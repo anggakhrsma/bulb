@@ -1,12 +1,18 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const shell_utils = @import("shell.zig");
 
 pub const CommandRunner = struct {
     ptr: ?*anyopaque = null,
-    run_fn: *const fn (?*anyopaque, std.mem.Allocator, []const u8) anyerror!?[]u8 = runShellCommand,
+    run_fn: *const fn (?*anyopaque, std.mem.Allocator, *const std.process.Environ.Map, []const u8) anyerror!?[]u8 = runShellCommand,
 
-    pub fn run(self: CommandRunner, allocator: std.mem.Allocator, command: []const u8) !?[]u8 {
-        return self.run_fn(self.ptr, allocator, command);
+    pub fn run(
+        self: CommandRunner,
+        allocator: std.mem.Allocator,
+        env: *const std.process.Environ.Map,
+        command: []const u8,
+    ) !?[]u8 {
+        return self.run_fn(self.ptr, allocator, env, command);
     }
 };
 
@@ -109,7 +115,7 @@ pub const Resolver = struct {
         config: []const u8,
     ) !?[]u8 {
         if (!isCommandConfigValue(config)) return resolveTemplateAlloc(allocator, self.env, config);
-        return self.runner.run(allocator, config[1..]) catch null;
+        return self.runner.run(allocator, self.env, config[1..]) catch null;
     }
 
     pub fn resolveConfigValueOrThrowAlloc(
@@ -193,7 +199,7 @@ pub const Resolver = struct {
             return if (cached) |value| try allocator.dupe(u8, value) else null;
         }
 
-        const result = self.runner.run(self.allocator, config[1..]) catch null;
+        const result = self.runner.run(self.allocator, self.env, config[1..]) catch null;
         errdefer if (result) |value| self.allocator.free(value);
         const copy = if (result) |value| try allocator.dupe(u8, value) else null;
         errdefer if (copy) |value| allocator.free(value);
@@ -444,23 +450,139 @@ fn getConfiguredEnv(env: *const std.process.Environ.Map, key: []const u8) ?[]con
     return if (value.len > 0) value else null;
 }
 
-fn runShellCommand(_: ?*anyopaque, allocator: std.mem.Allocator, command: []const u8) !?[]u8 {
+const ArgvRunResult = struct {
+    stdout: []u8,
+    stderr: []u8,
+    term: std.process.Child.Term,
+
+    fn deinit(self: *ArgvRunResult, allocator: std.mem.Allocator) void {
+        allocator.free(self.stdout);
+        allocator.free(self.stderr);
+        self.* = .{ .stdout = &.{}, .stderr = &.{}, .term = .{ .exited = 0 } };
+    }
+};
+
+const ArgvRunner = struct {
+    ptr: ?*anyopaque = null,
+    run_fn: *const fn (?*anyopaque, std.mem.Allocator, std.Io, []const []const u8) anyerror!ArgvRunResult = defaultArgvRun,
+
+    fn run(
+        self: ArgvRunner,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        argv: []const []const u8,
+    ) !ArgvRunResult {
+        return self.run_fn(self.ptr, allocator, io, argv);
+    }
+};
+
+const ShellLookup = struct {
+    ptr: ?*anyopaque = null,
+    get_fn: *const fn (?*anyopaque, std.mem.Allocator, std.Io, *const std.process.Environ.Map, std.Target.Os.Tag) anyerror!shell_utils.ShellConfig = defaultShellLookup,
+
+    fn get(
+        self: ShellLookup,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        env: *const std.process.Environ.Map,
+        os_tag: std.Target.Os.Tag,
+    ) !shell_utils.ShellConfig {
+        return self.get_fn(self.ptr, allocator, io, env, os_tag);
+    }
+};
+
+const ConfiguredCommandResult = struct {
+    executed: bool,
+    value: ?[]u8,
+};
+
+fn runShellCommand(
+    _: ?*anyopaque,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    command: []const u8,
+) !?[]u8 {
     var threaded = std.Io.Threaded.init(std.heap.smp_allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    const process_allocator = std.heap.page_allocator;
-    const argv: []const []const u8 = if (builtin.os.tag == .windows)
+    return runShellCommandForOsAlloc(allocator, io, env, command, builtin.os.tag, .{}, .{});
+}
+
+fn runShellCommandForOsAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    command: []const u8,
+    os_tag: std.Target.Os.Tag,
+    argv_runner: ArgvRunner,
+    shell_lookup: ShellLookup,
+) !?[]u8 {
+    if (os_tag == .windows) {
+        const configured = try executeWithConfiguredShellAlloc(
+            allocator,
+            io,
+            env,
+            command,
+            os_tag,
+            argv_runner,
+            shell_lookup,
+        );
+        if (configured.executed) return configured.value;
+        return executeWithDefaultShellAlloc(allocator, io, command, os_tag, argv_runner);
+    }
+
+    return executeWithDefaultShellAlloc(allocator, io, command, os_tag, argv_runner);
+}
+
+fn executeWithConfiguredShellAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    command: []const u8,
+    os_tag: std.Target.Os.Tag,
+    argv_runner: ArgvRunner,
+    shell_lookup: ShellLookup,
+) !ConfiguredCommandResult {
+    var shell_config = shell_lookup.get(allocator, io, env, os_tag) catch {
+        return .{ .executed = false, .value = null };
+    };
+    defer shell_config.deinit(allocator);
+
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    try argv.append(allocator, shell_config.shell);
+    try argv.appendSlice(allocator, shell_config.args);
+    try argv.append(allocator, command);
+
+    const value = executeArgvTrimmedAlloc(allocator, io, argv.items, argv_runner) catch |err| switch (err) {
+        error.FileNotFound => return .{ .executed = false, .value = null },
+        else => return .{ .executed = true, .value = null },
+    };
+    return .{ .executed = true, .value = value };
+}
+
+fn executeWithDefaultShellAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    command: []const u8,
+    os_tag: std.Target.Os.Tag,
+    argv_runner: ArgvRunner,
+) !?[]u8 {
+    const argv: []const []const u8 = if (os_tag == .windows)
         &.{ "cmd.exe", "/d", "/s", "/c", command }
     else
         &.{ "/bin/sh", "-c", command };
-    const result = std.process.run(process_allocator, io, .{
-        .argv = argv,
-        .stdout_limit = .limited(1024 * 1024),
-        .stderr_limit = .limited(1024 * 1024),
-        .timeout = .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } },
-    }) catch return null;
-    defer process_allocator.free(result.stdout);
-    defer process_allocator.free(result.stderr);
+    return executeArgvTrimmedAlloc(allocator, io, argv, argv_runner) catch null;
+}
+
+fn executeArgvTrimmedAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    argv: []const []const u8,
+    argv_runner: ArgvRunner,
+) !?[]u8 {
+    var result = try argv_runner.run(allocator, io, argv);
+    defer result.deinit(allocator);
     switch (result.term) {
         .exited => |status| if (status != 0) return null,
         else => return null,
@@ -469,16 +591,106 @@ fn runShellCommand(_: ?*anyopaque, allocator: std.mem.Allocator, command: []cons
     return if (trimmed.len > 0) try allocator.dupe(u8, trimmed) else null;
 }
 
+fn defaultArgvRun(
+    _: ?*anyopaque,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    argv: []const []const u8,
+) !ArgvRunResult {
+    const result = try std.process.run(allocator, io, .{
+        .argv = argv,
+        .stdout_limit = .limited(1024 * 1024),
+        .stderr_limit = .limited(1024 * 1024),
+        .timeout = .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } },
+    });
+    return .{ .stdout = result.stdout, .stderr = result.stderr, .term = result.term };
+}
+
+fn defaultShellLookup(
+    _: ?*anyopaque,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    os_tag: std.Target.Os.Tag,
+) !shell_utils.ShellConfig {
+    return shell_utils.getShellConfigForOsAlloc(allocator, io, env, null, os_tag);
+}
+
 const FakeRunner = struct {
     calls: usize = 0,
 
-    fn run(ptr: ?*anyopaque, allocator: std.mem.Allocator, command: []const u8) !?[]u8 {
+    fn run(
+        ptr: ?*anyopaque,
+        allocator: std.mem.Allocator,
+        _: *const std.process.Environ.Map,
+        command: []const u8,
+    ) !?[]u8 {
         const self: *FakeRunner = @ptrCast(@alignCast(ptr.?));
         self.calls += 1;
         if (std.mem.eql(u8, command, "fail")) return null;
         return try allocator.dupe(u8, command);
     }
 };
+
+const FakeShellLookup = struct {
+    found: bool = true,
+    calls: usize = 0,
+
+    fn get(
+        ptr: ?*anyopaque,
+        allocator: std.mem.Allocator,
+        _: std.Io,
+        _: *const std.process.Environ.Map,
+        _: std.Target.Os.Tag,
+    ) !shell_utils.ShellConfig {
+        const self: *FakeShellLookup = @ptrCast(@alignCast(ptr.?));
+        self.calls += 1;
+        if (!self.found) return error.NoBashShellFound;
+        return .{ .shell = try allocator.dupe(u8, "C:\\Git\\bin\\bash.exe") };
+    }
+};
+
+const FakeArgvRunner = struct {
+    configured_calls: usize = 0,
+    default_calls: usize = 0,
+
+    fn run(
+        ptr: ?*anyopaque,
+        allocator: std.mem.Allocator,
+        _: std.Io,
+        argv: []const []const u8,
+    ) !ArgvRunResult {
+        const self: *FakeArgvRunner = @ptrCast(@alignCast(ptr.?));
+        const command = argv[argv.len - 1];
+        if (std.mem.eql(u8, argv[0], "C:\\Git\\bin\\bash.exe")) {
+            self.configured_calls += 1;
+            if (std.mem.eql(u8, command, "missing-configured")) return error.FileNotFound;
+            if (std.mem.eql(u8, command, "configured-failure")) {
+                return fakeRunResultAlloc(allocator, "", .{ .exited = 1 });
+            }
+            return fakeRunResultAlloc(allocator, " configured value \n", .{ .exited = 0 });
+        }
+
+        if (std.mem.eql(u8, argv[0], "cmd.exe")) {
+            self.default_calls += 1;
+            return fakeRunResultAlloc(allocator, " default value \n", .{ .exited = 0 });
+        }
+
+        return error.UnexpectedArgv;
+    }
+};
+
+fn fakeRunResultAlloc(
+    allocator: std.mem.Allocator,
+    stdout: []const u8,
+    term: std.process.Child.Term,
+) !ArgvRunResult {
+    return .{
+        .stdout = try allocator.dupe(u8, stdout),
+        .stderr = try allocator.dupe(u8, ""),
+        .term = term,
+    };
+}
 
 test "config values resolve literals environment templates and escapes" {
     const allocator = std.testing.allocator;
@@ -692,4 +904,87 @@ test "config shell commands preserve pipes trim output and reject failures" {
     try std.testing.expectEqualStrings("hello-world", value);
     try std.testing.expectEqual(null, try resolver.resolveConfigValueAlloc(allocator, "!exit 1"));
     try std.testing.expectEqual(null, try resolver.resolveConfigValueAlloc(allocator, "!printf ''"));
+}
+
+test "Windows command configs prefer configured shell and trim output" {
+    const allocator = std.testing.allocator;
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    var shell_lookup: FakeShellLookup = .{};
+    var argv_runner: FakeArgvRunner = .{};
+
+    const value = (try runShellCommandForOsAlloc(
+        allocator,
+        std.testing.io,
+        &env,
+        "echo configured",
+        .windows,
+        .{ .ptr = &argv_runner, .run_fn = FakeArgvRunner.run },
+        .{ .ptr = &shell_lookup, .get_fn = FakeShellLookup.get },
+    )).?;
+    defer allocator.free(value);
+
+    try std.testing.expectEqualStrings("configured value", value);
+    try std.testing.expectEqual(@as(usize, 1), shell_lookup.calls);
+    try std.testing.expectEqual(@as(usize, 1), argv_runner.configured_calls);
+    try std.testing.expectEqual(@as(usize, 0), argv_runner.default_calls);
+}
+
+test "Windows command configs fall back when configured shell is unavailable" {
+    const allocator = std.testing.allocator;
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    var shell_lookup: FakeShellLookup = .{ .found = false };
+    var argv_runner: FakeArgvRunner = .{};
+
+    const value = (try runShellCommandForOsAlloc(
+        allocator,
+        std.testing.io,
+        &env,
+        "echo default",
+        .windows,
+        .{ .ptr = &argv_runner, .run_fn = FakeArgvRunner.run },
+        .{ .ptr = &shell_lookup, .get_fn = FakeShellLookup.get },
+    )).?;
+    defer allocator.free(value);
+
+    try std.testing.expectEqualStrings("default value", value);
+    try std.testing.expectEqual(@as(usize, 1), shell_lookup.calls);
+    try std.testing.expectEqual(@as(usize, 0), argv_runner.configured_calls);
+    try std.testing.expectEqual(@as(usize, 1), argv_runner.default_calls);
+}
+
+test "Windows command configs fall back only for configured shell ENOENT" {
+    const allocator = std.testing.allocator;
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    var shell_lookup: FakeShellLookup = .{};
+    var argv_runner: FakeArgvRunner = .{};
+
+    const missing_value = (try runShellCommandForOsAlloc(
+        allocator,
+        std.testing.io,
+        &env,
+        "missing-configured",
+        .windows,
+        .{ .ptr = &argv_runner, .run_fn = FakeArgvRunner.run },
+        .{ .ptr = &shell_lookup, .get_fn = FakeShellLookup.get },
+    )).?;
+    defer allocator.free(missing_value);
+    try std.testing.expectEqualStrings("default value", missing_value);
+    try std.testing.expectEqual(@as(usize, 1), argv_runner.configured_calls);
+    try std.testing.expectEqual(@as(usize, 1), argv_runner.default_calls);
+
+    const failed_value = try runShellCommandForOsAlloc(
+        allocator,
+        std.testing.io,
+        &env,
+        "configured-failure",
+        .windows,
+        .{ .ptr = &argv_runner, .run_fn = FakeArgvRunner.run },
+        .{ .ptr = &shell_lookup, .get_fn = FakeShellLookup.get },
+    );
+    try std.testing.expectEqual(null, failed_value);
+    try std.testing.expectEqual(@as(usize, 2), argv_runner.configured_calls);
+    try std.testing.expectEqual(@as(usize, 1), argv_runner.default_calls);
 }

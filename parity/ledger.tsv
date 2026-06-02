@@ -448,7 +448,7 @@ packages/coding-agent/src/core/output-guard.ts	bulb_coding_agent	source	implemen
 packages/coding-agent/src/core/package-manager.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/core/prompt-templates.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/core/provider-display-names.ts	bulb_coding_agent	source	pending		
-packages/coding-agent/src/core/resolve-config-value.ts	bulb_coding_agent	source	in_progress	src/bulb_coding_agent/resolve_config_value.zig	Literal, environment-template, escape, shell-command, trimmed-output, failure, command-cache, uncached required resolution, Pi-compatible failure diagnostics, missing-variable/configured checks, legacy-variable handling, and header resolution helpers ported; Windows configured-shell fallback remains
+packages/coding-agent/src/core/resolve-config-value.ts	bulb_coding_agent	source	implemented	src/bulb_coding_agent/resolve_config_value.zig	Literal, environment-template, escape, shell-command, trimmed-output, failure, command-cache, uncached required resolution, Pi-compatible failure diagnostics, missing-variable/configured checks, legacy-variable handling, header resolution helpers, and Windows configured-shell fallback ported.
 packages/coding-agent/src/core/resource-loader.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/core/sdk.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/core/session-cwd.ts	bulb_coding_agent	source	pending		

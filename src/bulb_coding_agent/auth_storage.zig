@@ -1110,7 +1110,12 @@ const TestFallback = struct {
 const TestCommandRunner = struct {
     calls: usize = 0,
 
-    fn run(ptr: ?*anyopaque, allocator: std.mem.Allocator, command: []const u8) !?[]u8 {
+    fn run(
+        ptr: ?*anyopaque,
+        allocator: std.mem.Allocator,
+        _: *const std.process.Environ.Map,
+        command: []const u8,
+    ) !?[]u8 {
         const self: *TestCommandRunner = @ptrCast(@alignCast(ptr.?));
         self.calls += 1;
         return try allocator.dupe(u8, command);

@@ -2334,7 +2334,12 @@ fn joinEnvVarNamesAlloc(allocator: std.mem.Allocator, names: []const []const u8)
 const TestCommandRunner = struct {
     calls: usize = 0,
 
-    fn run(ptr: ?*anyopaque, allocator: std.mem.Allocator, command: []const u8) !?[]u8 {
+    fn run(
+        ptr: ?*anyopaque,
+        allocator: std.mem.Allocator,
+        _: *const std.process.Environ.Map,
+        command: []const u8,
+    ) !?[]u8 {
         const self: *TestCommandRunner = @ptrCast(@alignCast(ptr.?));
         self.calls += 1;
         if (std.mem.eql(u8, command, "fail")) return null;
