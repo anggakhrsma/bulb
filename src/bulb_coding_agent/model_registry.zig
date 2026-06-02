@@ -3101,6 +3101,82 @@ test "model registry restores built-in models after unregistering a dynamic base
     try std.testing.expectEqualStrings(original_base_url, restored.base_url);
 }
 
+test "model registry replaces built-in dynamic provider models and overlays base URL across refresh" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    var runner: TestCommandRunner = .{};
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "models.json", .data = "{\"providers\":{}}" });
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, "models.json", allocator);
+    defer allocator.free(path);
+
+    var harness = try makeTestRegistry(allocator, &env, &runner, path);
+    defer harness.deinit();
+    const models = [_]ai.Model{dynamicTestModel("custom-claude")};
+    try harness.registry.registerProvider("anthropic", .{
+        .base_url = "https://custom.test/anthropic",
+        .api_key = "test-key",
+        .api = "anthropic-messages",
+        .models = &models,
+    });
+    try harness.registry.refresh();
+
+    try std.testing.expectEqual(@as(usize, 1), countModelsForProvider(&harness.registry, "anthropic"));
+    try std.testing.expectEqualStrings(
+        "https://custom.test/anthropic",
+        harness.registry.find("anthropic", "custom-claude").?.base_url,
+    );
+
+    try harness.registry.registerProvider("anthropic", .{ .base_url = "https://proxy.test/anthropic" });
+    try harness.registry.refresh();
+
+    try std.testing.expectEqual(@as(usize, 1), countModelsForProvider(&harness.registry, "anthropic"));
+    try std.testing.expectEqualStrings(
+        "https://proxy.test/anthropic",
+        harness.registry.find("anthropic", "custom-claude").?.base_url,
+    );
+}
+
+test "model registry keeps dynamic provider models during header-only refresh overlays" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    var runner: TestCommandRunner = .{};
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "models.json", .data = "{\"providers\":{}}" });
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, "models.json", allocator);
+    defer allocator.free(path);
+
+    var harness = try makeTestRegistry(allocator, &env, &runner, path);
+    defer harness.deinit();
+    const models = [_]ai.Model{
+        dynamicTestModel("custom-a"),
+        dynamicTestModel("custom-b"),
+    };
+    try harness.registry.registerProvider("custom-provider", .{
+        .base_url = "https://custom.test/v1",
+        .api_key = "test-key",
+        .api = "openai-completions",
+        .models = &models,
+    });
+    const headers = [_]config_value.HeaderInput{.{ .key = "x-proxy", .value = "enabled" }};
+    try harness.registry.registerProvider("custom-provider", .{ .headers = &headers });
+    try harness.registry.refresh();
+
+    try std.testing.expectEqual(@as(usize, 2), countModelsForProvider(&harness.registry, "custom-provider"));
+    const model = harness.registry.find("custom-provider", "custom-a") orelse return error.ModelMissing;
+    try std.testing.expectEqualStrings("https://custom.test/v1", model.base_url);
+    var request_auth = try harness.registry.getApiKeyAndHeadersAlloc(allocator, model);
+    defer request_auth.deinit(allocator);
+    switch (request_auth) {
+        .ok => |auth| try std.testing.expectEqualStrings("enabled", auth.getHeader("x-proxy").?),
+        .failure => return error.UnexpectedFailure,
+    }
+}
+
 test "model registry preserves models when a dynamic provider replacement fails validation" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
