@@ -2,6 +2,7 @@ const std = @import("std");
 const openai_codex_responses = @import("../../providers/openai_codex_responses.zig");
 const types = @import("../../types.zig");
 const device_code = @import("device_code.zig");
+const oauth_page = @import("oauth_page.zig");
 
 pub const callback_host_env = "BULB_OAUTH_CALLBACK_HOST";
 pub const client_id = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -9,6 +10,8 @@ pub const auth_base_url = "https://auth.openai.com";
 pub const authorize_url = auth_base_url ++ "/oauth/authorize";
 pub const token_url = auth_base_url ++ "/oauth/token";
 pub const redirect_uri = "http://localhost:1455/auth/callback";
+pub const callback_port: u16 = 1455;
+pub const default_callback_host = "127.0.0.1";
 pub const device_user_code_url = auth_base_url ++ "/api/accounts/deviceauth/usercode";
 pub const device_token_url = auth_base_url ++ "/api/accounts/deviceauth/token";
 pub const device_verification_uri = auth_base_url ++ "/codex/device";
@@ -108,6 +111,35 @@ pub const DeviceCodeCallback = struct {
     }
 };
 
+pub const OAuthAuthInfo = struct {
+    url: []const u8,
+    instructions: ?[]const u8 = null,
+};
+
+pub const AuthCallback = struct {
+    ptr: ?*anyopaque = null,
+    call: *const fn (?*anyopaque, OAuthAuthInfo) anyerror!void,
+
+    pub fn invoke(self: AuthCallback, info: OAuthAuthInfo) !void {
+        try self.call(self.ptr, info);
+    }
+};
+
+pub const OAuthPrompt = struct {
+    message: []const u8,
+    placeholder: ?[]const u8 = null,
+    allow_empty: bool = false,
+};
+
+pub const PromptCallback = struct {
+    ptr: ?*anyopaque = null,
+    call: *const fn (?*anyopaque, OAuthPrompt) anyerror![]const u8,
+
+    pub fn invoke(self: PromptCallback, prompt: OAuthPrompt) ![]const u8 {
+        return self.call(self.ptr, prompt);
+    }
+};
+
 pub const OAuthSelectOption = struct {
     id: []const u8,
     label: []const u8,
@@ -137,6 +169,10 @@ pub const OpenAICodexDeviceCodeLoginOptions = struct {
 
 pub const OpenAICodexLoginCallbacks = struct {
     transport: ?OAuthHttpTransport = null,
+    callback_server_factory: OAuthCallbackServerFactory = .{},
+    env: ?*const std.process.Environ.Map = null,
+    on_auth: ?AuthCallback = null,
+    on_prompt: ?PromptCallback = null,
     on_select: ?SelectCallback = null,
     on_device_code: ?DeviceCodeCallback = null,
     signal: ?*types.AbortSignal = null,
@@ -144,9 +180,31 @@ pub const OpenAICodexLoginCallbacks = struct {
     sleeper: device_code.Sleeper = .{},
 };
 
+pub const OpenAICodexBrowserLoginOptions = struct {
+    transport: ?OAuthHttpTransport = null,
+    callback_server_factory: OAuthCallbackServerFactory = .{},
+    env: ?*const std.process.Environ.Map = null,
+    on_auth: ?AuthCallback = null,
+    on_prompt: ?PromptCallback = null,
+    signal: ?*types.AbortSignal = null,
+    clock: device_code.Clock = .{},
+    originator: []const u8 = "bulb",
+};
+
 pub const AuthorizationInput = struct {
     code: ?[]const u8 = null,
     state: ?[]const u8 = null,
+};
+
+const OwnedAuthorizationInput = struct {
+    allocator: std.mem.Allocator,
+    code: ?[]u8 = null,
+    state: ?[]u8 = null,
+
+    fn deinit(self: *OwnedAuthorizationInput) void {
+        if (self.code) |code| self.allocator.free(code);
+        if (self.state) |state| self.allocator.free(state);
+    }
 };
 
 pub const AuthorizationFlow = struct {
@@ -193,10 +251,15 @@ pub const OpenAICodexOAuthProvider = struct {
             ) };
         }
 
-        return .{ .failed = try failure(
-            allocator,
-            "OpenAI Codex browser login callback server is not yet ported in native Zig",
-        ) };
+        return loginOpenAICodex(allocator, .{
+            .transport = callbacks.transport,
+            .callback_server_factory = callbacks.callback_server_factory,
+            .env = callbacks.env,
+            .on_auth = callbacks.on_auth,
+            .on_prompt = callbacks.on_prompt,
+            .signal = callbacks.signal,
+            .clock = callbacks.clock,
+        });
     }
 
     pub fn refreshToken(
@@ -271,6 +334,58 @@ pub fn loginOpenAICodexDeviceCode(
     }
 }
 
+pub fn loginOpenAICodex(
+    allocator: std.mem.Allocator,
+    options: OpenAICodexBrowserLoginOptions,
+) !OAuthCredentialsResult {
+    var flow = try createAuthorizationFlow(allocator, options.originator);
+    defer flow.deinit();
+
+    var server = try options.callback_server_factory.startServer(allocator, flow.state, options.env);
+    defer server.closeServer();
+
+    if (options.on_auth) |callback| {
+        try callback.invoke(.{
+            .url = flow.url,
+            .instructions = "A browser window should open. Complete login to finish.",
+        });
+    }
+
+    var code = try server.waitForCode(allocator);
+    defer if (code) |owned| allocator.free(owned);
+
+    if (code == null) {
+        if (options.on_prompt) |callback| {
+            const input = try callback.invoke(.{
+                .message = "Paste the authorization code (or full redirect URL):",
+            });
+            var parsed = try parseAuthorizationInputOwned(allocator, input);
+            defer parsed.deinit();
+            if (parsed.state) |state| {
+                if (!std.mem.eql(u8, state, flow.state)) {
+                    return .{ .failed = try failure(allocator, "State mismatch") };
+                }
+            }
+            if (parsed.code) |parsed_code| code = try allocator.dupe(u8, parsed_code);
+        }
+    }
+
+    const authorization_code = code orelse
+        return .{ .failed = try failure(allocator, "Missing authorization code") };
+
+    var std_transport: StdOAuthHttpTransport = .{};
+    const default_transport: OAuthHttpTransport = .{ .ptr = &std_transport, .request = stdOAuthHttpRequest };
+    return exchangeAuthorizationCodeForCredentials(
+        allocator,
+        authorization_code,
+        flow.verifier,
+        redirect_uri,
+        options.transport orelse default_transport,
+        options.signal,
+        options.clock,
+    );
+}
+
 pub fn refreshOpenAICodexToken(
     allocator: std.mem.Allocator,
     refresh_token: []const u8,
@@ -341,6 +456,226 @@ pub fn parseAuthorizationInput(input: []const u8) AuthorizationInput {
 
     if (std.mem.indexOf(u8, value, "code=") != null) return parseQuery(value);
     return .{ .code = value };
+}
+
+fn parseAuthorizationInputOwned(
+    allocator: std.mem.Allocator,
+    input: []const u8,
+) !OwnedAuthorizationInput {
+    return ownAuthorizationInput(allocator, parseAuthorizationInput(input));
+}
+
+fn parseQueryOwned(
+    allocator: std.mem.Allocator,
+    query: []const u8,
+) !OwnedAuthorizationInput {
+    return ownAuthorizationInput(allocator, parseQuery(query));
+}
+
+fn ownAuthorizationInput(
+    allocator: std.mem.Allocator,
+    parsed: AuthorizationInput,
+) !OwnedAuthorizationInput {
+    const code = if (parsed.code) |value| try decodeQueryComponent(allocator, value) else null;
+    errdefer if (code) |value| allocator.free(value);
+    const state = if (parsed.state) |value| try decodeQueryComponent(allocator, value) else null;
+    return .{ .allocator = allocator, .code = code, .state = state };
+}
+
+pub const OAuthCallbackServer = struct {
+    ptr: *anyopaque,
+    wait_for_code: *const fn (*anyopaque, std.mem.Allocator) anyerror!?[]u8,
+    close: *const fn (*anyopaque) void,
+
+    pub fn waitForCode(self: OAuthCallbackServer, allocator: std.mem.Allocator) !?[]u8 {
+        return self.wait_for_code(self.ptr, allocator);
+    }
+
+    pub fn closeServer(self: *OAuthCallbackServer) void {
+        self.close(self.ptr);
+        self.* = undefined;
+    }
+};
+
+pub const OAuthCallbackServerFactory = struct {
+    ptr: ?*anyopaque = null,
+    start: *const fn (
+        ?*anyopaque,
+        std.mem.Allocator,
+        []const u8,
+        ?*const std.process.Environ.Map,
+    ) anyerror!OAuthCallbackServer = startLocalOAuthCallbackServer,
+
+    pub fn startServer(
+        self: OAuthCallbackServerFactory,
+        allocator: std.mem.Allocator,
+        state: []const u8,
+        env: ?*const std.process.Environ.Map,
+    ) !OAuthCallbackServer {
+        return self.start(self.ptr, allocator, state, env);
+    }
+};
+
+pub const OAuthCallbackResponse = struct {
+    allocator: std.mem.Allocator,
+    status: std.http.Status,
+    html: []u8,
+    code: ?[]u8 = null,
+
+    pub fn deinit(self: *OAuthCallbackResponse) void {
+        self.allocator.free(self.html);
+        if (self.code) |code| self.allocator.free(code);
+    }
+
+    fn takeCode(self: *OAuthCallbackResponse) ?[]u8 {
+        const code = self.code;
+        self.code = null;
+        return code;
+    }
+};
+
+pub fn handleOpenAICodexCallbackTarget(
+    allocator: std.mem.Allocator,
+    target: []const u8,
+    expected_state: []const u8,
+) !OAuthCallbackResponse {
+    const query_start = std.mem.indexOfScalar(u8, target, '?');
+    const path = if (query_start) |index| target[0..index] else target;
+    if (!std.mem.eql(u8, path, "/auth/callback")) {
+        return callbackError(allocator, .not_found, "Callback route not found.");
+    }
+
+    const query = if (query_start) |index| target[index + 1 ..] else "";
+    var parsed = try parseQueryOwned(allocator, query);
+    defer parsed.deinit();
+    const state = parsed.state orelse
+        return callbackError(allocator, .bad_request, "State mismatch.");
+    if (!std.mem.eql(u8, state, expected_state)) {
+        return callbackError(allocator, .bad_request, "State mismatch.");
+    }
+
+    const code = parsed.code orelse
+        return callbackError(allocator, .bad_request, "Missing authorization code.");
+    const code_copy = try allocator.dupe(u8, code);
+    errdefer allocator.free(code_copy);
+    return .{
+        .allocator = allocator,
+        .status = .ok,
+        .html = try oauth_page.oauthSuccessHtml(
+            allocator,
+            "OpenAI authentication completed. You can close this window.",
+        ),
+        .code = code_copy,
+    };
+}
+
+fn callbackError(
+    allocator: std.mem.Allocator,
+    status: std.http.Status,
+    message: []const u8,
+) !OAuthCallbackResponse {
+    return .{
+        .allocator = allocator,
+        .status = status,
+        .html = try oauth_page.oauthErrorHtml(allocator, message, null),
+    };
+}
+
+const LocalOAuthCallbackServer = struct {
+    allocator: std.mem.Allocator,
+    listener: ?std.Io.net.Server,
+    state: []u8,
+
+    fn start(
+        allocator: std.mem.Allocator,
+        state: []const u8,
+        env: ?*const std.process.Environ.Map,
+    ) !*LocalOAuthCallbackServer {
+        const self = try allocator.create(LocalOAuthCallbackServer);
+        errdefer allocator.destroy(self);
+        self.* = .{
+            .allocator = allocator,
+            .listener = null,
+            .state = try allocator.dupe(u8, state),
+        };
+        errdefer allocator.free(self.state);
+
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const host = callbackHost(env);
+        const address = std.Io.net.IpAddress.resolve(io, host, callback_port) catch return self;
+        self.listener = address.listen(io, .{ .reuse_address = true }) catch return self;
+        return self;
+    }
+
+    fn waitForCode(ptr: *anyopaque, allocator: std.mem.Allocator) anyerror!?[]u8 {
+        const self: *LocalOAuthCallbackServer = @ptrCast(@alignCast(ptr));
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const listener = if (self.listener) |*value| value else return null;
+
+        while (true) {
+            const stream = listener.accept(io) catch return null;
+            if (try self.handleConnection(allocator, stream)) |code| return code;
+        }
+    }
+
+    fn handleConnection(
+        self: *LocalOAuthCallbackServer,
+        allocator: std.mem.Allocator,
+        stream: std.Io.net.Stream,
+    ) !?[]u8 {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var connection = stream;
+        defer connection.close(io);
+        var send_buffer: [4096]u8 = undefined;
+        var recv_buffer: [4096]u8 = undefined;
+        var connection_reader = connection.reader(io, &recv_buffer);
+        var connection_writer = connection.writer(io, &send_buffer);
+        var server: std.http.Server = .init(&connection_reader.interface, &connection_writer.interface);
+        var request = server.receiveHead() catch return null;
+
+        var response = try handleOpenAICodexCallbackTarget(allocator, request.head.target, self.state);
+        defer response.deinit();
+        const headers = [_]std.http.Header{
+            .{ .name = "Content-Type", .value = "text/html; charset=utf-8" },
+        };
+        try request.respond(response.html, .{
+            .status = response.status,
+            .keep_alive = false,
+            .extra_headers = &headers,
+        });
+        return response.takeCode();
+    }
+
+    fn close(ptr: *anyopaque) void {
+        const self: *LocalOAuthCallbackServer = @ptrCast(@alignCast(ptr));
+        const io = std.Io.Threaded.global_single_threaded.io();
+        if (self.listener) |*listener| listener.deinit(io);
+        self.allocator.free(self.state);
+        self.allocator.destroy(self);
+    }
+
+    fn callbackServer(self: *LocalOAuthCallbackServer) OAuthCallbackServer {
+        return .{
+            .ptr = self,
+            .wait_for_code = waitForCode,
+            .close = close,
+        };
+    }
+};
+
+pub fn callbackHost(env: ?*const std.process.Environ.Map) []const u8 {
+    if (env) |environ| return environ.get(callback_host_env) orelse default_callback_host;
+    return default_callback_host;
+}
+
+fn startLocalOAuthCallbackServer(
+    _: ?*anyopaque,
+    allocator: std.mem.Allocator,
+    state: []const u8,
+    env: ?*const std.process.Environ.Map,
+) !OAuthCallbackServer {
+    const server = try LocalOAuthCallbackServer.start(allocator, state, env);
+    return server.callbackServer();
 }
 
 fn exchangeAuthorizationCodeForCredentials(
@@ -778,6 +1113,15 @@ fn parseQuery(query: []const u8) AuthorizationInput {
     return result;
 }
 
+fn decodeQueryComponent(allocator: std.mem.Allocator, encoded: []const u8) ![]u8 {
+    const working = try allocator.dupe(u8, encoded);
+    defer allocator.free(working);
+    for (working) |*byte| {
+        if (byte.* == '+') byte.* = ' ';
+    }
+    return allocator.dupe(u8, std.Uri.percentDecodeInPlace(working));
+}
+
 fn createState(allocator: std.mem.Allocator) ![]u8 {
     var bytes: [16]u8 = undefined;
     std.Io.Threaded.global_single_threaded.io().random(&bytes);
@@ -1103,6 +1447,229 @@ const TestSelectRecorder = struct {
     }
 };
 
+const FakeOAuthCallbackServerFactory = struct {
+    allocator: std.mem.Allocator,
+    code: ?[]const u8,
+    starts: usize = 0,
+    waits: usize = 0,
+    closes: usize = 0,
+    states: std.ArrayList([]u8) = .empty,
+
+    fn deinit(self: *FakeOAuthCallbackServerFactory) void {
+        for (self.states.items) |state| self.allocator.free(state);
+        self.states.deinit(self.allocator);
+    }
+
+    fn factory(self: *FakeOAuthCallbackServerFactory) OAuthCallbackServerFactory {
+        return .{ .ptr = self, .start = start };
+    }
+
+    fn start(
+        ptr: ?*anyopaque,
+        _: std.mem.Allocator,
+        state: []const u8,
+        _: ?*const std.process.Environ.Map,
+    ) anyerror!OAuthCallbackServer {
+        const self: *FakeOAuthCallbackServerFactory = @ptrCast(@alignCast(ptr.?));
+        self.starts += 1;
+        try self.states.append(self.allocator, try self.allocator.dupe(u8, state));
+        return .{
+            .ptr = self,
+            .wait_for_code = waitForCode,
+            .close = close,
+        };
+    }
+
+    fn waitForCode(ptr: *anyopaque, allocator: std.mem.Allocator) anyerror!?[]u8 {
+        const self: *FakeOAuthCallbackServerFactory = @ptrCast(@alignCast(ptr));
+        self.waits += 1;
+        return if (self.code) |code| try allocator.dupe(u8, code) else null;
+    }
+
+    fn close(ptr: *anyopaque) void {
+        const self: *FakeOAuthCallbackServerFactory = @ptrCast(@alignCast(ptr));
+        self.closes += 1;
+    }
+};
+
+const TestAuthRecorder = struct {
+    allocator: std.mem.Allocator,
+    urls: std.ArrayList([]u8) = .empty,
+    instructions: std.ArrayList([]u8) = .empty,
+
+    fn deinit(self: *TestAuthRecorder) void {
+        for (self.urls.items) |url| self.allocator.free(url);
+        self.urls.deinit(self.allocator);
+        for (self.instructions.items) |instructions| self.allocator.free(instructions);
+        self.instructions.deinit(self.allocator);
+    }
+
+    fn call(ptr: ?*anyopaque, info: OAuthAuthInfo) anyerror!void {
+        const self: *TestAuthRecorder = @ptrCast(@alignCast(ptr.?));
+        try self.urls.append(self.allocator, try self.allocator.dupe(u8, info.url));
+        if (info.instructions) |instructions| {
+            try self.instructions.append(self.allocator, try self.allocator.dupe(u8, instructions));
+        }
+    }
+};
+
+const TestPromptRecorder = struct {
+    allocator: std.mem.Allocator,
+    input: []const u8,
+    messages: std.ArrayList([]u8) = .empty,
+
+    fn deinit(self: *TestPromptRecorder) void {
+        for (self.messages.items) |message| self.allocator.free(message);
+        self.messages.deinit(self.allocator);
+    }
+
+    fn call(ptr: ?*anyopaque, prompt: OAuthPrompt) anyerror![]const u8 {
+        const self: *TestPromptRecorder = @ptrCast(@alignCast(ptr.?));
+        try self.messages.append(self.allocator, try self.allocator.dupe(u8, prompt.message));
+        return self.input;
+    }
+};
+
+test "OpenAI Codex OAuth callback route validates path state and code" {
+    const allocator = std.testing.allocator;
+
+    var missing_route = try handleOpenAICodexCallbackTarget(allocator, "/missing", "expected-state");
+    defer missing_route.deinit();
+    try std.testing.expectEqual(std.http.Status.not_found, missing_route.status);
+    try std.testing.expect(std.mem.indexOf(u8, missing_route.html, "Callback route not found.") != null);
+
+    var wrong_state = try handleOpenAICodexCallbackTarget(
+        allocator,
+        "/auth/callback?code=oauth-code&state=wrong-state",
+        "expected-state",
+    );
+    defer wrong_state.deinit();
+    try std.testing.expectEqual(std.http.Status.bad_request, wrong_state.status);
+    try std.testing.expect(std.mem.indexOf(u8, wrong_state.html, "State mismatch.") != null);
+
+    var missing_code = try handleOpenAICodexCallbackTarget(
+        allocator,
+        "/auth/callback?state=expected-state",
+        "expected-state",
+    );
+    defer missing_code.deinit();
+    try std.testing.expectEqual(std.http.Status.bad_request, missing_code.status);
+    try std.testing.expect(std.mem.indexOf(u8, missing_code.html, "Missing authorization code.") != null);
+
+    var success = try handleOpenAICodexCallbackTarget(
+        allocator,
+        "/auth/callback?code=oauth%2Bcode&state=expected%2Dstate",
+        "expected-state",
+    );
+    defer success.deinit();
+    try std.testing.expectEqual(std.http.Status.ok, success.status);
+    try std.testing.expectEqualStrings("oauth+code", success.code.?);
+    try std.testing.expect(std.mem.indexOf(u8, success.html, "OpenAI authentication completed.") != null);
+}
+
+test "OpenAI Codex OAuth callback host honors Bulb environment override" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectEqualStrings(default_callback_host, callbackHost(null));
+
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put(callback_host_env, "0.0.0.0");
+    try std.testing.expectEqualStrings("0.0.0.0", callbackHost(&env));
+}
+
+test "OpenAI Codex OAuth browser login exchanges callback authorization code" {
+    const allocator = std.testing.allocator;
+    const access_token = try createAccessToken(allocator, "account-browser");
+    defer allocator.free(access_token);
+    const token_body = try std.fmt.allocPrint(
+        allocator,
+        "{{\"access_token\":\"{s}\",\"refresh_token\":\"refresh-token\",\"expires_in\":3600}}",
+        .{access_token},
+    );
+    defer allocator.free(token_body);
+    const responses = [_]FakeOAuthResponse{.{ .body = token_body }};
+    var transport = FakeOAuthTransport.init(allocator, &responses);
+    defer transport.deinit();
+    var server: FakeOAuthCallbackServerFactory = .{ .allocator = allocator, .code = "browser-code" };
+    defer server.deinit();
+    var auth: TestAuthRecorder = .{ .allocator = allocator };
+    defer auth.deinit();
+    var clock: TestClock = .{ .now_value = 1_779_235_200_000 };
+
+    var result = try loginOpenAICodex(allocator, .{
+        .transport = transport.transport(),
+        .callback_server_factory = server.factory(),
+        .on_auth = .{ .ptr = &auth, .call = TestAuthRecorder.call },
+        .clock = .{ .ptr = &clock, .now_ms = TestClock.now },
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqualStrings("account-browser", result.credentials.account_id);
+    try std.testing.expectEqual(@as(usize, 1), server.starts);
+    try std.testing.expectEqual(@as(usize, 1), server.waits);
+    try std.testing.expectEqual(@as(usize, 1), server.closes);
+    try std.testing.expectEqual(@as(usize, 1), auth.urls.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, auth.urls.items[0], "originator=bulb") != null);
+    try std.testing.expectEqual(@as(usize, 1), transport.records.items.len);
+    try std.testing.expectEqualStrings(
+        "grant_type=authorization_code&client_id=app_EMoamEEZ73f0CkXaXp7hrann&code=browser-code&code_verifier=",
+        transport.records.items[0].body[0.."grant_type=authorization_code&client_id=app_EMoamEEZ73f0CkXaXp7hrann&code=browser-code&code_verifier=".len],
+    );
+    try std.testing.expect(std.mem.endsWith(u8, transport.records.items[0].body, "&redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback"));
+}
+
+test "OpenAI Codex OAuth browser login falls back to pasted authorization code" {
+    const allocator = std.testing.allocator;
+    const access_token = try createAccessToken(allocator, "account-pasted");
+    defer allocator.free(access_token);
+    const token_body = try std.fmt.allocPrint(
+        allocator,
+        "{{\"access_token\":\"{s}\",\"refresh_token\":\"refresh-token\",\"expires_in\":3600}}",
+        .{access_token},
+    );
+    defer allocator.free(token_body);
+    const responses = [_]FakeOAuthResponse{.{ .body = token_body }};
+    var transport = FakeOAuthTransport.init(allocator, &responses);
+    defer transport.deinit();
+    var server: FakeOAuthCallbackServerFactory = .{ .allocator = allocator, .code = null };
+    defer server.deinit();
+    var prompt: TestPromptRecorder = .{ .allocator = allocator, .input = "pasted-code" };
+    defer prompt.deinit();
+    var clock: TestClock = .{ .now_value = 0 };
+
+    var result = try loginOpenAICodex(allocator, .{
+        .transport = transport.transport(),
+        .callback_server_factory = server.factory(),
+        .on_prompt = .{ .ptr = &prompt, .call = TestPromptRecorder.call },
+        .clock = .{ .ptr = &clock, .now_ms = TestClock.now },
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqualStrings("account-pasted", result.credentials.account_id);
+    try std.testing.expectEqual(@as(usize, 1), prompt.messages.items.len);
+    try std.testing.expectEqualStrings(
+        "Paste the authorization code (or full redirect URL):",
+        prompt.messages.items[0],
+    );
+    try std.testing.expect(std.mem.indexOf(u8, transport.records.items[0].body, "&code=pasted-code&") != null);
+}
+
+test "OpenAI Codex OAuth browser login rejects pasted state mismatch" {
+    const allocator = std.testing.allocator;
+    var server: FakeOAuthCallbackServerFactory = .{ .allocator = allocator, .code = null };
+    defer server.deinit();
+    var prompt: TestPromptRecorder = .{ .allocator = allocator, .input = "pasted-code#wrong-state" };
+    defer prompt.deinit();
+
+    var result = try loginOpenAICodex(allocator, .{
+        .callback_server_factory = server.factory(),
+        .on_prompt = .{ .ptr = &prompt, .call = TestPromptRecorder.call },
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqualStrings("State mismatch", result.failed.message);
+}
+
 test "OpenAI Codex OAuth provider offers browser first and uses selected device code flow" {
     const allocator = std.testing.allocator;
     const access_token = try createAccessToken(allocator, "account-456");
@@ -1146,6 +1713,38 @@ test "OpenAI Codex OAuth provider offers browser first and uses selected device 
     try std.testing.expectEqualStrings("Device code login (headless)", select.prompts.items[0].options[1].label);
     try std.testing.expectEqual(@as(usize, 1), infos.infos.items.len);
     try std.testing.expectEqualStrings("WXYZ-7890", infos.infos.items[0].user_code);
+}
+
+test "OpenAI Codex OAuth provider uses selected browser callback flow" {
+    const allocator = std.testing.allocator;
+    const access_token = try createAccessToken(allocator, "account-provider-browser");
+    defer allocator.free(access_token);
+    const token_body = try std.fmt.allocPrint(
+        allocator,
+        "{{\"access_token\":\"{s}\",\"refresh_token\":\"refresh-token\",\"expires_in\":3600}}",
+        .{access_token},
+    );
+    defer allocator.free(token_body);
+    const responses = [_]FakeOAuthResponse{.{ .body = token_body }};
+    var transport = FakeOAuthTransport.init(allocator, &responses);
+    defer transport.deinit();
+    var server: FakeOAuthCallbackServerFactory = .{ .allocator = allocator, .code = "provider-browser-code" };
+    defer server.deinit();
+    var select: TestSelectRecorder = .{ .selected = browser_login_method };
+    defer select.deinit(allocator);
+    var clock: TestClock = .{ .now_value = 0 };
+
+    var result = try openai_codex_oauth_provider.login(allocator, .{
+        .transport = transport.transport(),
+        .callback_server_factory = server.factory(),
+        .on_select = .{ .ptr = &select, .call = TestSelectRecorder.call },
+        .clock = .{ .ptr = &clock, .now_ms = TestClock.now },
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqualStrings("account-provider-browser", result.credentials.account_id);
+    try std.testing.expectEqual(@as(usize, 1), server.starts);
+    try std.testing.expect(std.mem.indexOf(u8, transport.records.items[0].body, "&code=provider-browser-code&") != null);
 }
 
 fn noopSleep(_: ?*anyopaque, _: u64, _: ?*types.AbortSignal) anyerror!void {}
