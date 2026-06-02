@@ -21,7 +21,7 @@ pub fn main(init: std.process.Init) !void {
             \\  bulb-ai --version    Print the Bulb AI utility version
             \\
         );
-        try stdout.print("Native APIs declared: {d}\n", .{@typeInfo(ai.Api).@"enum".fields.len});
+        try stdout.print("Native APIs declared: {d}\n", .{ai.known_api_count});
     }
 
     try stdout.flush();

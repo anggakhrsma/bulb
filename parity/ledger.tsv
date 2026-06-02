@@ -95,7 +95,7 @@ packages/ai/package.json	bulb_ai	source	pending
 packages/ai/scripts/generate-image-models.ts	bulb_ai	source	pending		
 packages/ai/scripts/generate-models.ts	bulb_ai	source	pending		
 packages/ai/scripts/generate-test-image.ts	bulb_ai	source	pending		
-packages/ai/src/api-registry.ts	bulb_ai	source	pending		
+packages/ai/src/api-registry.ts	bulb_ai	source	in_progress	src/bulb_ai/api_registry.zig	Native provider registration, dispatch, and unregister foundation
 packages/ai/src/bedrock-provider.ts	bulb_ai	source	pending		
 packages/ai/src/cli.ts	bulb_ai	source	pending		
 packages/ai/src/env-api-keys.ts	bulb_ai	source	pending		
@@ -111,7 +111,7 @@ packages/ai/src/providers/amazon-bedrock.ts	bulb_ai	source	pending
 packages/ai/src/providers/anthropic.ts	bulb_ai	source	pending		
 packages/ai/src/providers/azure-openai-responses.ts	bulb_ai	source	pending		
 packages/ai/src/providers/cloudflare.ts	bulb_ai	source	pending		
-packages/ai/src/providers/faux.ts	bulb_ai	source	in_progress	src/bulb_ai/faux_provider.zig	Queued deterministic provider foundation
+packages/ai/src/providers/faux.ts	bulb_ai	source	in_progress	src/bulb_ai/faux_provider.zig	Registration, models, queueing, factories, usage, cache simulation, registry dispatch, delta streams, aborts, and unregister ported; paced async delivery remains
 packages/ai/src/providers/github-copilot-headers.ts	bulb_ai	source	pending		
 packages/ai/src/providers/google-shared.ts	bulb_ai	source	pending		
 packages/ai/src/providers/google-vertex.ts	bulb_ai	source	pending		
@@ -129,7 +129,7 @@ packages/ai/src/providers/simple-options.ts	bulb_ai	source	pending
 packages/ai/src/providers/transform-messages.ts	bulb_ai	source	pending		
 packages/ai/src/session-resources.ts	bulb_ai	source	pending		
 packages/ai/src/stream.ts	bulb_ai	source	pending		
-packages/ai/src/types.ts	bulb_ai	source	in_progress	src/bulb_ai/types.zig	Core message model and usage accounting started
+packages/ai/src/types.ts	bulb_ai	source	in_progress	src/bulb_ai/types.zig	Core messages, contexts, options, usage accounting, models, and stream event protocol started
 packages/ai/src/utils/abort-signals.ts	bulb_ai	source	pending		
 packages/ai/src/utils/diagnostics.ts	bulb_ai	source	pending		
 packages/ai/src/utils/event-stream.ts	bulb_ai	source	pending		
@@ -178,7 +178,7 @@ packages/ai/test/cross-provider-handoff.test.ts	bulb_ai	test	pending
 packages/ai/test/data/red-circle.png	bulb_ai	test	pending		
 packages/ai/test/empty.test.ts	bulb_ai	test	pending		
 packages/ai/test/env-api-keys.test.ts	bulb_ai	test	pending		
-packages/ai/test/faux-provider.test.ts	bulb_ai	test	in_progress	src/bulb_ai/faux_provider.zig	Queued response and helper-block cases started
+packages/ai/test/faux-provider.test.ts	bulb_ai	test	in_progress	src/bulb_ai/faux_provider.zig	Native regression coverage ported for models, metadata, queues, factories, usage, cache simulation, stream events, aborts, and unregister
 packages/ai/test/fireworks-models.test.ts	bulb_ai	test	pending		
 packages/ai/test/github-copilot-anthropic.test.ts	bulb_ai	test	pending		
 packages/ai/test/github-copilot-oauth.test.ts	bulb_ai	test	pending		

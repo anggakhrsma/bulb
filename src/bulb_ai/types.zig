@@ -1,22 +1,32 @@
 const std = @import("std");
 
-pub const Api = enum {
-    anthropic_messages,
-    openai_completions,
-    mistral_conversations,
-    openai_responses,
-    azure_openai_responses,
-    openai_codex_responses,
-    google_generative_ai,
-    google_vertex,
-    bedrock_converse_stream,
-    openrouter_images,
+pub const api = struct {
+    pub const anthropic_messages = "anthropic-messages";
+    pub const openai_completions = "openai-completions";
+    pub const mistral_conversations = "mistral-conversations";
+    pub const openai_responses = "openai-responses";
+    pub const azure_openai_responses = "azure-openai-responses";
+    pub const openai_codex_responses = "openai-codex-responses";
+    pub const google_generative_ai = "google-generative-ai";
+    pub const google_vertex = "google-vertex";
+    pub const bedrock_converse_stream = "bedrock-converse-stream";
+    pub const openrouter_images = "openrouter-images";
 };
+
+pub const known_api_count = 10;
+pub const Api = []const u8;
 
 pub const Transport = enum {
     sse,
     websocket,
+    websocket_cached,
     auto,
+};
+
+pub const CacheRetention = enum {
+    none,
+    short,
+    long,
 };
 
 pub const ThinkingLevel = enum {
@@ -32,7 +42,7 @@ pub const StopReason = enum {
     stop,
     length,
     tool_use,
-    error_response,
+    @"error",
     aborted,
 };
 
@@ -108,6 +118,7 @@ pub const AssistantMessage = struct {
     usage: Usage = .{},
     stop_reason: StopReason = .stop,
     error_message: ?[]const u8 = null,
+    response_id: ?[]const u8 = null,
     timestamp_ms: i64 = 0,
 };
 
@@ -125,22 +136,82 @@ pub const Message = union(enum) {
     tool_result: ToolResultMessage,
 };
 
+pub const Tool = struct {
+    name: []const u8,
+    description: []const u8,
+    parameters_json: []const u8,
+};
+
+pub const Context = struct {
+    system_prompt: ?[]const u8 = null,
+    messages: []const Message,
+    tools: []const Tool = &.{},
+};
+
+pub const AbortSignal = struct {
+    aborted: bool = false,
+
+    pub fn abort(self: *AbortSignal) void {
+        self.aborted = true;
+    }
+};
+
+pub const ContentIndex = struct {
+    content_index: usize,
+};
+
+pub const ContentDelta = struct {
+    content_index: usize,
+    delta: []const u8,
+};
+
+pub const ContentEnd = struct {
+    content_index: usize,
+    content: []const u8,
+};
+
+pub const ToolCallEnd = struct {
+    content_index: usize,
+    tool_call: ToolCall,
+};
+
+pub const TerminalError = struct {
+    reason: StopReason,
+    message: AssistantMessage,
+};
+
 pub const StreamEvent = union(enum) {
-    start: AssistantMessage,
-    text_delta: struct {
-        content_index: usize,
-        delta: []const u8,
-    },
-    thinking_delta: struct {
-        content_index: usize,
-        delta: []const u8,
-    },
-    tool_call_delta: struct {
-        content_index: usize,
-        delta: []const u8,
-    },
-    done: AssistantMessage,
-    error_response: AssistantMessage,
+    start: void,
+    text_start: ContentIndex,
+    text_delta: ContentDelta,
+    text_end: ContentEnd,
+    thinking_start: ContentIndex,
+    thinking_delta: ContentDelta,
+    thinking_end: ContentEnd,
+    toolcall_start: ContentIndex,
+    toolcall_delta: ContentDelta,
+    toolcall_end: ToolCallEnd,
+    done: StopReason,
+    @"error": TerminalError,
+};
+
+pub const EventObserver = *const fn (signal: *AbortSignal, event: StreamEvent) void;
+
+pub const StreamOptions = struct {
+    cache_retention: CacheRetention = .short,
+    session_id: ?[]const u8 = null,
+    signal: ?*AbortSignal = null,
+    on_event: ?EventObserver = null,
+};
+
+pub const StreamResult = struct {
+    allocator: std.mem.Allocator,
+    events: std.ArrayList(StreamEvent) = .empty,
+    message: AssistantMessage,
+
+    pub fn deinit(self: *StreamResult) void {
+        self.events.deinit(self.allocator);
+    }
 };
 
 pub const ModelCost = struct {
@@ -150,16 +221,18 @@ pub const ModelCost = struct {
     cache_write: f64 = 0,
 };
 
+pub const default_model_input = [_][]const u8{ "text", "image" };
+
 pub const Model = struct {
     id: []const u8,
     name: []const u8,
     api: Api,
     provider: []const u8,
     base_url: []const u8,
-    input: []const []const u8,
+    input: []const []const u8 = &default_model_input,
     cost: ModelCost = .{},
-    context_window: u64,
-    max_tokens: u64,
+    context_window: u64 = 128_000,
+    max_tokens: u64 = 16_384,
     reasoning: bool = false,
 };
 
