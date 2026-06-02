@@ -54,9 +54,10 @@ pub const ProviderConfigInput = struct {
     base_url: ?[]const u8 = null,
     api_key: ?[]const u8 = null,
     api: ?ai.Api = null,
-    headers: []const config_value.HeaderInput = &.{},
-    auth_header: bool = false,
-    models: []const ai.Model = &.{},
+    headers: ?[]const config_value.HeaderInput = null,
+    auth_header: ?bool = null,
+    oauth: ?ai.oauth.OAuthProviderInterface = null,
+    models: ?[]const ai.Model = null,
 };
 
 const ProviderRequestConfig = struct {
@@ -67,6 +68,83 @@ const ProviderRequestConfig = struct {
     fn deinit(self: *ProviderRequestConfig, allocator: std.mem.Allocator) void {
         if (self.api_key) |api_key| allocator.free(api_key);
         deinitHeaderInputs(allocator, self.headers);
+        self.* = .{};
+    }
+};
+
+const OwnedProviderConfig = struct {
+    name: ?[]u8 = null,
+    base_url: ?[]u8 = null,
+    api_key: ?[]u8 = null,
+    api: ?[]u8 = null,
+    headers: []config_value.HeaderInput = &.{},
+    auth_header: ?bool = null,
+    oauth: ?ai.oauth.OAuthProviderInterface = null,
+    models: []ai.Model = &.{},
+
+    fn cloneMerged(
+        allocator: std.mem.Allocator,
+        provider_name: []const u8,
+        existing: ?OwnedProviderConfig,
+        input: ProviderConfigInput,
+    ) !OwnedProviderConfig {
+        var result = if (existing) |config|
+            try config.clone(allocator)
+        else
+            OwnedProviderConfig{};
+        errdefer result.deinit(allocator);
+
+        if (input.name) |value| try replaceOptionalOwnedString(allocator, &result.name, value);
+        if (input.base_url) |value| try replaceOptionalOwnedString(allocator, &result.base_url, value);
+        if (input.api_key) |value| {
+            const migrated = try cloneDynamicConfigValueAlloc(allocator, value);
+            if (result.api_key) |previous| allocator.free(previous);
+            result.api_key = migrated;
+        }
+        if (input.api) |value| try replaceOptionalOwnedString(allocator, &result.api, value);
+        if (input.headers) |headers| {
+            const cloned = try cloneDynamicHeaderInputs(allocator, headers);
+            deinitHeaderInputs(allocator, result.headers);
+            result.headers = cloned;
+        }
+        if (input.auth_header) |value| result.auth_header = value;
+        if (input.oauth) |oauth| {
+            const cloned = try cloneOAuthProvider(allocator, provider_name, oauth);
+            if (result.oauth) |previous| deinitOAuthProvider(allocator, previous);
+            result.oauth = cloned;
+        }
+        if (input.models) |models| {
+            const cloned = try cloneModelsForProvider(allocator, provider_name, models);
+            deinitModelItems(allocator, result.models);
+            if (result.models.len > 0) allocator.free(result.models);
+            result.models = cloned;
+        }
+        return result;
+    }
+
+    fn clone(self: OwnedProviderConfig, allocator: std.mem.Allocator) !OwnedProviderConfig {
+        var result = OwnedProviderConfig{};
+        errdefer result.deinit(allocator);
+        result.name = if (self.name) |value| try allocator.dupe(u8, value) else null;
+        result.base_url = if (self.base_url) |value| try allocator.dupe(u8, value) else null;
+        result.api_key = if (self.api_key) |value| try allocator.dupe(u8, value) else null;
+        result.api = if (self.api) |value| try allocator.dupe(u8, value) else null;
+        result.headers = try cloneHeaderInputs(allocator, self.headers);
+        result.auth_header = self.auth_header;
+        result.oauth = if (self.oauth) |oauth| try cloneOAuthProvider(allocator, oauth.id, oauth) else null;
+        result.models = try cloneModels(allocator, self.models);
+        return result;
+    }
+
+    fn deinit(self: *OwnedProviderConfig, allocator: std.mem.Allocator) void {
+        if (self.name) |value| allocator.free(value);
+        if (self.base_url) |value| allocator.free(value);
+        if (self.api_key) |value| allocator.free(value);
+        if (self.api) |value| allocator.free(value);
+        deinitHeaderInputs(allocator, self.headers);
+        if (self.oauth) |oauth| deinitOAuthProvider(allocator, oauth);
+        deinitModelItems(allocator, self.models);
+        if (self.models.len > 0) allocator.free(self.models);
         self.* = .{};
     }
 };
@@ -114,6 +192,7 @@ pub const ModelRegistry = struct {
     models: std.ArrayList(ai.Model) = .empty,
     provider_request_configs: std.StringHashMap(ProviderRequestConfig),
     model_request_headers: std.StringHashMap([]config_value.HeaderInput),
+    registered_providers: std.StringHashMap(OwnedProviderConfig),
     models_json_path: ?[]u8 = null,
     load_error: ?[]u8 = null,
 
@@ -127,6 +206,7 @@ pub const ModelRegistry = struct {
             .auth_storage = storage,
             .provider_request_configs = std.StringHashMap(ProviderRequestConfig).init(allocator),
             .model_request_headers = std.StringHashMap([]config_value.HeaderInput).init(allocator),
+            .registered_providers = std.StringHashMap(OwnedProviderConfig).init(allocator),
             .models_json_path = if (models_json_path) |path| try allocator.dupe(u8, path) else null,
         };
         errdefer registry.deinit();
@@ -142,7 +222,9 @@ pub const ModelRegistry = struct {
     }
 
     pub fn deinit(self: *ModelRegistry) void {
+        self.auth_storage.oauth_registry.resetOAuthProviders() catch {};
         self.clearLoaded();
+        deinitRegisteredProviders(self.allocator, &self.registered_providers);
         self.models.deinit(self.allocator);
         if (self.models_json_path) |path| self.allocator.free(path);
         if (self.load_error) |message| self.allocator.free(message);
@@ -151,12 +233,14 @@ pub const ModelRegistry = struct {
     }
 
     pub fn refresh(self: *ModelRegistry) !void {
+        try self.auth_storage.oauth_registry.resetOAuthProviders();
         self.clearLoaded();
         if (self.load_error) |message| {
             self.allocator.free(message);
             self.load_error = null;
         }
         try self.loadModels();
+        try self.applyRegisteredProviders();
     }
 
     pub fn getError(self: *const ModelRegistry) ?[]const u8 {
@@ -172,6 +256,55 @@ pub const ModelRegistry = struct {
             if (std.mem.eql(u8, model.provider, provider) and std.mem.eql(u8, model.id, model_id)) return model;
         }
         return null;
+    }
+
+    pub fn getProviderDisplayName(self: *const ModelRegistry, provider: []const u8) []const u8 {
+        if (self.registered_providers.get(provider)) |config| {
+            if (config.name) |name| return name;
+            if (config.oauth) |oauth| return oauth.name;
+        }
+        for (self.auth_storage.getOAuthProviders()) |oauth| {
+            if (std.mem.eql(u8, oauth.id, provider)) return oauth.name;
+        }
+        return builtInProviderDisplayName(provider) orelse provider;
+    }
+
+    pub fn registerProvider(self: *ModelRegistry, provider_name: []const u8, input: ProviderConfigInput) !void {
+        try validateDynamicProviderConfig(provider_name, input);
+        var merged = try OwnedProviderConfig.cloneMerged(
+            self.allocator,
+            provider_name,
+            self.registered_providers.get(provider_name),
+            input,
+        );
+        var merged_owned = true;
+        errdefer if (merged_owned) merged.deinit(self.allocator);
+
+        // OAuth entries borrow strings from the owned config, so drop registry
+        // references before replacing a previously registered provider.
+        try self.auth_storage.oauth_registry.resetOAuthProviders();
+        if (self.registered_providers.getPtr(provider_name)) |existing| {
+            existing.deinit(self.allocator);
+            existing.* = merged;
+            merged_owned = false;
+        } else {
+            const key = try self.allocator.dupe(u8, provider_name);
+            errdefer self.allocator.free(key);
+            try self.registered_providers.put(key, merged);
+            merged_owned = false;
+        }
+        try self.refresh();
+    }
+
+    pub fn unregisterProvider(self: *ModelRegistry, provider_name: []const u8) !void {
+        if (!self.registered_providers.contains(provider_name)) return;
+        try self.auth_storage.oauth_registry.resetOAuthProviders();
+        if (self.registered_providers.fetchRemove(provider_name)) |removed| {
+            self.allocator.free(removed.key);
+            var config = removed.value;
+            config.deinit(self.allocator);
+        }
+        try self.refresh();
     }
 
     pub fn getAvailableAlloc(
@@ -385,6 +518,55 @@ pub const ModelRegistry = struct {
 
         try self.loadBuiltInModels(&provider_overrides, &model_overrides);
         try self.mergeCustomModels(custom_models.items);
+    }
+
+    fn applyRegisteredProviders(self: *ModelRegistry) !void {
+        var iterator = self.registered_providers.iterator();
+        while (iterator.next()) |entry| {
+            try self.applyRegisteredProvider(entry.key_ptr.*, entry.value_ptr.*);
+        }
+    }
+
+    fn applyRegisteredProvider(
+        self: *ModelRegistry,
+        provider_name: []const u8,
+        config: OwnedProviderConfig,
+    ) !void {
+        if (config.oauth) |oauth| try self.auth_storage.oauth_registry.registerOAuthProvider(oauth);
+
+        var request_config = ProviderRequestConfig{};
+        errdefer request_config.deinit(self.allocator);
+        request_config.api_key = if (config.api_key) |value| try self.allocator.dupe(u8, value) else null;
+        request_config.headers = try cloneHeaderInputs(self.allocator, config.headers);
+        request_config.auth_header = config.auth_header orelse false;
+        const owned_request_config = request_config;
+        request_config = .{};
+        try self.storeProviderRequestConfig(provider_name, owned_request_config);
+
+        if (config.models.len > 0) {
+            self.removeModelsForProvider(provider_name);
+            for (config.models) |model| {
+                var cloned = try cloneDynamicModel(self.allocator, provider_name, config, model);
+                errdefer deinitModel(self.allocator, &cloned);
+                try self.models.append(self.allocator, cloned);
+            }
+        } else if (config.base_url) |base_url| {
+            for (self.models.items) |*model| {
+                if (std.mem.eql(u8, model.provider, provider_name)) {
+                    try replaceOwnedString(self.allocator, &model.base_url, base_url);
+                }
+            }
+        }
+    }
+
+    fn removeModelsForProvider(self: *ModelRegistry, provider_name: []const u8) void {
+        var index = self.models.items.len;
+        while (index > 0) {
+            index -= 1;
+            if (!std.mem.eql(u8, self.models.items[index].provider, provider_name)) continue;
+            var removed = self.models.orderedRemove(index);
+            deinitModel(self.allocator, &removed);
+        }
     }
 
     fn loadBuiltInModels(
@@ -728,21 +910,22 @@ fn cloneModel(
     model: ai.Model,
     override_base_url: ?[]const u8,
 ) !ai.Model {
-    return .{
-        .id = try allocator.dupe(u8, model.id),
-        .name = try allocator.dupe(u8, model.name),
-        .api = try allocator.dupe(u8, model.api),
-        .provider = try allocator.dupe(u8, model.provider),
-        .base_url = try allocator.dupe(u8, override_base_url orelse model.base_url),
-        .reasoning = model.reasoning,
-        .thinking_level_map = try cloneThinkingLevelMap(allocator, model.thinking_level_map),
-        .input = try cloneStringSlice(allocator, model.input),
-        .cost = model.cost,
-        .context_window = model.context_window,
-        .max_tokens = model.max_tokens,
-        .headers = try cloneAiHeaders(allocator, model.headers),
-        .compat = try cloneModelCompat(allocator, model.compat),
-    };
+    var cloned = emptyModel();
+    errdefer deinitModel(allocator, &cloned);
+    cloned.id = try allocator.dupe(u8, model.id);
+    cloned.name = try allocator.dupe(u8, model.name);
+    cloned.api = try allocator.dupe(u8, model.api);
+    cloned.provider = try allocator.dupe(u8, model.provider);
+    cloned.base_url = try allocator.dupe(u8, override_base_url orelse model.base_url);
+    cloned.reasoning = model.reasoning;
+    cloned.thinking_level_map = try cloneThinkingLevelMap(allocator, model.thinking_level_map);
+    cloned.input = try cloneStringSlice(allocator, model.input);
+    cloned.cost = model.cost;
+    cloned.context_window = model.context_window;
+    cloned.max_tokens = model.max_tokens;
+    cloned.headers = try cloneAiHeaders(allocator, model.headers);
+    cloned.compat = try cloneModelCompat(allocator, model.compat);
+    return cloned;
 }
 
 fn deinitModelItems(allocator: std.mem.Allocator, models: []ai.Model) void {
@@ -810,6 +993,100 @@ fn replaceOwnedString(allocator: std.mem.Allocator, target: *[]const u8, value: 
     const copy = try allocator.dupe(u8, value);
     allocator.free(target.*);
     target.* = copy;
+}
+
+fn replaceOptionalOwnedString(allocator: std.mem.Allocator, target: *?[]u8, value: []const u8) !void {
+    const copy = try allocator.dupe(u8, value);
+    if (target.*) |previous| allocator.free(previous);
+    target.* = copy;
+}
+
+fn cloneDynamicConfigValueAlloc(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
+    if (!config_value.isLegacyEnvVarNameConfigValue(value)) return try allocator.dupe(u8, value);
+    return try std.fmt.allocPrint(allocator, "${s}", .{value});
+}
+
+fn cloneOAuthProvider(
+    allocator: std.mem.Allocator,
+    provider_name: []const u8,
+    oauth: ai.oauth.OAuthProviderInterface,
+) !ai.oauth.OAuthProviderInterface {
+    const id = try allocator.dupe(u8, provider_name);
+    errdefer allocator.free(id);
+    return .{
+        .id = id,
+        .name = try allocator.dupe(u8, oauth.name),
+        .context = oauth.context,
+        .login_fn = oauth.login_fn,
+        .refresh_token_fn = oauth.refresh_token_fn,
+        .get_api_key_fn = oauth.get_api_key_fn,
+        .modify_models_fn = oauth.modify_models_fn,
+        .uses_callback_server = oauth.uses_callback_server,
+    };
+}
+
+fn deinitOAuthProvider(allocator: std.mem.Allocator, oauth: ai.oauth.OAuthProviderInterface) void {
+    allocator.free(oauth.id);
+    allocator.free(oauth.name);
+}
+
+fn cloneModels(allocator: std.mem.Allocator, models: []const ai.Model) ![]ai.Model {
+    if (models.len == 0) return &.{};
+    const cloned = try allocator.alloc(ai.Model, models.len);
+    var initialized: usize = 0;
+    errdefer {
+        deinitModelItems(allocator, cloned[0..initialized]);
+        allocator.free(cloned);
+    }
+    for (models, 0..) |model, index| {
+        cloned[index] = try cloneModel(allocator, model, null);
+        initialized += 1;
+    }
+    return cloned;
+}
+
+fn cloneModelsForProvider(
+    allocator: std.mem.Allocator,
+    provider_name: []const u8,
+    models: []const ai.Model,
+) ![]ai.Model {
+    if (models.len == 0) return &.{};
+    const cloned = try allocator.alloc(ai.Model, models.len);
+    var initialized: usize = 0;
+    errdefer {
+        deinitModelItems(allocator, cloned[0..initialized]);
+        allocator.free(cloned);
+    }
+    for (models, 0..) |model, index| {
+        var adjusted = model;
+        adjusted.provider = provider_name;
+        cloned[index] = try cloneModel(allocator, adjusted, null);
+        initialized += 1;
+    }
+    return cloned;
+}
+
+fn cloneDynamicModel(
+    allocator: std.mem.Allocator,
+    provider_name: []const u8,
+    config: OwnedProviderConfig,
+    model: ai.Model,
+) !ai.Model {
+    var adjusted = model;
+    adjusted.provider = provider_name;
+    if (adjusted.api.len == 0) adjusted.api = config.api.?;
+    if (adjusted.base_url.len == 0) adjusted.base_url = config.base_url.?;
+    return try cloneModel(allocator, adjusted, null);
+}
+
+fn validateDynamicProviderConfig(_: []const u8, input: ProviderConfigInput) !void {
+    const models = input.models orelse return;
+    if (models.len == 0) return;
+    if (input.base_url == null) return error.DynamicProviderBaseUrlRequired;
+    if (input.api_key == null and input.oauth == null) return error.DynamicProviderAuthRequired;
+    for (models) |model| {
+        if (model.api.len == 0 and input.api == null) return error.DynamicProviderApiRequired;
+    }
 }
 
 fn cloneThinkingLevelMap(
@@ -1100,6 +1377,52 @@ fn deinitHeaderInputs(allocator: std.mem.Allocator, headers: []config_value.Head
         allocator.free(header.value);
     }
     if (headers.len > 0) allocator.free(headers);
+}
+
+fn cloneHeaderInputs(
+    allocator: std.mem.Allocator,
+    headers: []const config_value.HeaderInput,
+) ![]config_value.HeaderInput {
+    if (headers.len == 0) return &.{};
+    const cloned = try allocator.alloc(config_value.HeaderInput, headers.len);
+    var initialized: usize = 0;
+    errdefer {
+        deinitHeaderInputs(allocator, cloned[0..initialized]);
+        allocator.free(cloned);
+    }
+    for (headers, 0..) |header, index| {
+        const key = try allocator.dupe(u8, header.key);
+        errdefer allocator.free(key);
+        cloned[index] = .{
+            .key = key,
+            .value = try allocator.dupe(u8, header.value),
+        };
+        initialized += 1;
+    }
+    return cloned;
+}
+
+fn cloneDynamicHeaderInputs(
+    allocator: std.mem.Allocator,
+    headers: []const config_value.HeaderInput,
+) ![]config_value.HeaderInput {
+    if (headers.len == 0) return &.{};
+    const cloned = try allocator.alloc(config_value.HeaderInput, headers.len);
+    var initialized: usize = 0;
+    errdefer {
+        deinitHeaderInputs(allocator, cloned[0..initialized]);
+        allocator.free(cloned);
+    }
+    for (headers, 0..) |header, index| {
+        const key = try allocator.dupe(u8, header.key);
+        errdefer allocator.free(key);
+        cloned[index] = .{
+            .key = key,
+            .value = try cloneDynamicConfigValueAlloc(allocator, header.value),
+        };
+        initialized += 1;
+    }
+    return cloned;
 }
 
 fn parseInputAlloc(allocator: std.mem.Allocator, maybe_value: ?std.json.Value) ![]const []const u8 {
@@ -1478,6 +1801,18 @@ fn deinitProviderOverrides(
     map.deinit();
 }
 
+fn deinitRegisteredProviders(
+    allocator: std.mem.Allocator,
+    map: *std.StringHashMap(OwnedProviderConfig),
+) void {
+    var iterator = map.iterator();
+    while (iterator.next()) |entry| {
+        allocator.free(entry.key_ptr.*);
+        entry.value_ptr.deinit(allocator);
+    }
+    map.deinit();
+}
+
 fn deinitModelOverrides(
     allocator: std.mem.Allocator,
     map: *std.StringHashMap(ModelOverride),
@@ -1505,6 +1840,45 @@ fn builtInDefaultApi(provider: []const u8) ?[]const u8 {
 fn builtInDefaultBaseUrl(provider: []const u8) ?[]const u8 {
     var models = ai.models.getModels(provider);
     return if (models.next()) |model| model.base_url else null;
+}
+
+fn builtInProviderDisplayName(provider: []const u8) ?[]const u8 {
+    const display_names = [_]struct { id: []const u8, name: []const u8 }{
+        .{ .id = "anthropic", .name = "Anthropic" },
+        .{ .id = "amazon-bedrock", .name = "Amazon Bedrock" },
+        .{ .id = "azure-openai-responses", .name = "Azure OpenAI Responses" },
+        .{ .id = "cerebras", .name = "Cerebras" },
+        .{ .id = "cloudflare-ai-gateway", .name = "Cloudflare AI Gateway" },
+        .{ .id = "cloudflare-workers-ai", .name = "Cloudflare Workers AI" },
+        .{ .id = "deepseek", .name = "DeepSeek" },
+        .{ .id = "fireworks", .name = "Fireworks" },
+        .{ .id = "google", .name = "Google Gemini" },
+        .{ .id = "google-vertex", .name = "Google Vertex AI" },
+        .{ .id = "groq", .name = "Groq" },
+        .{ .id = "huggingface", .name = "Hugging Face" },
+        .{ .id = "kimi-coding", .name = "Kimi For Coding" },
+        .{ .id = "mistral", .name = "Mistral" },
+        .{ .id = "minimax", .name = "MiniMax" },
+        .{ .id = "minimax-cn", .name = "MiniMax (China)" },
+        .{ .id = "moonshotai", .name = "Moonshot AI" },
+        .{ .id = "moonshotai-cn", .name = "Moonshot AI (China)" },
+        .{ .id = "opencode", .name = "OpenCode Zen" },
+        .{ .id = "opencode-go", .name = "OpenCode Go" },
+        .{ .id = "openai", .name = "OpenAI" },
+        .{ .id = "openrouter", .name = "OpenRouter" },
+        .{ .id = "together", .name = "Together AI" },
+        .{ .id = "vercel-ai-gateway", .name = "Vercel AI Gateway" },
+        .{ .id = "xai", .name = "xAI" },
+        .{ .id = "zai", .name = "ZAI" },
+        .{ .id = "xiaomi", .name = "Xiaomi MiMo" },
+        .{ .id = "xiaomi-token-plan-cn", .name = "Xiaomi MiMo Token Plan (China)" },
+        .{ .id = "xiaomi-token-plan-ams", .name = "Xiaomi MiMo Token Plan (Amsterdam)" },
+        .{ .id = "xiaomi-token-plan-sgp", .name = "Xiaomi MiMo Token Plan (Singapore)" },
+    };
+    for (display_names) |entry| {
+        if (std.mem.eql(u8, entry.id, provider)) return entry.name;
+    }
+    return null;
 }
 
 fn joinEnvVarNamesAlloc(allocator: std.mem.Allocator, names: []const []const u8) ![]u8 {
@@ -1917,4 +2291,225 @@ test "model registry applies provider compat overrides to built-in models" {
     const sonnet = harness.registry.find("openrouter", "anthropic/claude-sonnet-4") orelse return error.ModelMissing;
     try std.testing.expectEqual(@as(?bool, false), sonnet.compat.supports_usage_in_streaming);
     try std.testing.expectEqual(@as(?bool, false), sonnet.compat.supports_strict_mode);
+}
+
+fn dynamicTestModel(id: []const u8) ai.Model {
+    return .{
+        .id = id,
+        .name = id,
+        .api = "",
+        .provider = "",
+        .base_url = "",
+        .input = &.{"text"},
+    };
+}
+
+const DynamicTestOAuth = struct {
+    fn provider(context: *u8, name: []const u8) ai.oauth.OAuthProviderInterface {
+        return .{
+            .id = "ignored",
+            .name = name,
+            .context = context,
+            .login_fn = login,
+            .refresh_token_fn = refreshToken,
+            .get_api_key_fn = getApiKey,
+        };
+    }
+
+    fn login(
+        _: *anyopaque,
+        _: std.mem.Allocator,
+        _: ai.oauth.OAuthLoginCallbacks,
+    ) !ai.oauth.OAuthCredentialsResult {
+        return error.TestOAuthLoginNotUsed;
+    }
+
+    fn refreshToken(
+        _: *anyopaque,
+        _: std.mem.Allocator,
+        _: ai.oauth.OAuthCredentials,
+    ) !ai.oauth.OAuthCredentialsResult {
+        return error.TestOAuthRefreshNotUsed;
+    }
+
+    fn getApiKey(_: *anyopaque, credentials: ai.oauth.OAuthCredentials) []const u8 {
+        return credentials.access;
+    }
+};
+
+// Ported from packages/coding-agent/test/model-registry.test.ts dynamic provider
+// lifecycle and override persistence cases.
+test "model registry replays dynamic provider models headers and base URL overrides across refresh" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    var runner: TestCommandRunner = .{};
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "models.json", .data = "{\"providers\":{}}" });
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, "models.json", allocator);
+    defer allocator.free(path);
+
+    var harness = try makeTestRegistry(allocator, &env, &runner, path);
+    defer harness.deinit();
+    const models = [_]ai.Model{
+        dynamicTestModel("custom-a"),
+        dynamicTestModel("custom-b"),
+    };
+    try harness.registry.registerProvider("custom-provider", .{
+        .base_url = "https://custom.test/v1",
+        .api_key = "test-key",
+        .api = "openai-completions",
+        .models = &models,
+    });
+    try harness.registry.refresh();
+
+    try std.testing.expectEqual(@as(usize, 2), countModelsForProvider(&harness.registry, "custom-provider"));
+    try std.testing.expectEqualStrings(
+        "https://custom.test/v1",
+        harness.registry.find("custom-provider", "custom-a").?.base_url,
+    );
+
+    const headers = [_]config_value.HeaderInput{.{ .key = "x-proxy", .value = "enabled" }};
+    try harness.registry.registerProvider("custom-provider", .{
+        .base_url = "https://proxy.test/custom",
+        .headers = &headers,
+    });
+    try harness.registry.refresh();
+
+    const model = harness.registry.find("custom-provider", "custom-a") orelse return error.ModelMissing;
+    try std.testing.expectEqualStrings("https://proxy.test/custom", model.base_url);
+    var request_auth = try harness.registry.getApiKeyAndHeadersAlloc(allocator, model);
+    defer request_auth.deinit(allocator);
+    switch (request_auth) {
+        .ok => |auth| try std.testing.expectEqualStrings("enabled", auth.getHeader("x-proxy").?),
+        .failure => return error.UnexpectedFailure,
+    }
+
+    try harness.registry.unregisterProvider("custom-provider");
+    try std.testing.expectEqual(@as(usize, 0), countModelsForProvider(&harness.registry, "custom-provider"));
+}
+
+test "model registry restores built-in models after unregistering a dynamic base URL override" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    var runner: TestCommandRunner = .{};
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "models.json", .data = "{\"providers\":{}}" });
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, "models.json", allocator);
+    defer allocator.free(path);
+
+    var harness = try makeTestRegistry(allocator, &env, &runner, path);
+    defer harness.deinit();
+    const original = harness.registry.find("anthropic", "claude-sonnet-4-5") orelse return error.ModelMissing;
+    const original_base_url = try allocator.dupe(u8, original.base_url);
+    defer allocator.free(original_base_url);
+
+    try harness.registry.registerProvider("anthropic", .{ .base_url = "https://proxy.test/anthropic" });
+    try harness.registry.refresh();
+    const overridden = harness.registry.find("anthropic", "claude-sonnet-4-5") orelse return error.ModelMissing;
+    try std.testing.expectEqualStrings("https://proxy.test/anthropic", overridden.base_url);
+
+    try harness.registry.unregisterProvider("anthropic");
+    const restored = harness.registry.find("anthropic", "claude-sonnet-4-5") orelse return error.ModelMissing;
+    try std.testing.expectEqualStrings(original_base_url, restored.base_url);
+}
+
+test "model registry preserves models when a dynamic provider replacement fails validation" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    var runner: TestCommandRunner = .{};
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "models.json", .data = "{\"providers\":{}}" });
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, "models.json", allocator);
+    defer allocator.free(path);
+
+    var harness = try makeTestRegistry(allocator, &env, &runner, path);
+    defer harness.deinit();
+    const valid_models = [_]ai.Model{dynamicTestModel("demo-model")};
+    try harness.registry.registerProvider("demo-provider", .{
+        .base_url = "https://provider.test/v1",
+        .api_key = "test-key",
+        .api = "openai-completions",
+        .models = &valid_models,
+    });
+
+    const broken_models = [_]ai.Model{dynamicTestModel("broken-model")};
+    try std.testing.expectError(error.DynamicProviderApiRequired, harness.registry.registerProvider("demo-provider", .{
+        .base_url = "https://provider.test/v2",
+        .api_key = "test-key",
+        .models = &broken_models,
+    }));
+    try std.testing.expect(harness.registry.find("demo-provider", "demo-model") != null);
+    try harness.registry.refresh();
+    try std.testing.expect(harness.registry.find("demo-provider", "demo-model") != null);
+}
+
+test "model registry resolves dynamic display names OAuth restoration and legacy uppercase config values" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    var runner: TestCommandRunner = .{};
+    try env.put("CUSTOM_DYNAMIC_KEY", "legacy-env-key");
+    try env.put("CUSTOM_DYNAMIC_HEADER", "legacy-header");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "models.json", .data = "{\"providers\":{}}" });
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, "models.json", allocator);
+    defer allocator.free(path);
+
+    var harness = try makeTestRegistry(allocator, &env, &runner, path);
+    defer harness.deinit();
+    try std.testing.expectEqualStrings("OpenAI", harness.registry.getProviderDisplayName("openai"));
+    try std.testing.expectEqualStrings("GitHub Copilot", harness.registry.getProviderDisplayName("github-copilot"));
+    try std.testing.expectEqualStrings("unknown-provider", harness.registry.getProviderDisplayName("unknown-provider"));
+
+    const models = [_]ai.Model{dynamicTestModel("demo-model")};
+    const headers = [_]config_value.HeaderInput{.{ .key = "x-legacy", .value = "CUSTOM_DYNAMIC_HEADER" }};
+    try harness.registry.registerProvider("named-provider", .{
+        .name = "Named Provider",
+        .base_url = "https://provider.test/v1",
+        .api_key = "CUSTOM_DYNAMIC_KEY",
+        .api = "openai-completions",
+        .headers = &headers,
+        .models = &models,
+    });
+    try std.testing.expectEqualStrings("Named Provider", harness.registry.getProviderDisplayName("named-provider"));
+    const key = (try harness.registry.getApiKeyForProviderAlloc(allocator, "named-provider")).?;
+    defer allocator.free(key);
+    try std.testing.expectEqualStrings("legacy-env-key", key);
+    const named_model = harness.registry.find("named-provider", "demo-model") orelse return error.ModelMissing;
+    var request_auth = try harness.registry.getApiKeyAndHeadersAlloc(allocator, named_model);
+    defer request_auth.deinit(allocator);
+    switch (request_auth) {
+        .ok => |auth| try std.testing.expectEqualStrings("legacy-header", auth.getHeader("x-legacy").?),
+        .failure => return error.UnexpectedFailure,
+    }
+
+    var oauth_context: u8 = 0;
+    try harness.registry.registerProvider("anthropic", .{
+        .oauth = DynamicTestOAuth.provider(&oauth_context, "Custom Anthropic OAuth"),
+    });
+    try std.testing.expectEqualStrings("Custom Anthropic OAuth", harness.registry.getProviderDisplayName("anthropic"));
+    try std.testing.expectEqualStrings(
+        "Custom Anthropic OAuth",
+        harness.oauth_registry.getOAuthProvider("anthropic").?.name,
+    );
+    try harness.registry.unregisterProvider("anthropic");
+    try std.testing.expectEqualStrings(
+        "Anthropic (Claude Pro/Max)",
+        harness.oauth_registry.getOAuthProvider("anthropic").?.name,
+    );
+}
+
+fn countModelsForProvider(registry: *const ModelRegistry, provider: []const u8) usize {
+    var count: usize = 0;
+    for (registry.getAll()) |model| {
+        if (std.mem.eql(u8, model.provider, provider)) count += 1;
+    }
+    return count;
 }
