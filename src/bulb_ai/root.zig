@@ -45,6 +45,7 @@ pub const Context = types.Context;
 pub const Cost = types.Cost;
 pub const DiagnosticCode = types.DiagnosticCode;
 pub const DiagnosticErrorInfo = types.DiagnosticErrorInfo;
+pub const Header = types.Header;
 pub const ImageContent = types.ImageContent;
 pub const ImageModel = types.ImageModel;
 pub const Message = types.Message;
