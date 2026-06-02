@@ -549,8 +549,8 @@ packages/coding-agent/src/utils/mime.ts	bulb_coding_agent	source	implemented	src
 packages/coding-agent/src/utils/paths.ts	bulb_coding_agent	source	implemented	src/bulb_coding_agent/paths.zig	Canonical path fallback, symlink resolution, local/remote package-source detection, tilde normalization, file URL decoding/validation, cwd-relative path detection, slash formatting, and best-effort cloud-sync ignore xattr/setfattr behavior ported
 packages/coding-agent/src/utils/photon.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/utils/pi-user-agent.ts	bulb_coding_agent	source	implemented	src/bulb_coding_agent/user_agent.zig	Bulb-native user-agent formatter ported with Pi-compatible platform/arch naming and Zig runtime branding
-packages/coding-agent/src/utils/shell.ts	bulb_coding_agent	source	pending		
-packages/coding-agent/src/utils/sleep.ts	bulb_coding_agent	source	pending		
+packages/coding-agent/src/utils/shell.ts	bulb_coding_agent	source	implemented	src/bulb_coding_agent/shell.zig	Zig-native shell config/env, output sanitization, and detached child tracker/kill helper.
+packages/coding-agent/src/utils/sleep.ts	bulb_coding_agent	source	implemented	src/bulb_coding_agent/sleep.zig	Abort-aware Zig sleeper interface matching Pi sleep semantics for native runtimes.
 packages/coding-agent/src/utils/syntax-highlight.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/utils/tools-manager.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/utils/version-check.ts	bulb_coding_agent	source	implemented	src/bulb_coding_agent/version_check.zig	Bulb-native release version checker ported with semver comparison, service-base URL resolution, BULB skip/offline flags, user-agent header, HTTP transport injection, metadata/note trimming, and non-ok response handling

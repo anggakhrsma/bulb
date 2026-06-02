@@ -13,6 +13,8 @@ pub const messages = @import("messages.zig");
 pub const output_guard = @import("output_guard.zig");
 pub const paths = @import("paths.zig");
 pub const path_utils = @import("path_utils.zig");
+pub const shell = @import("shell.zig");
+pub const sleep = @import("sleep.zig");
 pub const user_agent = @import("user_agent.zig");
 pub const version_check = @import("version_check.zig");
 
@@ -32,6 +34,8 @@ test {
     _ = @import("output_guard.zig");
     _ = @import("paths.zig");
     _ = @import("path_utils.zig");
+    _ = @import("shell.zig");
+    _ = @import("sleep.zig");
     _ = @import("user_agent.zig");
     _ = @import("version_check.zig");
 }
