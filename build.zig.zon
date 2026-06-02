@@ -1,0 +1,21 @@
+.{
+    .name = .bulb,
+    .version = "0.0.0",
+    .fingerprint = 0x88a56ef06629e4cf,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{
+        ".github",
+        "build.zig",
+        "build.zig.zon",
+        "DEPENDENCIES.md",
+        "LICENSE",
+        "NOTICE.md",
+        "PARITY.md",
+        "README.md",
+        "UPSTREAM.md",
+        "parity",
+        "src",
+        "tools",
+    },
+}

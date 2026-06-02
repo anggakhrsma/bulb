@@ -1,0 +1,54 @@
+const std = @import("std");
+const ai = @import("bulb_ai");
+
+pub const AgentStatus = enum {
+    idle,
+    streaming,
+};
+
+pub const AgentEventTag = enum {
+    agent_start,
+    agent_end,
+    turn_start,
+    turn_end,
+    message_start,
+    message_update,
+    message_end,
+    tool_execution_start,
+    tool_execution_update,
+    tool_execution_end,
+};
+
+pub const AgentError = error{
+    AlreadyStreaming,
+    NotStreaming,
+};
+
+pub const AgentState = struct {
+    status: AgentStatus = .idle,
+    thinking_level: ai.ThinkingLevel = .off,
+    turn_count: usize = 0,
+
+    pub fn beginTurn(self: *AgentState) AgentError!void {
+        if (self.status == .streaming) return error.AlreadyStreaming;
+        self.status = .streaming;
+        self.turn_count += 1;
+    }
+
+    pub fn endTurn(self: *AgentState) AgentError!void {
+        if (self.status != .streaming) return error.NotStreaming;
+        self.status = .idle;
+    }
+};
+
+// Ported subset of packages/agent/test/agent.test.ts streaming guard cases.
+test "agent lifecycle guards streaming state" {
+    var state: AgentState = .{};
+
+    try state.beginTurn();
+    try std.testing.expectEqual(AgentStatus.streaming, state.status);
+    try std.testing.expectError(error.AlreadyStreaming, state.beginTurn());
+    try state.endTurn();
+    try std.testing.expectEqual(@as(usize, 1), state.turn_count);
+    try std.testing.expectError(error.NotStreaming, state.endTurn());
+}

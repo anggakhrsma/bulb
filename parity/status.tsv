@@ -1,0 +1,11 @@
+upstream_path	status	bulb_path	notes
+LICENSE	implemented	LICENSE	Preserved upstream MIT notice
+packages/agent/src/agent.ts	in_progress	src/bulb_agent/root.zig	Initial streaming lifecycle state
+packages/agent/test/agent.test.ts	in_progress	src/bulb_agent/root.zig	Streaming-state guard cases started
+packages/ai/src/providers/faux.ts	in_progress	src/bulb_ai/faux_provider.zig	Queued deterministic provider foundation
+packages/ai/src/types.ts	in_progress	src/bulb_ai/types.zig	Core message model and usage accounting started
+packages/ai/test/faux-provider.test.ts	in_progress	src/bulb_ai/faux_provider.zig	Queued response and helper-block cases started
+packages/ai/test/total-tokens.test.ts	in_progress	src/bulb_ai/types.zig	Total token accounting invariant started
+packages/tui/src/utils.ts	in_progress	src/bulb_tui/root.zig	Visible-width behavior started
+packages/tui/test/regression-regional-indicator-width.test.ts	in_progress	src/bulb_tui/root.zig	Regional-indicator regression cases started
+packages/tui/test/truncate-to-width.test.ts	in_progress	src/bulb_tui/root.zig	Visible-width subset started
