@@ -232,7 +232,78 @@ pub const ModelCost = struct {
     cache_write: f64 = 0,
 };
 
+pub const ThinkingLevelOverride = union(enum) {
+    unset,
+    unsupported,
+    mapped: []const u8,
+};
+
+pub const ThinkingLevelMap = struct {
+    off: ThinkingLevelOverride = .unset,
+    minimal: ThinkingLevelOverride = .unset,
+    low: ThinkingLevelOverride = .unset,
+    medium: ThinkingLevelOverride = .unset,
+    high: ThinkingLevelOverride = .unset,
+    xhigh: ThinkingLevelOverride = .unset,
+
+    pub fn get(self: ThinkingLevelMap, level: ThinkingLevel) ThinkingLevelOverride {
+        return switch (level) {
+            .off => self.off,
+            .minimal => self.minimal,
+            .low => self.low,
+            .medium => self.medium,
+            .high => self.high,
+            .xhigh => self.xhigh,
+        };
+    }
+};
+
+pub const MaxTokensField = enum {
+    max_completion_tokens,
+    max_tokens,
+};
+
+pub const ThinkingFormat = enum {
+    openai,
+    openrouter,
+    deepseek,
+    together,
+    zai,
+    qwen,
+    qwen_chat_template,
+    string_thinking,
+};
+
+pub const Header = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
+pub const ModelCompat = struct {
+    supports_store: ?bool = null,
+    supports_developer_role: ?bool = null,
+    supports_reasoning_effort: ?bool = null,
+    supports_usage_in_streaming: ?bool = null,
+    max_tokens_field: ?MaxTokensField = null,
+    requires_tool_result_name: ?bool = null,
+    requires_assistant_after_tool_result: ?bool = null,
+    requires_thinking_as_text: ?bool = null,
+    requires_reasoning_content_on_assistant_messages: ?bool = null,
+    thinking_format: ?ThinkingFormat = null,
+    zai_tool_stream: ?bool = null,
+    supports_strict_mode: ?bool = null,
+    send_session_affinity_headers: ?bool = null,
+    send_session_id_header: ?bool = null,
+    supports_long_cache_retention: ?bool = null,
+    supports_eager_tool_input_streaming: ?bool = null,
+    supports_cache_control_on_tools: ?bool = null,
+    supports_temperature: ?bool = null,
+    force_adaptive_thinking: ?bool = null,
+    allow_empty_signature: ?bool = null,
+};
+
 pub const default_model_input = [_][]const u8{ "text", "image" };
+pub const default_image_output = [_][]const u8{"image"};
 
 pub const Model = struct {
     id: []const u8,
@@ -240,11 +311,25 @@ pub const Model = struct {
     api: Api,
     provider: []const u8,
     base_url: []const u8,
+    reasoning: bool = false,
+    thinking_level_map: ThinkingLevelMap = .{},
     input: []const []const u8 = &default_model_input,
     cost: ModelCost = .{},
     context_window: u64 = 128_000,
     max_tokens: u64 = 16_384,
-    reasoning: bool = false,
+    headers: []const Header = &.{},
+    compat: ModelCompat = .{},
+};
+
+pub const ImageModel = struct {
+    id: []const u8,
+    name: []const u8,
+    api: Api,
+    provider: []const u8,
+    base_url: []const u8,
+    input: []const []const u8 = &default_model_input,
+    output: []const []const u8 = &default_image_output,
+    cost: ModelCost = .{},
 };
 
 // Ported invariant from packages/ai/test/total-tokens.test.ts.

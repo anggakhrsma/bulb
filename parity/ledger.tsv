@@ -99,13 +99,13 @@ packages/ai/src/api-registry.ts	bulb_ai	source	in_progress	src/bulb_ai/api_regis
 packages/ai/src/bedrock-provider.ts	bulb_ai	source	pending		
 packages/ai/src/cli.ts	bulb_ai	source	pending		
 packages/ai/src/env-api-keys.ts	bulb_ai	source	in_progress	src/bulb_ai/utils/env_api_keys.zig	Provider key map, precedence, explicit Vertex API keys, and Bedrock ambient credential markers ported; filesystem-backed gcloud ADC remains
-packages/ai/src/image-models.generated.ts	bulb_ai	source	pending		
-packages/ai/src/image-models.ts	bulb_ai	source	pending		
+packages/ai/src/image-models.generated.ts	bulb_ai	source	implemented	src/bulb_ai/image_models_generated.zig	OpenRouter image model snapshot ported from the frozen generated registry
+packages/ai/src/image-models.ts	bulb_ai	source	implemented	src/bulb_ai/image_models.zig	Native image provider/model lookup, listing, and OpenRouter metadata regressions ported
 packages/ai/src/images-api-registry.ts	bulb_ai	source	pending		
 packages/ai/src/images.ts	bulb_ai	source	pending		
 packages/ai/src/index.ts	bulb_ai	source	pending		
-packages/ai/src/models.generated.ts	bulb_ai	source	pending		
-packages/ai/src/models.ts	bulb_ai	source	pending		
+packages/ai/src/models.generated.ts	bulb_ai	source	implemented	src/bulb_ai/models_generated.zig	All 925 generated text model metadata entries ported into a static Zig snapshot
+packages/ai/src/models.ts	bulb_ai	source	implemented	src/bulb_ai/models.zig	Native model lookup, provider/model iteration, cost calculation, thinking-level support, clamping, and equality helpers ported
 packages/ai/src/oauth.ts	bulb_ai	source	pending		
 packages/ai/src/providers/amazon-bedrock.ts	bulb_ai	source	pending		
 packages/ai/src/providers/anthropic.ts	bulb_ai	source	pending		
@@ -179,7 +179,7 @@ packages/ai/test/data/red-circle.png	bulb_ai	test	pending
 packages/ai/test/empty.test.ts	bulb_ai	test	pending		
 packages/ai/test/env-api-keys.test.ts	bulb_ai	test	implemented	src/bulb_ai/utils/env_api_keys.zig	Copilot generic-token exclusion and explicit credential resolution regression coverage ported
 packages/ai/test/faux-provider.test.ts	bulb_ai	test	in_progress	src/bulb_ai/faux_provider.zig	Native regression coverage ported for models, metadata, queues, factories, usage, cache simulation, stream events, aborts, and unregister
-packages/ai/test/fireworks-models.test.ts	bulb_ai	test	pending		
+packages/ai/test/fireworks-models.test.ts	bulb_ai	test	in_progress	src/bulb_ai/models.zig	Generated Fireworks model metadata, env-key mapping, and router discovery ported; Anthropic request compatibility tests remain with provider transport
 packages/ai/test/github-copilot-anthropic.test.ts	bulb_ai	test	pending		
 packages/ai/test/github-copilot-oauth.test.ts	bulb_ai	test	pending		
 packages/ai/test/google-shared-convert-tools.test.ts	bulb_ai	test	pending		
@@ -216,12 +216,12 @@ packages/ai/test/openai-responses-partial-json-cleanup.test.ts	bulb_ai	test	pend
 packages/ai/test/openai-responses-reasoning-replay-e2e.test.ts	bulb_ai	test	pending		
 packages/ai/test/openai-responses-tool-result-images.test.ts	bulb_ai	test	pending		
 packages/ai/test/openrouter-cache-write-repro.test.ts	bulb_ai	test	pending		
-packages/ai/test/openrouter-images.test.ts	bulb_ai	test	pending		
+packages/ai/test/openrouter-images.test.ts	bulb_ai	test	in_progress	src/bulb_ai/image_models.zig	OpenRouter image model metadata and registry lookup coverage started; image generation transport tests remain
 packages/ai/test/overflow.test.ts	bulb_ai	test	implemented	src/bulb_ai/utils/overflow.zig	Explicit provider, exclusion, silent, and length-stop overflow regressions ported
 packages/ai/test/responseid.test.ts	bulb_ai	test	pending		
 packages/ai/test/stream.test.ts	bulb_ai	test	pending		
-packages/ai/test/supports-xhigh.test.ts	bulb_ai	test	pending		
-packages/ai/test/together-models.test.ts	bulb_ai	test	pending		
+packages/ai/test/supports-xhigh.test.ts	bulb_ai	test	implemented	src/bulb_ai/models.zig	Supported thinking-level matrix ported against the generated model snapshot
+packages/ai/test/together-models.test.ts	bulb_ai	test	implemented	src/bulb_ai/models.zig	Together metadata, thinking-level maps, compat flags, and env-key coverage ported
 packages/ai/test/tokens.test.ts	bulb_ai	test	pending		
 packages/ai/test/tool-call-id-normalization.test.ts	bulb_ai	test	pending		
 packages/ai/test/tool-call-without-result.test.ts	bulb_ai	test	pending		
@@ -230,7 +230,7 @@ packages/ai/test/transform-messages-copilot-openai-to-anthropic.test.ts	bulb_ai	
 packages/ai/test/unicode-surrogate.test.ts	bulb_ai	test	pending		
 packages/ai/test/validation.test.ts	bulb_ai	test	in_progress	src/bulb_ai/utils/validation.zig	Serialized plain-schema primitive coercion and rejection cases ported with additional nested coverage
 packages/ai/test/xhigh.test.ts	bulb_ai	test	pending		
-packages/ai/test/xiaomi-models.test.ts	bulb_ai	test	pending		
+packages/ai/test/xiaomi-models.test.ts	bulb_ai	test	implemented	src/bulb_ai/models.zig	MiMo billing-provider and token-plan omission regressions ported
 packages/ai/test/xiaomi-token-plan-ams-anthropic-empty-signature-smoke.test.ts	bulb_ai	test	pending		
 packages/ai/test/zen.test.ts	bulb_ai	test	pending		
 packages/ai/tsconfig.build.json	bulb_ai	source	pending		

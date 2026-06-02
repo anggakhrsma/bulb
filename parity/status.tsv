@@ -4,6 +4,10 @@ packages/agent/src/agent.ts	in_progress	src/bulb_agent/root.zig	Initial streamin
 packages/agent/test/agent.test.ts	in_progress	src/bulb_agent/root.zig	Streaming-state guard cases started
 packages/ai/src/api-registry.ts	in_progress	src/bulb_ai/api_registry.zig	Native provider registration, dispatch, and unregister foundation
 packages/ai/src/env-api-keys.ts	in_progress	src/bulb_ai/utils/env_api_keys.zig	Provider key map, precedence, explicit Vertex API keys, and Bedrock ambient credential markers ported; filesystem-backed gcloud ADC remains
+packages/ai/src/image-models.generated.ts	implemented	src/bulb_ai/image_models_generated.zig	OpenRouter image model snapshot ported from the frozen generated registry
+packages/ai/src/image-models.ts	implemented	src/bulb_ai/image_models.zig	Native image provider/model lookup, listing, and OpenRouter metadata regressions ported
+packages/ai/src/models.generated.ts	implemented	src/bulb_ai/models_generated.zig	All 925 generated text model metadata entries ported into a static Zig snapshot
+packages/ai/src/models.ts	implemented	src/bulb_ai/models.zig	Native model lookup, provider/model iteration, cost calculation, thinking-level support, clamping, and equality helpers ported
 packages/ai/src/providers/faux.ts	in_progress	src/bulb_ai/faux_provider.zig	Registration, models, queueing, factories, usage, cache simulation, registry dispatch, delta streams, aborts, and unregister ported; paced async delivery remains
 packages/ai/src/session-resources.ts	implemented	src/bulb_ai/session_resources.zig	Native cleanup registry with deduplication, unregister, and invoke-all error behavior
 packages/ai/src/stream.ts	in_progress	src/bulb_ai/stream.zig	Native registry facade and environment API-key injection ported; simple-provider facade remains
@@ -15,10 +19,15 @@ packages/ai/src/utils/overflow.ts	implemented	src/bulb_ai/utils/overflow.zig	Pro
 packages/ai/src/utils/sanitize-unicode.ts	implemented	src/bulb_ai/utils/sanitize_unicode.zig	WTF-8 surrogate cleanup for native UTF-8 provider payloads
 packages/ai/src/utils/validation.ts	in_progress	src/bulb_ai/utils/validation.zig	Plain JSON schema primitive, nested object, array, and additional-property coercion ported; complete schema diagnostics remain
 packages/ai/test/env-api-keys.test.ts	implemented	src/bulb_ai/utils/env_api_keys.zig	Copilot generic-token exclusion and explicit credential resolution regression coverage ported
+packages/ai/test/fireworks-models.test.ts	in_progress	src/bulb_ai/models.zig	Generated Fireworks model metadata, env-key mapping, and router discovery ported; Anthropic request compatibility tests remain with provider transport
 packages/ai/test/faux-provider.test.ts	in_progress	src/bulb_ai/faux_provider.zig	Native regression coverage ported for models, metadata, queues, factories, usage, cache simulation, stream events, aborts, and unregister
+packages/ai/test/openrouter-images.test.ts	in_progress	src/bulb_ai/image_models.zig	OpenRouter image model metadata and registry lookup coverage started; image generation transport tests remain
 packages/ai/test/overflow.test.ts	implemented	src/bulb_ai/utils/overflow.zig	Explicit provider, exclusion, silent, and length-stop overflow regressions ported
+packages/ai/test/supports-xhigh.test.ts	implemented	src/bulb_ai/models.zig	Supported thinking-level matrix ported against the generated model snapshot
+packages/ai/test/together-models.test.ts	implemented	src/bulb_ai/models.zig	Together metadata, thinking-level maps, compat flags, and env-key coverage ported
 packages/ai/test/total-tokens.test.ts	in_progress	src/bulb_ai/types.zig	Total token accounting invariant started
 packages/ai/test/validation.test.ts	in_progress	src/bulb_ai/utils/validation.zig	Serialized plain-schema primitive coercion and rejection cases ported with additional nested coverage
+packages/ai/test/xiaomi-models.test.ts	implemented	src/bulb_ai/models.zig	MiMo billing-provider and token-plan omission regressions ported
 packages/tui/src/utils.ts	in_progress	src/bulb_tui/root.zig	Visible-width behavior started
 packages/tui/test/regression-regional-indicator-width.test.ts	in_progress	src/bulb_tui/root.zig	Regional-indicator regression cases started
 packages/tui/test/truncate-to-width.test.ts	in_progress	src/bulb_tui/root.zig	Visible-width subset started

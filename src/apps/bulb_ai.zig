@@ -22,6 +22,8 @@ pub fn main(init: std.process.Init) !void {
             \\
         );
         try stdout.print("Native APIs declared: {d}\n", .{ai.known_api_count});
+        try stdout.print("Text models in snapshot: {d}\n", .{ai.models.allModels().len});
+        try stdout.print("Image models in snapshot: {d}\n", .{ai.image_models.allImageModels().len});
     }
 
     try stdout.flush();
