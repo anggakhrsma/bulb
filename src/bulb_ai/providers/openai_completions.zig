@@ -1,5 +1,6 @@
 const std = @import("std");
 const cache_retention = @import("cache_retention.zig");
+const json_parse = @import("../utils/json_parse.zig");
 const models = @import("../models.zig");
 const openai_prompt_cache = @import("openai_prompt_cache.zig");
 const sanitize_unicode = @import("../utils/sanitize_unicode.zig");
@@ -48,6 +49,460 @@ pub const BuiltParams = struct {
     pub fn stringify(self: *const BuiltParams, allocator: std.mem.Allocator) ![]u8 {
         return std.json.Stringify.valueAlloc(allocator, self.value, .{});
     }
+};
+
+pub const ParsedStream = struct {
+    arena: std.heap.ArenaAllocator,
+    result: types.StreamResult,
+
+    pub fn deinit(self: *ParsedStream) void {
+        self.result.deinit();
+        self.arena.deinit();
+    }
+};
+
+pub const StopReasonMapping = struct {
+    stop_reason: types.StopReason,
+    error_message: ?[]const u8 = null,
+};
+
+pub fn parseStreamChunks(
+    allocator: std.mem.Allocator,
+    model: types.Model,
+    chunks_json: []const ?[]const u8,
+    options: types.StreamOptions,
+) !ParsedStream {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+
+    var parser = StreamParser.init(a, allocator, model, options);
+    errdefer parser.events.deinit(allocator);
+    try parser.emit(.{ .start = {} });
+
+    for (chunks_json) |chunk_json| {
+        if (isAborted(options)) break;
+        const json = chunk_json orelse continue;
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+        defer parsed.deinit();
+        try parser.processChunk(parsed.value);
+    }
+
+    try parser.finish();
+    return .{
+        .arena = arena,
+        .result = .{
+            .allocator = allocator,
+            .events = parser.events,
+            .message = parser.output,
+        },
+    };
+}
+
+pub fn parseChunkUsage(model: types.Model, raw_usage: std.json.Value) types.Usage {
+    const prompt_tokens = getUnsignedField(raw_usage, "prompt_tokens") orelse 0;
+    const completion_tokens = getUnsignedField(raw_usage, "completion_tokens") orelse 0;
+    const prompt_details = getObjectField(raw_usage, "prompt_tokens_details");
+    const cache_read_tokens = if (prompt_details) |details|
+        getUnsignedField(details, "cached_tokens") orelse (getUnsignedField(raw_usage, "prompt_cache_hit_tokens") orelse 0)
+    else
+        getUnsignedField(raw_usage, "prompt_cache_hit_tokens") orelse 0;
+    const cache_write_tokens = if (prompt_details) |details| getUnsignedField(details, "cache_write_tokens") orelse 0 else 0;
+    const non_output_prompt_tokens = cache_read_tokens +| cache_write_tokens;
+    const input_tokens = if (prompt_tokens > non_output_prompt_tokens) prompt_tokens - non_output_prompt_tokens else 0;
+
+    var usage: types.Usage = .{
+        .input = input_tokens,
+        .output = completion_tokens,
+        .cache_read = cache_read_tokens,
+        .cache_write = cache_write_tokens,
+    };
+    usage.calculateTotalTokens();
+    _ = models.calculateCost(model, &usage);
+    return usage;
+}
+
+pub fn mapStopReason(allocator: std.mem.Allocator, reason: []const u8) !StopReasonMapping {
+    if (eql(reason, "stop") or eql(reason, "end")) return .{ .stop_reason = .stop };
+    if (eql(reason, "length")) return .{ .stop_reason = .length };
+    if (eql(reason, "function_call") or eql(reason, "tool_calls")) return .{ .stop_reason = .tool_use };
+    if (eql(reason, "content_filter")) {
+        return .{ .stop_reason = .@"error", .error_message = "Provider finish_reason: content_filter" };
+    }
+    if (eql(reason, "network_error")) {
+        return .{ .stop_reason = .@"error", .error_message = "Provider finish_reason: network_error" };
+    }
+    return .{
+        .stop_reason = .@"error",
+        .error_message = try std.fmt.allocPrint(allocator, "Provider finish_reason: {s}", .{reason}),
+    };
+}
+
+const StreamParser = struct {
+    allocator: std.mem.Allocator,
+    event_allocator: std.mem.Allocator,
+    model: types.Model,
+    options: types.StreamOptions,
+    events: std.ArrayList(types.StreamEvent) = .empty,
+    output: types.AssistantMessage,
+    blocks: std.ArrayList(StreamingBlock) = .empty,
+    text_index: ?usize = null,
+    thinking_index: ?usize = null,
+    has_finish_reason: bool = false,
+    finalized: bool = false,
+    tool_blocks_by_index: std.AutoHashMap(usize, usize),
+    tool_blocks_by_id: std.StringHashMap(usize),
+
+    fn init(
+        allocator: std.mem.Allocator,
+        event_allocator: std.mem.Allocator,
+        model: types.Model,
+        options: types.StreamOptions,
+    ) StreamParser {
+        return .{
+            .allocator = allocator,
+            .event_allocator = event_allocator,
+            .model = model,
+            .options = options,
+            .output = .{
+                .content = &.{},
+                .api = model.api,
+                .provider = model.provider,
+                .model = model.id,
+                .usage = .{},
+                .stop_reason = .stop,
+            },
+            .tool_blocks_by_index = std.AutoHashMap(usize, usize).init(allocator),
+            .tool_blocks_by_id = std.StringHashMap(usize).init(allocator),
+        };
+    }
+
+    fn processChunk(self: *StreamParser, chunk: std.json.Value) !void {
+        if (chunk != .object) return;
+
+        if (self.output.response_id == null) {
+            if (getStringField(chunk, "id")) |id| {
+                if (id.len > 0) self.output.response_id = try self.allocator.dupe(u8, id);
+            }
+        }
+        if (self.output.response_model == null) {
+            if (getStringField(chunk, "model")) |response_model| {
+                if (response_model.len > 0 and !eql(response_model, self.model.id)) {
+                    self.output.response_model = try self.allocator.dupe(u8, response_model);
+                }
+            }
+        }
+        if (chunk.object.get("usage")) |usage| {
+            self.output.usage = parseChunkUsage(self.model, usage);
+        }
+
+        const choices = chunk.object.get("choices") orelse return;
+        if (choices != .array or choices.array.items.len == 0) return;
+        const choice = choices.array.items[0];
+        if (choice != .object) return;
+
+        if (chunk.object.get("usage") == null) {
+            if (choice.object.get("usage")) |usage| {
+                self.output.usage = parseChunkUsage(self.model, usage);
+            }
+        }
+
+        if (getStringField(choice, "finish_reason")) |reason| {
+            const mapped = try mapStopReason(self.allocator, reason);
+            self.output.stop_reason = mapped.stop_reason;
+            if (mapped.error_message) |message| {
+                self.output.error_message = if (std.mem.startsWith(u8, message, "Provider finish_reason:"))
+                    message
+                else
+                    try self.allocator.dupe(u8, message);
+            }
+            self.has_finish_reason = true;
+        }
+
+        if (choice.object.get("delta")) |delta| {
+            try self.processDelta(delta);
+        }
+    }
+
+    fn processDelta(self: *StreamParser, delta: std.json.Value) !void {
+        if (delta != .object) return;
+
+        if (getStringField(delta, "content")) |content| {
+            if (content.len > 0) try self.appendTextDelta(content);
+        }
+
+        const reasoning_fields = [_][]const u8{ "reasoning_content", "reasoning", "reasoning_text" };
+        for (reasoning_fields) |field| {
+            const value = getStringField(delta, field) orelse continue;
+            if (value.len == 0) continue;
+            const signature = if (eql(self.model.provider, "opencode-go") and eql(field, "reasoning")) "reasoning_content" else field;
+            try self.appendThinkingDelta(signature, value);
+            break;
+        }
+
+        if (delta.object.get("tool_calls")) |tool_calls| {
+            if (tool_calls == .array) {
+                for (tool_calls.array.items) |tool_call| {
+                    try self.processToolCallDelta(tool_call);
+                }
+            }
+        }
+
+        if (delta.object.get("reasoning_details")) |details| {
+            try self.processReasoningDetails(details);
+        }
+    }
+
+    fn appendTextDelta(self: *StreamParser, delta: []const u8) !void {
+        const index = try self.ensureTextBlock();
+        try self.blocks.items[index].text.text.appendSlice(self.allocator, delta);
+        try self.emit(.{ .text_delta = .{
+            .content_index = index,
+            .delta = try self.allocator.dupe(u8, delta),
+        } });
+    }
+
+    fn appendThinkingDelta(self: *StreamParser, signature: []const u8, delta: []const u8) !void {
+        const index = try self.ensureThinkingBlock(signature);
+        try self.blocks.items[index].thinking.thinking.appendSlice(self.allocator, delta);
+        try self.emit(.{ .thinking_delta = .{
+            .content_index = index,
+            .delta = try self.allocator.dupe(u8, delta),
+        } });
+    }
+
+    fn processToolCallDelta(self: *StreamParser, tool_call: std.json.Value) !void {
+        if (tool_call != .object) return;
+        const index = try self.ensureToolCallBlock(tool_call);
+        const args_delta = getNestedStringField(tool_call, "function", "arguments") orelse "";
+        if (args_delta.len > 0) {
+            try self.blocks.items[index].tool_call.partial_args.appendSlice(self.allocator, args_delta);
+        }
+        try self.emit(.{ .toolcall_delta = .{
+            .content_index = index,
+            .delta = try self.allocator.dupe(u8, args_delta),
+        } });
+    }
+
+    fn processReasoningDetails(self: *StreamParser, details: std.json.Value) !void {
+        if (details != .array) return;
+        for (details.array.items) |detail| {
+            if (detail != .object) continue;
+            const detail_type = getStringField(detail, "type") orelse continue;
+            if (!eql(detail_type, "reasoning.encrypted")) continue;
+            const id = getStringField(detail, "id") orelse continue;
+            const data = getStringField(detail, "data") orelse continue;
+            if (id.len == 0 or data.len == 0) continue;
+
+            const block_index = self.tool_blocks_by_id.get(id) orelse self.findToolBlockById(id) orelse continue;
+            const signature = try std.json.Stringify.valueAlloc(self.allocator, detail, .{});
+            self.blocks.items[block_index].tool_call.thought_signature = signature;
+        }
+    }
+
+    fn ensureTextBlock(self: *StreamParser) !usize {
+        if (self.text_index) |index| return index;
+        const index = self.blocks.items.len;
+        try self.blocks.append(self.allocator, .{ .text = .{} });
+        self.text_index = index;
+        try self.emit(.{ .text_start = .{ .content_index = index } });
+        return index;
+    }
+
+    fn ensureThinkingBlock(self: *StreamParser, signature: []const u8) !usize {
+        if (self.thinking_index) |index| return index;
+        const index = self.blocks.items.len;
+        try self.blocks.append(self.allocator, .{
+            .thinking = .{
+                .thinking_signature = try self.allocator.dupe(u8, signature),
+            },
+        });
+        self.thinking_index = index;
+        try self.emit(.{ .thinking_start = .{ .content_index = index } });
+        return index;
+    }
+
+    fn ensureToolCallBlock(self: *StreamParser, tool_call: std.json.Value) !usize {
+        const stream_index = getUnsignedField(tool_call, "index");
+        if (stream_index) |raw_index| {
+            const index = std.math.cast(usize, raw_index) orelse return error.StreamIndexTooLarge;
+            if (self.tool_blocks_by_index.get(index)) |block_index| {
+                try self.refreshToolCallBlock(block_index, tool_call, index);
+                return block_index;
+            }
+        }
+
+        const id = getStringField(tool_call, "id");
+        if (id) |value| {
+            if (self.tool_blocks_by_id.get(value)) |block_index| {
+                if (stream_index) |raw_index| {
+                    const index = std.math.cast(usize, raw_index) orelse return error.StreamIndexTooLarge;
+                    try self.refreshToolCallBlock(block_index, tool_call, index);
+                } else {
+                    try self.refreshToolCallBlock(block_index, tool_call, null);
+                }
+                return block_index;
+            }
+        }
+
+        const index = self.blocks.items.len;
+        const initial_id = try self.allocator.dupe(u8, id orelse "");
+        const function_name = getNestedStringField(tool_call, "function", "name") orelse "";
+        const initial_name = try self.allocator.dupe(u8, function_name);
+        const block_stream_index = if (stream_index) |raw_index| std.math.cast(usize, raw_index) orelse return error.StreamIndexTooLarge else null;
+
+        try self.blocks.append(self.allocator, .{
+            .tool_call = .{
+                .id = initial_id,
+                .name = initial_name,
+                .stream_index = block_stream_index,
+            },
+        });
+        if (block_stream_index) |index_key| try self.tool_blocks_by_index.put(index_key, index);
+        if (id) |value| {
+            if (value.len > 0) try self.tool_blocks_by_id.put(try self.allocator.dupe(u8, value), index);
+        }
+        try self.emit(.{ .toolcall_start = .{ .content_index = index } });
+        return index;
+    }
+
+    fn refreshToolCallBlock(self: *StreamParser, block_index: usize, tool_call: std.json.Value, stream_index: ?usize) !void {
+        const block = &self.blocks.items[block_index].tool_call;
+        if (stream_index) |index| {
+            if (block.stream_index == null) block.stream_index = index;
+            try self.tool_blocks_by_index.put(index, block_index);
+        }
+        if (getStringField(tool_call, "id")) |id| {
+            if (id.len > 0) {
+                const id_key = try self.allocator.dupe(u8, id);
+                if (block.id.len == 0) block.id = id_key;
+                try self.tool_blocks_by_id.put(id_key, block_index);
+            }
+        }
+        if (getNestedStringField(tool_call, "function", "name")) |name| {
+            if (name.len > 0 and block.name.len == 0) {
+                block.name = try self.allocator.dupe(u8, name);
+            }
+        }
+    }
+
+    fn findToolBlockById(self: *const StreamParser, id: []const u8) ?usize {
+        for (self.blocks.items, 0..) |block, index| {
+            if (block == .tool_call and eql(block.tool_call.id, id)) return index;
+        }
+        return null;
+    }
+
+    fn finish(self: *StreamParser) !void {
+        try self.finalizeBlocks();
+        if (isAborted(self.options)) {
+            try self.emitTerminal(.aborted, "Request was aborted");
+            return;
+        }
+        if (self.output.stop_reason == .aborted) {
+            try self.emitTerminal(.aborted, "Request was aborted");
+            return;
+        }
+        if (self.output.stop_reason == .@"error") {
+            try self.emitTerminal(.@"error", self.output.error_message orelse "Provider returned an error stop reason");
+            return;
+        }
+        if (!self.has_finish_reason) {
+            try self.emitTerminal(.@"error", "Stream ended without finish_reason");
+            return;
+        }
+
+        try self.emit(.{ .done = self.output.stop_reason });
+    }
+
+    fn finalizeBlocks(self: *StreamParser) !void {
+        if (self.finalized) return;
+        self.finalized = true;
+
+        var content = std.ArrayList(types.AssistantContent).empty;
+        for (self.blocks.items, 0..) |*block, index| {
+            switch (block.*) {
+                .text => |*text| {
+                    const final_text = try text.text.toOwnedSlice(self.allocator);
+                    try content.append(self.allocator, .{ .text = .{ .text = final_text } });
+                    try self.emit(.{ .text_end = .{
+                        .content_index = index,
+                        .content = final_text,
+                    } });
+                },
+                .thinking => |*thinking| {
+                    const final_thinking = try thinking.thinking.toOwnedSlice(self.allocator);
+                    try content.append(self.allocator, .{ .thinking = .{
+                        .thinking = final_thinking,
+                        .thinking_signature = thinking.thinking_signature,
+                    } });
+                    try self.emit(.{ .thinking_end = .{
+                        .content_index = index,
+                        .content = final_thinking,
+                    } });
+                },
+                .tool_call => |*tool_call| {
+                    const partial_args = try tool_call.partial_args.toOwnedSlice(self.allocator);
+                    var parsed_args = try json_parse.parseStreamingJson(self.allocator, partial_args);
+                    defer parsed_args.deinit();
+                    const arguments_json = try std.json.Stringify.valueAlloc(self.allocator, parsed_args.value, .{});
+                    tool_call.arguments_json = arguments_json;
+                    const final_call: types.ToolCall = .{
+                        .id = tool_call.id,
+                        .name = tool_call.name,
+                        .arguments_json = arguments_json,
+                        .thought_signature = tool_call.thought_signature,
+                    };
+                    try content.append(self.allocator, .{ .tool_call = final_call });
+                    try self.emit(.{ .toolcall_end = .{
+                        .content_index = index,
+                        .tool_call = final_call,
+                    } });
+                },
+            }
+        }
+        self.output.content = try content.toOwnedSlice(self.allocator);
+    }
+
+    fn emitTerminal(self: *StreamParser, reason: types.StopReason, message: []const u8) !void {
+        self.output.stop_reason = reason;
+        self.output.error_message = try self.allocator.dupe(u8, message);
+        try self.emit(.{ .@"error" = .{
+            .reason = reason,
+            .message = self.output,
+        } });
+    }
+
+    fn emit(self: *StreamParser, event: types.StreamEvent) !void {
+        try self.events.append(self.event_allocator, event);
+        if (self.options.signal) |signal| {
+            if (self.options.on_event) |observer| observer(signal, event);
+        }
+    }
+};
+
+const StreamingBlock = union(enum) {
+    text: TextState,
+    thinking: ThinkingState,
+    tool_call: ToolCallState,
+};
+
+const TextState = struct {
+    text: std.ArrayList(u8) = .empty,
+};
+
+const ThinkingState = struct {
+    thinking: std.ArrayList(u8) = .empty,
+    thinking_signature: []const u8,
+};
+
+const ToolCallState = struct {
+    id: []const u8,
+    name: []const u8,
+    partial_args: std.ArrayList(u8) = .empty,
+    arguments_json: []const u8 = "{}",
+    thought_signature: ?[]const u8 = null,
+    stream_index: ?usize = null,
 };
 
 pub fn buildParams(
@@ -865,11 +1320,41 @@ fn getStringField(value: std.json.Value, field: []const u8) ?[]const u8 {
     return if (nested == .string) nested.string else null;
 }
 
+fn getNestedStringField(value: std.json.Value, object_field: []const u8, string_field: []const u8) ?[]const u8 {
+    const nested = getObjectField(value, object_field) orelse return null;
+    return getStringField(nested, string_field);
+}
+
+fn getObjectField(value: std.json.Value, field: []const u8) ?std.json.Value {
+    if (value != .object) return null;
+    const nested = value.object.get(field) orelse return null;
+    return if (nested == .object) nested else null;
+}
+
+fn getUnsignedField(value: std.json.Value, field: []const u8) ?u64 {
+    if (value != .object) return null;
+    const nested = value.object.get(field) orelse return null;
+    return unsignedFromValue(nested);
+}
+
+fn unsignedFromValue(value: std.json.Value) ?u64 {
+    return switch (value) {
+        .integer => |integer| if (integer >= 0) @intCast(integer) else null,
+        .float => |float| if (float >= 0 and float <= @as(f64, @floatFromInt(std.math.maxInt(u64)))) @intFromFloat(float) else null,
+        .number_string => |number| std.fmt.parseInt(u64, number, 10) catch null,
+        else => null,
+    };
+}
+
 fn modelSupportsInput(model: types.Model, input: []const u8) bool {
     for (model.input) |candidate| {
         if (eql(candidate, input)) return true;
     }
     return false;
+}
+
+fn isAborted(options: types.StreamOptions) bool {
+    return if (options.signal) |signal| signal.aborted else false;
 }
 
 fn contains(haystack: []const u8, needle: []const u8) bool {
@@ -1194,4 +1679,235 @@ test "OpenAI completions serializes thinking replay as assistant text parts when
     try expectJsonEqual(assistant,
         \\{"role":"assistant","content":[{"type":"text","text":"internal reasoning"},{"type":"text","text":"visible answer"}]}
     );
+}
+
+// Ported from packages/ai/test/openai-completions-tool-choice.test.ts.
+test "OpenAI completions stream parser ignores null chunks and maps usage" {
+    const model = openAICompletionsTestModel();
+    const chunks = [_]?[]const u8{
+        null,
+        \\{"id":"chatcmpl-test","choices":[{"delta":{"content":"OK"},"finish_reason":null}]}
+        ,
+        \\{"id":"chatcmpl-test","choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1,"prompt_tokens_details":{"cached_tokens":0},"completion_tokens_details":{"reasoning_tokens":0}}}
+        ,
+    };
+
+    var parsed = try parseStreamChunks(std.testing.allocator, model, &chunks, .{});
+    defer parsed.deinit();
+
+    const message = parsed.result.message;
+    try std.testing.expectEqual(types.StopReason.stop, message.stop_reason);
+    try std.testing.expect(message.error_message == null);
+    try std.testing.expectEqualStrings("chatcmpl-test", message.response_id.?);
+    try std.testing.expectEqual(@as(u64, 4), message.usage.total_tokens);
+    try std.testing.expectEqual(@as(usize, 1), message.content.len);
+    try std.testing.expectEqualStrings("OK", message.content[0].text.text);
+    try std.testing.expectEqual(@as(usize, 1), countEvents(parsed.result.events.items, .text_start));
+    try std.testing.expectEqual(@as(usize, 1), countEvents(parsed.result.events.items, .text_delta));
+    try std.testing.expectEqual(@as(usize, 1), countEvents(parsed.result.events.items, .text_end));
+    try std.testing.expectEqual(@as(usize, 1), countEvents(parsed.result.events.items, .done));
+}
+
+// Ported from packages/ai/test/openai-completions-tool-choice.test.ts.
+test "OpenAI completions stream parser surfaces provider finish errors and truncated streams" {
+    const model = openAICompletionsTestModel();
+    const network_error_chunks = [_]?[]const u8{
+        \\{"choices":[{"delta":{"content":"partial"},"finish_reason":null}]}
+        ,
+        \\{"choices":[{"delta":{},"finish_reason":"network_error"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"prompt_tokens_details":{"cached_tokens":0},"completion_tokens_details":{"reasoning_tokens":0}}}
+        ,
+    };
+
+    var network_error = try parseStreamChunks(std.testing.allocator, model, &network_error_chunks, .{});
+    defer network_error.deinit();
+    try std.testing.expectEqual(types.StopReason.@"error", network_error.result.message.stop_reason);
+    try std.testing.expectEqualStrings("Provider finish_reason: network_error", network_error.result.message.error_message.?);
+    try std.testing.expectEqualStrings("partial", network_error.result.message.content[0].text.text);
+    try std.testing.expectEqual(@as(usize, 1), countEvents(network_error.result.events.items, .@"error"));
+
+    const truncated_chunks = [_]?[]const u8{
+        \\{"id":"chatcmpl-truncated","choices":[{"delta":{"content":"partial answer"},"finish_reason":null}]}
+        ,
+        \\{"id":"chatcmpl-truncated","choices":[{"delta":{"content":"partial answer"},"finish_reason":null}]}
+        ,
+    };
+    var truncated = try parseStreamChunks(std.testing.allocator, model, &truncated_chunks, .{});
+    defer truncated.deinit();
+    try std.testing.expectEqual(types.StopReason.@"error", truncated.result.message.stop_reason);
+    try std.testing.expectEqualStrings("Stream ended without finish_reason", truncated.result.message.error_message.?);
+    try std.testing.expectEqualStrings("partial answerpartial answer", truncated.result.message.content[0].text.text);
+}
+
+// Ported from packages/ai/test/openai-completions-response-model.test.ts.
+test "OpenAI completions stream parser exposes routed response model" {
+    const model: types.Model = .{
+        .id = "openrouter/auto",
+        .name = "OpenRouter Auto",
+        .api = types.api.openai_completions,
+        .provider = "openrouter",
+        .base_url = "https://openrouter.ai/api/v1",
+        .reasoning = false,
+        .input = &.{"text"},
+        .context_window = 200_000,
+        .max_tokens = 8192,
+    };
+    const chunks = [_]?[]const u8{
+        \\{"id":"chatcmpl-1","model":"anthropic/claude-opus-4.8","choices":[{"index":0,"delta":{"content":"hi"}}]}
+        ,
+        \\{"id":"chatcmpl-1","model":"anthropic/claude-opus-4.8","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":0},"completion_tokens_details":{"reasoning_tokens":0}}}
+        ,
+    };
+
+    var parsed = try parseStreamChunks(std.testing.allocator, model, &chunks, .{});
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("openrouter/auto", parsed.result.message.model);
+    try std.testing.expectEqualStrings("anthropic/claude-opus-4.8", parsed.result.message.response_model.?);
+    try std.testing.expectEqualStrings("openrouter", parsed.result.message.provider);
+    try std.testing.expectEqual(types.StopReason.stop, parsed.result.message.stop_reason);
+}
+
+// Ported from packages/ai/test/openai-completions-tool-choice.test.ts and
+// packages/ai/test/openrouter-cache-write-repro.test.ts.
+test "OpenAI completions stream parser preserves cache write usage" {
+    const model = openAICompletionsTestModel();
+    const chunks = [_]?[]const u8{
+        \\{"id":"chatcmpl-cache-write","choices":[{"delta":{"content":"OK"},"finish_reason":null}]}
+        ,
+        \\{"id":"chatcmpl-cache-write","choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":50,"cache_write_tokens":30},"completion_tokens_details":{"reasoning_tokens":0}}}
+        ,
+    };
+
+    var parsed = try parseStreamChunks(std.testing.allocator, model, &chunks, .{});
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(u64, 20), parsed.result.message.usage.input);
+    try std.testing.expectEqual(@as(u64, 5), parsed.result.message.usage.output);
+    try std.testing.expectEqual(@as(u64, 50), parsed.result.message.usage.cache_read);
+    try std.testing.expectEqual(@as(u64, 30), parsed.result.message.usage.cache_write);
+    try std.testing.expectEqual(@as(u64, 105), parsed.result.message.usage.total_tokens);
+}
+
+// Ported from packages/ai/test/openai-completions-tool-choice.test.ts.
+test "OpenAI completions stream parser coalesces mutating tool-call ids by stable index" {
+    const model = openAICompletionsTestModel();
+    const chunks = [_]?[]const u8{
+        \\{"id":"chatcmpl-kimi-bad-stream","choices":[{"delta":{"tool_calls":[{"index":0,"id":"functions.read:0","type":"function","function":{"name":"read","arguments":""}}]},"finish_reason":null}]}
+        ,
+        \\{"id":"chatcmpl-kimi-bad-stream","choices":[{"delta":{"tool_calls":[{"index":0,"id":"chatcmpl-tool-a","type":"function","function":{"name":null,"arguments":"{\"path\":\"README"}}]},"finish_reason":null}]}
+        ,
+        \\{"id":"chatcmpl-kimi-bad-stream","choices":[{"delta":{"tool_calls":[{"index":0,"id":"chatcmpl-tool-b","type":"function","function":{"name":null,"arguments":".md\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":0},"completion_tokens_details":{"reasoning_tokens":0}}}
+        ,
+    };
+
+    var parsed = try parseStreamChunks(std.testing.allocator, model, &chunks, .{});
+    defer parsed.deinit();
+
+    const message = parsed.result.message;
+    try std.testing.expectEqual(types.StopReason.tool_use, message.stop_reason);
+    try std.testing.expectEqual(@as(usize, 1), message.content.len);
+    const tool_call = message.content[0].tool_call;
+    try std.testing.expectEqualStrings("functions.read:0", tool_call.id);
+    try std.testing.expectEqualStrings("read", tool_call.name);
+    try std.testing.expectEqualStrings("{\"path\":\"README.md\"}", tool_call.arguments_json);
+    try std.testing.expectEqual(@as(usize, 1), countEvents(parsed.result.events.items, .toolcall_start));
+    try std.testing.expectEqual(@as(usize, 3), countEvents(parsed.result.events.items, .toolcall_delta));
+    try std.testing.expectEqual(@as(usize, 1), countEvents(parsed.result.events.items, .toolcall_end));
+    for (parsed.result.events.items) |event| {
+        switch (event) {
+            .toolcall_start => |item| try std.testing.expectEqual(@as(usize, 0), item.content_index),
+            .toolcall_delta => |item| try std.testing.expectEqual(@as(usize, 0), item.content_index),
+            .toolcall_end => |item| try std.testing.expectEqual(@as(usize, 0), item.content_index),
+            else => {},
+        }
+    }
+}
+
+// Ported from packages/ai/test/openai-completions-tool-choice.test.ts.
+test "OpenAI completions stream parser accumulates mixed text reasoning and parallel tools" {
+    const model = openAICompletionsTestModel();
+    const chunks = [_]?[]const u8{
+        \\{"id":"chatcmpl-mixed-deltas","choices":[{"delta":{"content":"answer 1","reasoning_content":"think 1","tool_calls":[{"index":0,"id":"tc_read_initial","type":"function","function":{"name":"read","arguments":"{\"path\":\"README"}},{"index":1,"id":"tc_grep_initial","type":"function","function":{"name":"grep","arguments":"{\"pattern\":\"TODO"}},{"id":"tc_list_no_index","type":"function","function":{"name":"list","arguments":"{\"path\":\"packages"}},{"id":"tc_write_no_index","type":"function","function":{"name":"write","arguments":"{\"path\":\"out"}}]},"finish_reason":null}]}
+        ,
+        \\{"id":"chatcmpl-mixed-deltas","choices":[{"delta":{"content":" answer 2","tool_calls":[{"index":1,"id":"tc_grep_changed","type":"function","function":{"arguments":"\",\"path\":\"src"}},{"id":"tc_write_no_index","type":"function","function":{"arguments":".txt\",\"content\":\"ok\"}"}},{"id":"tc_list_no_index","type":"function","function":{"arguments":"/ai\"}"}}]},"finish_reason":null}]}
+        ,
+        \\{"id":"chatcmpl-mixed-deltas","choices":[{"delta":{"content":"\n","reasoning_content":" think 2","tool_calls":[{"index":0,"id":"tc_read_changed","type":"function","function":{"arguments":".md\"}"}},{"index":1,"type":"function","function":{"arguments":"\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":8,"prompt_tokens_details":{"cached_tokens":0},"completion_tokens_details":{"reasoning_tokens":2}}}
+        ,
+    };
+
+    var parsed = try parseStreamChunks(std.testing.allocator, model, &chunks, .{});
+    defer parsed.deinit();
+
+    const message = parsed.result.message;
+    try std.testing.expectEqual(types.StopReason.tool_use, message.stop_reason);
+    try std.testing.expectEqual(@as(usize, 6), message.content.len);
+    try std.testing.expectEqualStrings("answer 1 answer 2\n", message.content[0].text.text);
+    try std.testing.expectEqualStrings("think 1 think 2", message.content[1].thinking.thinking);
+    try std.testing.expectEqualStrings("reasoning_content", message.content[1].thinking.thinking_signature.?);
+    try std.testing.expectEqualStrings("{\"path\":\"README.md\"}", message.content[2].tool_call.arguments_json);
+    try std.testing.expectEqualStrings("{\"pattern\":\"TODO\",\"path\":\"src\"}", message.content[3].tool_call.arguments_json);
+    try std.testing.expectEqualStrings("{\"path\":\"packages/ai\"}", message.content[4].tool_call.arguments_json);
+    try std.testing.expectEqualStrings("{\"path\":\"out.txt\",\"content\":\"ok\"}", message.content[5].tool_call.arguments_json);
+    try std.testing.expectEqual(@as(usize, 1), countEvents(parsed.result.events.items, .text_start));
+    try std.testing.expectEqual(@as(usize, 3), countEvents(parsed.result.events.items, .text_delta));
+    try std.testing.expectEqual(@as(usize, 1), countEvents(parsed.result.events.items, .thinking_start));
+    try std.testing.expectEqual(@as(usize, 2), countEvents(parsed.result.events.items, .thinking_delta));
+    try std.testing.expectEqual(@as(usize, 4), countEvents(parsed.result.events.items, .toolcall_start));
+    try std.testing.expectEqual(@as(usize, 9), countEvents(parsed.result.events.items, .toolcall_delta));
+    try std.testing.expectEqual(@as(usize, 4), countEvents(parsed.result.events.items, .toolcall_end));
+}
+
+// Ported from packages/ai/test/openai-completions-tool-choice.test.ts.
+test "OpenAI completions stream parser records reasoning signatures" {
+    var opencode = (models.getModel("opencode-go", "kimi-k2.6") orelse return error.ModelMissing).*;
+    opencode.api = types.api.openai_completions;
+    const opencode_chunks = [_]?[]const u8{
+        \\{"id":"chatcmpl-opencode-go-reasoning","choices":[{"delta":{"reasoning":"think"},"finish_reason":"stop"}]}
+        ,
+    };
+    var opencode_parsed = try parseStreamChunks(std.testing.allocator, opencode, &opencode_chunks, .{});
+    defer opencode_parsed.deinit();
+    try std.testing.expectEqualStrings("think", opencode_parsed.result.message.content[0].thinking.thinking);
+    try std.testing.expectEqualStrings("reasoning_content", opencode_parsed.result.message.content[0].thinking.thinking_signature.?);
+
+    const openai = openAICompletionsTestModel();
+    const openai_chunks = [_]?[]const u8{
+        \\{"id":"chatcmpl-reasoning","choices":[{"delta":{"reasoning":"think"},"finish_reason":"stop"}]}
+        ,
+    };
+    var openai_parsed = try parseStreamChunks(std.testing.allocator, openai, &openai_chunks, .{});
+    defer openai_parsed.deinit();
+    try std.testing.expectEqualStrings("reasoning", openai_parsed.result.message.content[0].thinking.thinking_signature.?);
+}
+
+test "OpenAI completions stream parser attaches encrypted reasoning details to matching tool calls" {
+    const model = openAICompletionsTestModel();
+    const chunks = [_]?[]const u8{
+        \\{"id":"chatcmpl-reasoning-details","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"read","arguments":"{\"path\":\"README.md\"}"}}],"reasoning_details":[{"type":"reasoning.encrypted","id":"call_1","data":"sealed"}]},"finish_reason":"tool_calls"}]}
+        ,
+    };
+
+    var parsed = try parseStreamChunks(std.testing.allocator, model, &chunks, .{});
+    defer parsed.deinit();
+
+    const signature = parsed.result.message.content[0].tool_call.thought_signature.?;
+    var signature_json = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, signature, .{});
+    defer signature_json.deinit();
+    try std.testing.expectEqualStrings("reasoning.encrypted", signature_json.value.object.get("type").?.string);
+    try std.testing.expectEqualStrings("call_1", signature_json.value.object.get("id").?.string);
+    try std.testing.expectEqualStrings("sealed", signature_json.value.object.get("data").?.string);
+}
+
+fn openAICompletionsTestModel() types.Model {
+    var model = (models.getModel("openai", "gpt-4o-mini") orelse unreachable).*;
+    model.api = types.api.openai_completions;
+    return model;
+}
+
+fn countEvents(events: []const types.StreamEvent, comptime tag: std.meta.Tag(types.StreamEvent)) usize {
+    var count: usize = 0;
+    for (events) |event| {
+        if (std.meta.activeTag(event) == tag) count += 1;
+    }
+    return count;
 }

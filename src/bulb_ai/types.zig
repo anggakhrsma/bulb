@@ -138,6 +138,7 @@ pub const AssistantMessage = struct {
     api: Api,
     provider: []const u8,
     model: []const u8,
+    response_model: ?[]const u8 = null,
     usage: Usage = .{},
     stop_reason: StopReason = .stop,
     error_message: ?[]const u8 = null,
