@@ -10,6 +10,9 @@ packages/ai/src/models.generated.ts	implemented	src/bulb_ai/models_generated.zig
 packages/ai/src/models.ts	implemented	src/bulb_ai/models.zig	Native model lookup, provider/model iteration, cost calculation, thinking-level support, clamping, and equality helpers ported
 packages/ai/src/providers/anthropic.ts	in_progress	src/bulb_ai/providers/anthropic_sse.zig	Raw SSE decoder, Anthropic message-event filtering, malformed JSON repair, usage/stop mapping, text accumulation, and streamed tool-JSON reconstruction ported; HTTP/auth/request transform remains
 packages/ai/src/providers/faux.ts	in_progress	src/bulb_ai/faux_provider.zig	Registration, models, queueing, factories, usage, cache simulation, registry dispatch, delta streams, aborts, and unregister ported; paced async delivery remains
+packages/ai/src/providers/openai-prompt-cache.ts	implemented	src/bulb_ai/providers/openai_prompt_cache.zig	OpenAI prompt-cache key clamping and prompt-cache retention helpers ported with Unicode-aware truncation
+packages/ai/src/providers/simple-options.ts	implemented	src/bulb_ai/providers/simple_options.zig	Native base-option copy, xhigh-to-high reasoning clamp, and thinking-budget token adjustment ported
+packages/ai/src/providers/transform-messages.ts	implemented	src/bulb_ai/providers/transform_messages.zig	Unsupported image downgrade, thinking replay transforms, tool-call ID normalization, errored-turn filtering, and synthetic missing tool results ported
 packages/ai/src/session-resources.ts	implemented	src/bulb_ai/session_resources.zig	Native cleanup registry with deduplication, unregister, and invoke-all error behavior
 packages/ai/src/stream.ts	in_progress	src/bulb_ai/stream.zig	Native registry facade and environment API-key injection ported; simple-provider facade remains
 packages/ai/src/types.ts	in_progress	src/bulb_ai/types.zig	Core messages, contexts, options, usage accounting, models, and stream event protocol started
@@ -21,8 +24,10 @@ packages/ai/src/utils/headers.ts	implemented	src/bulb_ai/utils/headers.zig	Heade
 packages/ai/src/utils/json-parse.ts	in_progress	src/bulb_ai/utils/json_parse.zig	JSON literal repair and native partial-object completion ported; provider integration remains
 packages/ai/src/utils/overflow.ts	implemented	src/bulb_ai/utils/overflow.zig	Provider error patterns, exclusions, silent overflow, and length-stop overflow ported
 packages/ai/src/utils/sanitize-unicode.ts	implemented	src/bulb_ai/utils/sanitize_unicode.zig	WTF-8 surrogate cleanup for native UTF-8 provider payloads
+packages/ai/src/utils/typebox-helpers.ts	implemented	src/bulb_ai/utils/typebox_helpers.zig	Native StringEnum helper emits provider-compatible JSON schema without TypeScript/TypeBox runtime
 packages/ai/src/utils/validation.ts	in_progress	src/bulb_ai/utils/validation.zig	Plain JSON schema primitive, nested object, array, and additional-property coercion ported; complete schema diagnostics remain
 packages/ai/test/anthropic-sse-parsing.test.ts	in_progress	src/bulb_ai/providers/anthropic_sse.zig	Raw malformed SSE JSON repair, streamed tool JSON repair, and unknown post-stop event regressions ported; full fake Anthropic client path remains
+packages/ai/test/cache-retention.test.ts	in_progress	src/bulb_ai/providers/cache_retention.zig	Cache-retention resolver, Anthropic cache-control ttl, OpenAI prompt_cache_key, and prompt_cache_retention regressions ported as provider helpers; full payload-builder capture remains
 packages/ai/test/env-api-keys.test.ts	implemented	src/bulb_ai/utils/env_api_keys.zig	Copilot generic-token exclusion and explicit credential resolution regression coverage ported
 packages/ai/test/fireworks-models.test.ts	in_progress	src/bulb_ai/models.zig	Generated Fireworks model metadata, env-key mapping, and router discovery ported; Anthropic request compatibility tests remain with provider transport
 packages/ai/test/faux-provider.test.ts	in_progress	src/bulb_ai/faux_provider.zig	Native regression coverage ported for models, metadata, queues, factories, usage, cache simulation, stream events, aborts, and unregister
@@ -30,7 +35,9 @@ packages/ai/test/openrouter-images.test.ts	in_progress	src/bulb_ai/image_models.
 packages/ai/test/overflow.test.ts	implemented	src/bulb_ai/utils/overflow.zig	Explicit provider, exclusion, silent, and length-stop overflow regressions ported
 packages/ai/test/supports-xhigh.test.ts	implemented	src/bulb_ai/models.zig	Supported thinking-level matrix ported against the generated model snapshot
 packages/ai/test/together-models.test.ts	implemented	src/bulb_ai/models.zig	Together metadata, thinking-level maps, compat flags, and env-key coverage ported
+packages/ai/test/tool-call-id-normalization.test.ts	in_progress	src/bulb_ai/providers/transform_messages.zig	Exact long OpenAI Responses ID normalization and tool-result remapping ported without credentialed live handoff; opt-in provider handoff remains
 packages/ai/test/total-tokens.test.ts	in_progress	src/bulb_ai/types.zig	Total token accounting invariant started
+packages/ai/test/transform-messages-copilot-openai-to-anthropic.test.ts	implemented	src/bulb_ai/providers/transform_messages.zig	Copilot OpenAI-to-Anthropic thinking conversion, thought-signature stripping, ID normalization, and synthetic tool-result cases ported
 packages/ai/test/validation.test.ts	in_progress	src/bulb_ai/utils/validation.zig	Serialized plain-schema primitive coercion and rejection cases ported with additional nested coverage
 packages/ai/test/xiaomi-models.test.ts	implemented	src/bulb_ai/models.zig	MiMo billing-provider and token-plan omission regressions ported
 packages/tui/src/utils.ts	in_progress	src/bulb_tui/root.zig	Visible-width behavior started

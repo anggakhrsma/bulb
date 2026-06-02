@@ -96,6 +96,7 @@ pub const AssistantMessageDiagnostic = struct {
 
 pub const TextContent = struct {
     text: []const u8,
+    text_signature: ?[]const u8 = null,
 };
 
 pub const ImageContent = struct {
@@ -105,12 +106,15 @@ pub const ImageContent = struct {
 
 pub const ThinkingContent = struct {
     thinking: []const u8,
+    thinking_signature: ?[]const u8 = null,
+    redacted: bool = false,
 };
 
 pub const ToolCall = struct {
     id: []const u8,
     name: []const u8,
     arguments_json: []const u8 = "{}",
+    thought_signature: ?[]const u8 = null,
 };
 
 pub const UserContent = union(enum) {
@@ -228,11 +232,37 @@ pub const StreamEvent = union(enum) {
 pub const EventObserver = *const fn (signal: *AbortSignal, event: StreamEvent) void;
 
 pub const StreamOptions = struct {
+    temperature: ?f64 = null,
+    max_tokens: ?u64 = null,
     api_key: ?[]const u8 = null,
+    transport: ?Transport = null,
     cache_retention: CacheRetention = .short,
     session_id: ?[]const u8 = null,
+    headers: []const Header = &.{},
+    timeout_ms: ?u64 = null,
+    websocket_connect_timeout_ms: ?u64 = null,
+    max_retries: ?u32 = null,
+    max_retry_delay_ms: ?u64 = null,
+    metadata_json: ?[]const u8 = null,
     signal: ?*AbortSignal = null,
     on_event: ?EventObserver = null,
+};
+
+pub const ThinkingBudgets = struct {
+    minimal: ?u64 = null,
+    low: ?u64 = null,
+    medium: ?u64 = null,
+    high: ?u64 = null,
+
+    pub fn budgetFor(self: ThinkingBudgets, level: ThinkingLevel) ?u64 {
+        return switch (level) {
+            .minimal => self.minimal,
+            .low => self.low,
+            .medium => self.medium,
+            .high => self.high,
+            else => null,
+        };
+    }
 };
 
 pub const StreamResult = struct {

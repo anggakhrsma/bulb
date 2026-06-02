@@ -121,12 +121,12 @@ packages/ai/src/providers/images/register-builtins.ts	bulb_ai	source	pending
 packages/ai/src/providers/mistral.ts	bulb_ai	source	pending		
 packages/ai/src/providers/openai-codex-responses.ts	bulb_ai	source	pending		
 packages/ai/src/providers/openai-completions.ts	bulb_ai	source	pending		
-packages/ai/src/providers/openai-prompt-cache.ts	bulb_ai	source	pending		
+packages/ai/src/providers/openai-prompt-cache.ts	bulb_ai	source	implemented	src/bulb_ai/providers/openai_prompt_cache.zig	OpenAI prompt-cache key clamping and prompt-cache retention helpers ported with Unicode-aware truncation
 packages/ai/src/providers/openai-responses-shared.ts	bulb_ai	source	pending		
 packages/ai/src/providers/openai-responses.ts	bulb_ai	source	pending		
 packages/ai/src/providers/register-builtins.ts	bulb_ai	source	pending		
-packages/ai/src/providers/simple-options.ts	bulb_ai	source	pending		
-packages/ai/src/providers/transform-messages.ts	bulb_ai	source	pending		
+packages/ai/src/providers/simple-options.ts	bulb_ai	source	implemented	src/bulb_ai/providers/simple_options.zig	Native base-option copy, xhigh-to-high reasoning clamp, and thinking-budget token adjustment ported
+packages/ai/src/providers/transform-messages.ts	bulb_ai	source	implemented	src/bulb_ai/providers/transform_messages.zig	Unsupported image downgrade, thinking replay transforms, tool-call ID normalization, errored-turn filtering, and synthetic missing tool results ported
 packages/ai/src/session-resources.ts	bulb_ai	source	implemented	src/bulb_ai/session_resources.zig	Native cleanup registry with deduplication, unregister, and invoke-all error behavior
 packages/ai/src/stream.ts	bulb_ai	source	in_progress	src/bulb_ai/stream.zig	Native registry facade and environment API-key injection ported; simple-provider facade remains
 packages/ai/src/types.ts	bulb_ai	source	in_progress	src/bulb_ai/types.zig	Core messages, contexts, options, usage accounting, models, and stream event protocol started
@@ -147,7 +147,7 @@ packages/ai/src/utils/oauth/pkce.ts	bulb_ai	source	pending
 packages/ai/src/utils/oauth/types.ts	bulb_ai	source	pending		
 packages/ai/src/utils/overflow.ts	bulb_ai	source	implemented	src/bulb_ai/utils/overflow.zig	Provider error patterns, exclusions, silent overflow, and length-stop overflow ported
 packages/ai/src/utils/sanitize-unicode.ts	bulb_ai	source	implemented	src/bulb_ai/utils/sanitize_unicode.zig	WTF-8 surrogate cleanup for native UTF-8 provider payloads
-packages/ai/src/utils/typebox-helpers.ts	bulb_ai	source	pending		
+packages/ai/src/utils/typebox-helpers.ts	bulb_ai	source	implemented	src/bulb_ai/utils/typebox_helpers.zig	Native StringEnum helper emits provider-compatible JSON schema without TypeScript/TypeBox runtime
 packages/ai/src/utils/validation.ts	bulb_ai	source	in_progress	src/bulb_ai/utils/validation.zig	Plain JSON schema primitive, nested object, array, and additional-property coercion ported; complete schema diagnostics remain
 packages/ai/test/abort.test.ts	bulb_ai	test	pending		
 packages/ai/test/anthropic-adaptive-thinking-models.test.ts	bulb_ai	test	pending		
@@ -170,7 +170,7 @@ packages/ai/test/bedrock-endpoint-resolution.test.ts	bulb_ai	test	pending
 packages/ai/test/bedrock-models.test.ts	bulb_ai	test	pending		
 packages/ai/test/bedrock-thinking-payload.test.ts	bulb_ai	test	pending		
 packages/ai/test/bedrock-utils.ts	bulb_ai	test	pending		
-packages/ai/test/cache-retention.test.ts	bulb_ai	test	pending		
+packages/ai/test/cache-retention.test.ts	bulb_ai	test	in_progress	src/bulb_ai/providers/cache_retention.zig	Cache-retention resolver, Anthropic cache-control ttl, OpenAI prompt_cache_key, and prompt_cache_retention regressions ported as provider helpers; full payload-builder capture remains
 packages/ai/test/cloudflare-utils.ts	bulb_ai	test	pending		
 packages/ai/test/codex-websocket-cached-probe.ts	bulb_ai	test	pending		
 packages/ai/test/context-overflow.test.ts	bulb_ai	test	pending		
@@ -223,10 +223,10 @@ packages/ai/test/stream.test.ts	bulb_ai	test	pending
 packages/ai/test/supports-xhigh.test.ts	bulb_ai	test	implemented	src/bulb_ai/models.zig	Supported thinking-level matrix ported against the generated model snapshot
 packages/ai/test/together-models.test.ts	bulb_ai	test	implemented	src/bulb_ai/models.zig	Together metadata, thinking-level maps, compat flags, and env-key coverage ported
 packages/ai/test/tokens.test.ts	bulb_ai	test	pending		
-packages/ai/test/tool-call-id-normalization.test.ts	bulb_ai	test	pending		
+packages/ai/test/tool-call-id-normalization.test.ts	bulb_ai	test	in_progress	src/bulb_ai/providers/transform_messages.zig	Exact long OpenAI Responses ID normalization and tool-result remapping ported without credentialed live handoff; opt-in provider handoff remains
 packages/ai/test/tool-call-without-result.test.ts	bulb_ai	test	pending		
 packages/ai/test/total-tokens.test.ts	bulb_ai	test	in_progress	src/bulb_ai/types.zig	Total token accounting invariant started
-packages/ai/test/transform-messages-copilot-openai-to-anthropic.test.ts	bulb_ai	test	pending		
+packages/ai/test/transform-messages-copilot-openai-to-anthropic.test.ts	bulb_ai	test	implemented	src/bulb_ai/providers/transform_messages.zig	Copilot OpenAI-to-Anthropic thinking conversion, thought-signature stripping, ID normalization, and synthetic tool-result cases ported
 packages/ai/test/unicode-surrogate.test.ts	bulb_ai	test	pending		
 packages/ai/test/validation.test.ts	bulb_ai	test	in_progress	src/bulb_ai/utils/validation.zig	Serialized plain-schema primitive coercion and rejection cases ported with additional nested coverage
 packages/ai/test/xhigh.test.ts	bulb_ai	test	pending		

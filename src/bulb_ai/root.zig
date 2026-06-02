@@ -6,6 +6,10 @@ pub const session_resources = @import("session_resources.zig");
 pub const models = @import("models.zig");
 pub const stream = @import("stream.zig");
 pub const anthropic_sse = @import("providers/anthropic_sse.zig");
+pub const cache_retention = @import("providers/cache_retention.zig");
+pub const openai_prompt_cache = @import("providers/openai_prompt_cache.zig");
+pub const simple_options = @import("providers/simple_options.zig");
+pub const transform_messages = @import("providers/transform_messages.zig");
 pub const abort_signals = @import("utils/abort_signals.zig");
 pub const diagnostics = @import("utils/diagnostics.zig");
 pub const env_api_keys = @import("utils/env_api_keys.zig");
@@ -16,6 +20,7 @@ pub const json_parse = @import("utils/json_parse.zig");
 pub const overflow = @import("utils/overflow.zig");
 pub const sanitize_unicode = @import("utils/sanitize_unicode.zig");
 pub const sse = @import("utils/sse.zig");
+pub const typebox_helpers = @import("utils/typebox_helpers.zig");
 pub const validation = @import("utils/validation.zig");
 
 pub const Api = types.Api;
@@ -40,6 +45,7 @@ pub const StreamOptions = types.StreamOptions;
 pub const StreamResult = types.StreamResult;
 pub const TextContent = types.TextContent;
 pub const ThinkingContent = types.ThinkingContent;
+pub const ThinkingBudgets = types.ThinkingBudgets;
 pub const ThinkingLevel = types.ThinkingLevel;
 pub const ThinkingLevelMap = types.ThinkingLevelMap;
 pub const ThinkingLevelOverride = types.ThinkingLevelOverride;
@@ -61,6 +67,10 @@ test {
     _ = @import("models.zig");
     _ = @import("stream.zig");
     _ = @import("providers/anthropic_sse.zig");
+    _ = @import("providers/cache_retention.zig");
+    _ = @import("providers/openai_prompt_cache.zig");
+    _ = @import("providers/simple_options.zig");
+    _ = @import("providers/transform_messages.zig");
     _ = @import("utils/abort_signals.zig");
     _ = @import("utils/diagnostics.zig");
     _ = @import("utils/env_api_keys.zig");
@@ -71,5 +81,6 @@ test {
     _ = @import("utils/overflow.zig");
     _ = @import("utils/sanitize_unicode.zig");
     _ = @import("utils/sse.zig");
+    _ = @import("utils/typebox_helpers.zig");
     _ = @import("utils/validation.zig");
 }
