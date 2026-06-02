@@ -2,6 +2,7 @@ const std = @import("std");
 const ai = @import("bulb_ai");
 const auth_storage = @import("auth_storage.zig");
 const config_value = @import("resolve_config_value.zig");
+const json_util = @import("json.zig");
 
 const max_models_json_bytes = 4 * 1024 * 1024;
 
@@ -677,7 +678,7 @@ pub const ModelRegistry = struct {
         };
         defer self.allocator.free(content);
 
-        const stripped = try stripJsonCommentsAlloc(self.allocator, content);
+        const stripped = try json_util.stripJsonCommentsAlloc(self.allocator, content);
         defer self.allocator.free(stripped);
         var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, stripped, .{}) catch |err| {
             const message = try std.fmt.allocPrint(
@@ -2180,62 +2181,6 @@ fn requiredF64(object: std.json.ObjectMap, key: []const u8) !f64 {
 
 fn schemaPathAlloc(allocator: std.mem.Allocator, base: []const u8, field: []const u8) ![]u8 {
     return try std.fmt.allocPrint(allocator, "{s}.{s}", .{ base, field });
-}
-
-fn stripJsonCommentsAlloc(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
-    var output: std.ArrayList(u8) = .empty;
-    defer output.deinit(allocator);
-    var index: usize = 0;
-    var in_string = false;
-    var escaped = false;
-
-    while (index < input.len) {
-        const character = input[index];
-        if (in_string) {
-            try output.append(allocator, character);
-            if (escaped) {
-                escaped = false;
-            } else if (character == '\\') {
-                escaped = true;
-            } else if (character == '"') {
-                in_string = false;
-            }
-            index += 1;
-            continue;
-        }
-
-        if (character == '"') {
-            in_string = true;
-            try output.append(allocator, character);
-            index += 1;
-            continue;
-        }
-
-        if (character == '/' and index + 1 < input.len) {
-            const next = input[index + 1];
-            if (next == '/') {
-                index += 2;
-                while (index < input.len and input[index] != '\n') : (index += 1) {}
-                if (index < input.len) try output.append(allocator, input[index]);
-                index += 1;
-                continue;
-            }
-            if (next == '*') {
-                index += 2;
-                while (index + 1 < input.len and !(input[index] == '*' and input[index + 1] == '/')) {
-                    if (input[index] == '\n') try output.append(allocator, '\n');
-                    index += 1;
-                }
-                index = @min(index + 2, input.len);
-                continue;
-            }
-        }
-
-        try output.append(allocator, character);
-        index += 1;
-    }
-
-    return try output.toOwnedSlice(allocator);
 }
 
 fn modelRequestKeyAlloc(allocator: std.mem.Allocator, provider: []const u8, model_id: []const u8) ![]u8 {

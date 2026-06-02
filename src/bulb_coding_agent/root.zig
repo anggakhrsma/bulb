@@ -5,6 +5,8 @@ pub const extension_sdk = @import("bulb_extension_sdk");
 pub const config = @import("config.zig");
 pub const resolve_config_value = @import("resolve_config_value.zig");
 pub const auth_storage = @import("auth_storage.zig");
+pub const json = @import("json.zig");
+pub const mime = @import("mime.zig");
 pub const model_registry = @import("model_registry.zig");
 pub const model_resolver = @import("model_resolver.zig");
 pub const messages = @import("messages.zig");
@@ -22,6 +24,8 @@ test {
     _ = @import("config.zig");
     _ = @import("resolve_config_value.zig");
     _ = @import("auth_storage.zig");
+    _ = @import("json.zig");
+    _ = @import("mime.zig");
     _ = @import("model_registry.zig");
     _ = @import("model_resolver.zig");
     _ = @import("messages.zig");
