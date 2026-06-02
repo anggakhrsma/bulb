@@ -8,6 +8,9 @@ pub const auth_storage = @import("auth_storage.zig");
 pub const model_registry = @import("model_registry.zig");
 pub const model_resolver = @import("model_resolver.zig");
 pub const messages = @import("messages.zig");
+pub const paths = @import("paths.zig");
+pub const path_utils = @import("path_utils.zig");
+pub const user_agent = @import("user_agent.zig");
 
 const build_options = @import("build_options");
 
@@ -20,4 +23,7 @@ test {
     _ = @import("model_registry.zig");
     _ = @import("model_resolver.zig");
     _ = @import("messages.zig");
+    _ = @import("paths.zig");
+    _ = @import("path_utils.zig");
+    _ = @import("user_agent.zig");
 }

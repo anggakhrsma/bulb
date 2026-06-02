@@ -469,7 +469,7 @@ packages/coding-agent/src/core/tools/grep.ts	bulb_coding_agent	source	pending
 packages/coding-agent/src/core/tools/index.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/core/tools/ls.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/core/tools/output-accumulator.ts	bulb_coding_agent	source	pending		
-packages/coding-agent/src/core/tools/path-utils.ts	bulb_coding_agent	source	pending		
+packages/coding-agent/src/core/tools/path-utils.ts	bulb_coding_agent	source	implemented	src/bulb_coding_agent/path_utils.zig	Home expansion, @file stripping, Unicode-space normalization, cwd resolution, existence checks, macOS screenshot AM/PM narrow-space fallback, NFD accent fallback, curly apostrophe fallback, and combined quote/accent read-path regressions ported
 packages/coding-agent/src/core/tools/read.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/core/tools/render-utils.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/core/tools/tool-definition-wrapper.ts	bulb_coding_agent	source	pending		
@@ -546,9 +546,9 @@ packages/coding-agent/src/utils/image-resize-worker.ts	bulb_coding_agent	source	
 packages/coding-agent/src/utils/image-resize.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/utils/json.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/utils/mime.ts	bulb_coding_agent	source	pending		
-packages/coding-agent/src/utils/paths.ts	bulb_coding_agent	source	pending		
+packages/coding-agent/src/utils/paths.ts	bulb_coding_agent	source	implemented	src/bulb_coding_agent/paths.zig	Canonical path fallback, symlink resolution, local/remote package-source detection, tilde normalization, file URL decoding/validation, cwd-relative path detection, slash formatting, and best-effort cloud-sync ignore xattr/setfattr behavior ported
 packages/coding-agent/src/utils/photon.ts	bulb_coding_agent	source	pending		
-packages/coding-agent/src/utils/pi-user-agent.ts	bulb_coding_agent	source	pending		
+packages/coding-agent/src/utils/pi-user-agent.ts	bulb_coding_agent	source	implemented	src/bulb_coding_agent/user_agent.zig	Bulb-native user-agent formatter ported with Pi-compatible platform/arch naming and Zig runtime branding
 packages/coding-agent/src/utils/shell.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/utils/sleep.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/utils/syntax-highlight.ts	bulb_coding_agent	source	pending		
@@ -638,9 +638,9 @@ packages/coding-agent/test/oauth-selector.test.ts	bulb_coding_agent	test	pending
 packages/coding-agent/test/package-command-paths.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/package-manager-ssh.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/package-manager.test.ts	bulb_coding_agent	test	pending		
-packages/coding-agent/test/path-utils.test.ts	bulb_coding_agent	test	pending		
-packages/coding-agent/test/paths.test.ts	bulb_coding_agent	test	pending		
-packages/coding-agent/test/pi-user-agent.test.ts	bulb_coding_agent	test	pending		
+packages/coding-agent/test/path-utils.test.ts	bulb_coding_agent	test	implemented	src/bulb_coding_agent/path_utils.zig	Upstream expandPath, resolveToCwd, existing-file, Unicode accent, curly quote, French screenshot, and AM/PM screenshot path regressions ported
+packages/coding-agent/test/paths.test.ts	bulb_coding_agent	test	implemented	src/bulb_coding_agent/paths.zig	Upstream canonicalizePath, symlink, missing/dangling fallback, cwd-relative traversal, tilde, file URL, percent literal, and isLocalPath regressions ported
+packages/coding-agent/test/pi-user-agent.test.ts	bulb_coding_agent	test	implemented	src/bulb_coding_agent/user_agent.zig	Upstream user-agent formatting test translated to Bulb product name and Zig-native runtime string
 packages/coding-agent/test/plan-mode-utils.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/print-mode.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/prompt-templates.test.ts	bulb_coding_agent	test	pending		
