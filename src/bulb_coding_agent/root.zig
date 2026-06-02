@@ -6,6 +6,7 @@ pub const config = @import("config.zig");
 pub const resolve_config_value = @import("resolve_config_value.zig");
 pub const auth_storage = @import("auth_storage.zig");
 pub const model_registry = @import("model_registry.zig");
+pub const model_resolver = @import("model_resolver.zig");
 
 const build_options = @import("build_options");
 
@@ -16,4 +17,5 @@ test {
     _ = @import("resolve_config_value.zig");
     _ = @import("auth_storage.zig");
     _ = @import("model_registry.zig");
+    _ = @import("model_resolver.zig");
 }
