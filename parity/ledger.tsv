@@ -553,7 +553,7 @@ packages/coding-agent/src/utils/shell.ts	bulb_coding_agent	source	pending
 packages/coding-agent/src/utils/sleep.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/utils/syntax-highlight.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/utils/tools-manager.ts	bulb_coding_agent	source	pending		
-packages/coding-agent/src/utils/version-check.ts	bulb_coding_agent	source	pending		
+packages/coding-agent/src/utils/version-check.ts	bulb_coding_agent	source	implemented	src/bulb_coding_agent/version_check.zig	Bulb-native release version checker ported with semver comparison, service-base URL resolution, BULB skip/offline flags, user-agent header, HTTP transport injection, metadata/note trimming, and non-ok response handling
 packages/coding-agent/src/utils/windows-self-update.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/test/agent-session-auto-compaction-queue.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/agent-session-branching.test.ts	bulb_coding_agent	test	pending		
@@ -719,7 +719,7 @@ packages/coding-agent/test/trigger-compact-extension.test.ts	bulb_coding_agent	t
 packages/coding-agent/test/truncate-to-width.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/user-message.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/utilities.ts	bulb_coding_agent	test	pending		
-packages/coding-agent/test/version-check.test.ts	bulb_coding_agent	test	pending		
+packages/coding-agent/test/version-check.test.ts	bulb_coding_agent	test	implemented	src/bulb_coding_agent/version_check.zig	Upstream version comparison, newer-only filtering, latest-version API request contract, package metadata, update note, and disabled-check regressions translated to Bulb-native tests
 packages/coding-agent/tsconfig.build.json	bulb_coding_agent	source	pending		
 packages/coding-agent/tsconfig.examples.json	bulb_coding_agent	source	pending		
 packages/coding-agent/vitest.config.ts	bulb_coding_agent	source	pending		
