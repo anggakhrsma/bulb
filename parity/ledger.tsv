@@ -109,7 +109,7 @@ packages/ai/src/models.ts	bulb_ai	source	implemented	src/bulb_ai/models.zig	Nati
 packages/ai/src/oauth.ts	bulb_ai	source	pending		
 packages/ai/src/providers/amazon-bedrock.ts	bulb_ai	source	pending		
 packages/ai/src/providers/anthropic.ts	bulb_ai	source	in_progress	src/bulb_ai/providers/anthropic_sse.zig	Raw SSE decoder, Anthropic message-event filtering, malformed JSON repair, usage/stop mapping, text accumulation, and streamed tool-JSON reconstruction ported; HTTP/auth/request transform remains
-packages/ai/src/providers/azure-openai-responses.ts	bulb_ai	source	pending		
+packages/ai/src/providers/azure-openai-responses.ts	bulb_ai	source	in_progress	src/bulb_ai/providers/azure_openai_responses.zig	Azure Responses deployment-map resolution, base URL/resource/API-version normalization, request payload construction, prompt-cache key clamping, reasoning/simple option mapping, native std.http POST/SSE execution, deterministic transport, retry option propagation, and query-safe request URL assembly ported; response-header extraction, precise timeouts, and credentialed live cases remain
 packages/ai/src/providers/cloudflare.ts	bulb_ai	source	in_progress	src/bulb_ai/providers/openai_completions.zig	Cloudflare provider detection and base URL environment placeholder substitution ported for OpenAI Completions client configuration; shared use by other providers remains
 packages/ai/src/providers/faux.ts	bulb_ai	source	in_progress	src/bulb_ai/faux_provider.zig	Registration, models, queueing, factories, usage, cache simulation, registry dispatch, delta streams, aborts, and unregister ported; paced async delivery remains
 packages/ai/src/providers/github-copilot-headers.ts	bulb_ai	source	in_progress	src/bulb_ai/providers/openai_completions.zig	Copilot initiator, intent, and vision-request dynamic header inference ported for OpenAI Completions client configuration; shared provider integrations remain
@@ -162,7 +162,7 @@ packages/ai/test/anthropic-sse-parsing.test.ts	bulb_ai	test	in_progress	src/bulb
 packages/ai/test/anthropic-temperature-compat.test.ts	bulb_ai	test	pending		
 packages/ai/test/anthropic-thinking-disable.test.ts	bulb_ai	test	pending		
 packages/ai/test/anthropic-tool-name-normalization.test.ts	bulb_ai	test	pending		
-packages/ai/test/azure-openai-base-url.test.ts	bulb_ai	test	pending		
+packages/ai/test/azure-openai-base-url.test.ts	bulb_ai	test	implemented	src/bulb_ai/providers/azure_openai_responses.zig	Azure Responses base URL normalization, invalid URL handling, resource-name default URL construction, deployment-name map parsing, prompt_cache_key clamping, API-version propagation, and query-preserving native request URL coverage ported without credentials
 packages/ai/test/azure-utils.ts	bulb_ai	test	pending		
 packages/ai/test/bedrock-convert-messages.test.ts	bulb_ai	test	pending		
 packages/ai/test/bedrock-custom-headers.test.ts	bulb_ai	test	pending		
