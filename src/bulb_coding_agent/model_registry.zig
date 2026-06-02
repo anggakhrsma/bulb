@@ -71,6 +71,43 @@ const ProviderRequestConfig = struct {
     }
 };
 
+const ProviderOverride = struct {
+    base_url: ?[]u8 = null,
+    compat: ai.ModelCompat = .{},
+
+    fn deinit(self: *ProviderOverride, allocator: std.mem.Allocator) void {
+        if (self.base_url) |base_url| allocator.free(base_url);
+        deinitModelCompat(allocator, &self.compat);
+        self.* = .{};
+    }
+};
+
+const PartialModelCost = struct {
+    input: ?f64 = null,
+    output: ?f64 = null,
+    cache_read: ?f64 = null,
+    cache_write: ?f64 = null,
+};
+
+const ModelOverride = struct {
+    name: ?[]u8 = null,
+    reasoning: ?bool = null,
+    thinking_level_map: ?ai.ThinkingLevelMap = null,
+    input: ?[]const []const u8 = null,
+    cost: ?PartialModelCost = null,
+    context_window: ?u64 = null,
+    max_tokens: ?u64 = null,
+    compat: ai.ModelCompat = .{},
+
+    fn deinit(self: *ModelOverride, allocator: std.mem.Allocator) void {
+        if (self.name) |name| allocator.free(name);
+        if (self.thinking_level_map) |*map| deinitThinkingLevelMap(allocator, map);
+        if (self.input) |input| deinitStringSlice(allocator, input);
+        deinitModelCompat(allocator, &self.compat);
+        self.* = .{};
+    }
+};
+
 pub const ModelRegistry = struct {
     allocator: std.mem.Allocator,
     auth_storage: *auth_storage.AuthStorage,
@@ -325,8 +362,11 @@ pub const ModelRegistry = struct {
     }
 
     fn loadModels(self: *ModelRegistry) !void {
-        var base_url_overrides = std.StringHashMap([]u8).init(self.allocator);
-        defer deinitStringMap(self.allocator, &base_url_overrides);
+        var provider_overrides = std.StringHashMap(ProviderOverride).init(self.allocator);
+        defer deinitProviderOverrides(self.allocator, &provider_overrides);
+
+        var model_overrides = std.StringHashMap(ModelOverride).init(self.allocator);
+        defer deinitModelOverrides(self.allocator, &model_overrides);
 
         var custom_models: std.ArrayList(ai.Model) = .empty;
         defer {
@@ -335,7 +375,7 @@ pub const ModelRegistry = struct {
         }
 
         if (self.models_json_path) |path| {
-            self.loadCustomModels(path, &base_url_overrides, &custom_models) catch |err| {
+            self.loadCustomModels(path, &provider_overrides, &model_overrides, &custom_models) catch |err| {
                 deinitModelItems(self.allocator, custom_models.items);
                 custom_models.clearRetainingCapacity();
                 self.clearRequestConfigMaps();
@@ -343,28 +383,43 @@ pub const ModelRegistry = struct {
             };
         }
 
-        try self.loadBuiltInModels(&base_url_overrides);
+        try self.loadBuiltInModels(&provider_overrides, &model_overrides);
         try self.mergeCustomModels(custom_models.items);
     }
 
     fn loadBuiltInModels(
         self: *ModelRegistry,
-        base_url_overrides: *const std.StringHashMap([]u8),
+        provider_overrides: *const std.StringHashMap(ProviderOverride),
+        model_overrides: *const std.StringHashMap(ModelOverride),
     ) !void {
         for (ai.models.allModels()) |model| {
-            const override_base_url = base_url_overrides.get(model.provider);
-            try self.models.append(self.allocator, try cloneModel(
+            const provider_override = provider_overrides.get(model.provider);
+            var cloned = try cloneModel(
                 self.allocator,
                 model,
-                override_base_url,
-            ));
+                if (provider_override) |override| override.base_url else null,
+            );
+            errdefer deinitModel(self.allocator, &cloned);
+
+            if (provider_override) |override| {
+                try mergeModelCompat(self.allocator, &cloned.compat, override.compat);
+            }
+
+            const override_key = try modelRequestKeyAlloc(self.allocator, model.provider, model.id);
+            defer self.allocator.free(override_key);
+            if (model_overrides.get(override_key)) |override| {
+                try applyModelOverride(self.allocator, &cloned, override);
+            }
+
+            try self.models.append(self.allocator, cloned);
         }
     }
 
     fn loadCustomModels(
         self: *ModelRegistry,
         path: []const u8,
-        base_url_overrides: *std.StringHashMap([]u8),
+        provider_overrides: *std.StringHashMap(ProviderOverride),
+        model_overrides: *std.StringHashMap(ModelOverride),
         custom_models: *std.ArrayList(ai.Model),
     ) !void {
         const io = std.Io.Threaded.global_single_threaded.io();
@@ -390,7 +445,8 @@ pub const ModelRegistry = struct {
             try self.loadProviderConfig(
                 entry.key_ptr.*,
                 entry.value_ptr.object,
-                base_url_overrides,
+                provider_overrides,
+                model_overrides,
                 custom_models,
             );
         }
@@ -400,13 +456,20 @@ pub const ModelRegistry = struct {
         self: *ModelRegistry,
         provider_name: []const u8,
         object: std.json.ObjectMap,
-        base_url_overrides: *std.StringHashMap([]u8),
+        provider_overrides: *std.StringHashMap(ProviderOverride),
+        model_overrides: *std.StringHashMap(ModelOverride),
         custom_models: *std.ArrayList(ai.Model),
     ) !void {
         const base_url = try optionalString(object, "baseUrl");
         const api_key = try optionalString(object, "apiKey");
         const api_name = try optionalString(object, "api");
         const auth_header = try optionalBool(object, "authHeader") orelse false;
+        const provider_compat = try parseCompatObjectAlloc(self.allocator, object.get("compat"));
+        var provider_compat_owned = true;
+        errdefer if (provider_compat_owned) {
+            var compat = provider_compat;
+            deinitModelCompat(self.allocator, &compat);
+        };
         const provider_headers = try parseHeadersObjectAlloc(self.allocator, object.get("headers"));
         var provider_headers_owned = true;
         errdefer if (provider_headers_owned) deinitHeaderInputs(self.allocator, provider_headers);
@@ -421,7 +484,28 @@ pub const ModelRegistry = struct {
         request_config_owned = false;
         try self.storeProviderRequestConfig(provider_name, request_config);
 
-        if (base_url) |value| try putOwnedString(self.allocator, base_url_overrides, provider_name, value);
+        if (base_url != null or object.get("compat") != null) {
+            const override_base_url = if (base_url) |value| try self.allocator.dupe(u8, value) else null;
+            const override = ProviderOverride{
+                .base_url = override_base_url,
+                .compat = provider_compat,
+            };
+            provider_compat_owned = false;
+            try storeProviderOverride(
+                self.allocator,
+                provider_overrides,
+                provider_name,
+                override,
+            );
+        } else {
+            var compat = provider_compat;
+            deinitModelCompat(self.allocator, &compat);
+            provider_compat_owned = false;
+        }
+
+        if (object.get("modelOverrides")) |model_overrides_value| {
+            try self.loadModelOverrides(provider_name, model_overrides_value, model_overrides);
+        }
 
         const models_value = object.get("models") orelse return;
         if (models_value != .array) return error.InvalidModelsJson;
@@ -444,7 +528,6 @@ pub const ModelRegistry = struct {
         provider_api: ?[]const u8,
         provider_base_url: ?[]const u8,
     ) !ai.Model {
-        _ = provider_object;
         const id = try requiredString(object, "id");
         const name = try optionalString(object, "name") orelse id;
         const api_name = (try optionalString(object, "api")) orelse provider_api orelse builtInDefaultApi(provider_name) orelse return error.InvalidModelsJson;
@@ -453,6 +536,13 @@ pub const ModelRegistry = struct {
         var model_headers_owned = true;
         errdefer if (model_headers_owned) deinitHeaderInputs(self.allocator, model_headers);
 
+        var compat = try parseCompatObjectAlloc(self.allocator, provider_object.get("compat"));
+        var compat_owned = true;
+        errdefer if (compat_owned) deinitModelCompat(self.allocator, &compat);
+        var model_compat = try parseCompatObjectAlloc(self.allocator, object.get("compat"));
+        defer deinitModelCompat(self.allocator, &model_compat);
+        try mergeModelCompat(self.allocator, &compat, model_compat);
+
         var model = ai.Model{
             .id = try self.allocator.dupe(u8, id),
             .name = try self.allocator.dupe(u8, name),
@@ -460,18 +550,69 @@ pub const ModelRegistry = struct {
             .provider = try self.allocator.dupe(u8, provider_name),
             .base_url = try self.allocator.dupe(u8, base_url),
             .reasoning = try optionalBool(object, "reasoning") orelse false,
+            .thinking_level_map = try parseThinkingLevelMapAlloc(self.allocator, object.get("thinkingLevelMap")),
             .input = try parseInputAlloc(self.allocator, object.get("input")),
             .cost = try parseCost(object.get("cost")),
             .context_window = try optionalU64(object, "contextWindow") orelse 128_000,
             .max_tokens = try optionalU64(object, "maxTokens") orelse 16_384,
             .headers = &.{},
-            .compat = .{},
+            .compat = compat,
         };
+        compat_owned = false;
         errdefer deinitModel(self.allocator, &model);
 
         model_headers_owned = false;
         try self.storeModelHeaders(provider_name, id, model_headers);
         return model;
+    }
+
+    fn loadModelOverrides(
+        self: *ModelRegistry,
+        provider_name: []const u8,
+        value: std.json.Value,
+        model_overrides: *std.StringHashMap(ModelOverride),
+    ) !void {
+        if (value != .object) return error.InvalidModelsJson;
+        var iterator = value.object.iterator();
+        while (iterator.next()) |entry| {
+            if (entry.value_ptr.* != .object) return error.InvalidModelsJson;
+            var model_override = try self.parseModelOverrideDefinition(
+                provider_name,
+                entry.key_ptr.*,
+                entry.value_ptr.object,
+            );
+            errdefer model_override.deinit(self.allocator);
+            try storeModelOverride(
+                self.allocator,
+                model_overrides,
+                provider_name,
+                entry.key_ptr.*,
+                model_override,
+            );
+        }
+    }
+
+    fn parseModelOverrideDefinition(
+        self: *ModelRegistry,
+        provider_name: []const u8,
+        model_id: []const u8,
+        object: std.json.ObjectMap,
+    ) !ModelOverride {
+        var override = ModelOverride{
+            .name = if (try optionalString(object, "name")) |value| try self.allocator.dupe(u8, value) else null,
+            .reasoning = try optionalBool(object, "reasoning"),
+            .thinking_level_map = if (object.get("thinkingLevelMap")) |value| try parseThinkingLevelMapAlloc(self.allocator, value) else null,
+            .input = if (object.get("input")) |value| try parseInputAlloc(self.allocator, value) else null,
+            .cost = try parsePartialCost(object.get("cost")),
+            .context_window = try optionalU64(object, "contextWindow"),
+            .max_tokens = try optionalU64(object, "maxTokens"),
+            .compat = try parseCompatObjectAlloc(self.allocator, object.get("compat")),
+        };
+        errdefer override.deinit(self.allocator);
+
+        const headers = try parseHeadersObjectAlloc(self.allocator, object.get("headers"));
+        try self.storeModelHeaders(provider_name, model_id, headers);
+        return override;
     }
 
     fn mergeCustomModels(self: *ModelRegistry, custom_models: []ai.Model) !void {
@@ -594,13 +735,13 @@ fn cloneModel(
         .provider = try allocator.dupe(u8, model.provider),
         .base_url = try allocator.dupe(u8, override_base_url orelse model.base_url),
         .reasoning = model.reasoning,
-        .thinking_level_map = model.thinking_level_map,
+        .thinking_level_map = try cloneThinkingLevelMap(allocator, model.thinking_level_map),
         .input = try cloneStringSlice(allocator, model.input),
         .cost = model.cost,
         .context_window = model.context_window,
         .max_tokens = model.max_tokens,
         .headers = try cloneAiHeaders(allocator, model.headers),
-        .compat = model.compat,
+        .compat = try cloneModelCompat(allocator, model.compat),
     };
 }
 
@@ -620,8 +761,10 @@ fn deinitModel(allocator: std.mem.Allocator, model: *ai.Model) void {
     if (model.api.len > 0) allocator.free(model.api);
     if (model.provider.len > 0) allocator.free(model.provider);
     if (model.base_url.len > 0) allocator.free(model.base_url);
+    deinitThinkingLevelMap(allocator, &model.thinking_level_map);
     deinitStringSlice(allocator, model.input);
     deinitAiHeaders(allocator, model.headers);
+    deinitModelCompat(allocator, &model.compat);
     model.* = emptyModel();
 }
 
@@ -635,6 +778,164 @@ fn emptyModel() ai.Model {
         .input = &.{},
         .headers = &.{},
     };
+}
+
+fn applyModelOverride(
+    allocator: std.mem.Allocator,
+    model: *ai.Model,
+    override: ModelOverride,
+) !void {
+    if (override.name) |name| try replaceOwnedString(allocator, &model.name, name);
+    if (override.reasoning) |reasoning| model.reasoning = reasoning;
+    if (override.thinking_level_map) |thinking_level_map| {
+        try mergeThinkingLevelMap(allocator, &model.thinking_level_map, thinking_level_map);
+    }
+    if (override.input) |input| {
+        const cloned = try cloneStringSlice(allocator, input);
+        deinitStringSlice(allocator, model.input);
+        model.input = cloned;
+    }
+    if (override.cost) |cost| {
+        if (cost.input) |value| model.cost.input = value;
+        if (cost.output) |value| model.cost.output = value;
+        if (cost.cache_read) |value| model.cost.cache_read = value;
+        if (cost.cache_write) |value| model.cost.cache_write = value;
+    }
+    if (override.context_window) |context_window| model.context_window = context_window;
+    if (override.max_tokens) |max_tokens| model.max_tokens = max_tokens;
+    try mergeModelCompat(allocator, &model.compat, override.compat);
+}
+
+fn replaceOwnedString(allocator: std.mem.Allocator, target: *[]const u8, value: []const u8) !void {
+    const copy = try allocator.dupe(u8, value);
+    allocator.free(target.*);
+    target.* = copy;
+}
+
+fn cloneThinkingLevelMap(
+    allocator: std.mem.Allocator,
+    map: ai.ThinkingLevelMap,
+) !ai.ThinkingLevelMap {
+    return .{
+        .off = try cloneThinkingLevelOverride(allocator, map.off),
+        .minimal = try cloneThinkingLevelOverride(allocator, map.minimal),
+        .low = try cloneThinkingLevelOverride(allocator, map.low),
+        .medium = try cloneThinkingLevelOverride(allocator, map.medium),
+        .high = try cloneThinkingLevelOverride(allocator, map.high),
+        .xhigh = try cloneThinkingLevelOverride(allocator, map.xhigh),
+    };
+}
+
+fn cloneThinkingLevelOverride(
+    allocator: std.mem.Allocator,
+    value: ai.ThinkingLevelOverride,
+) !ai.ThinkingLevelOverride {
+    return switch (value) {
+        .unset => .unset,
+        .unsupported => .unsupported,
+        .mapped => |mapped| .{ .mapped = try allocator.dupe(u8, mapped) },
+    };
+}
+
+fn deinitThinkingLevelMap(allocator: std.mem.Allocator, map: *ai.ThinkingLevelMap) void {
+    deinitThinkingLevelOverride(allocator, &map.off);
+    deinitThinkingLevelOverride(allocator, &map.minimal);
+    deinitThinkingLevelOverride(allocator, &map.low);
+    deinitThinkingLevelOverride(allocator, &map.medium);
+    deinitThinkingLevelOverride(allocator, &map.high);
+    deinitThinkingLevelOverride(allocator, &map.xhigh);
+    map.* = .{};
+}
+
+fn deinitThinkingLevelOverride(
+    allocator: std.mem.Allocator,
+    value: *ai.ThinkingLevelOverride,
+) void {
+    switch (value.*) {
+        .mapped => |mapped| allocator.free(mapped),
+        .unset, .unsupported => {},
+    }
+    value.* = .unset;
+}
+
+fn mergeThinkingLevelMap(
+    allocator: std.mem.Allocator,
+    target: *ai.ThinkingLevelMap,
+    override: ai.ThinkingLevelMap,
+) !void {
+    try mergeThinkingLevelOverride(allocator, &target.off, override.off);
+    try mergeThinkingLevelOverride(allocator, &target.minimal, override.minimal);
+    try mergeThinkingLevelOverride(allocator, &target.low, override.low);
+    try mergeThinkingLevelOverride(allocator, &target.medium, override.medium);
+    try mergeThinkingLevelOverride(allocator, &target.high, override.high);
+    try mergeThinkingLevelOverride(allocator, &target.xhigh, override.xhigh);
+}
+
+fn mergeThinkingLevelOverride(
+    allocator: std.mem.Allocator,
+    target: *ai.ThinkingLevelOverride,
+    override: ai.ThinkingLevelOverride,
+) !void {
+    switch (override) {
+        .unset => return,
+        .unsupported => {
+            deinitThinkingLevelOverride(allocator, target);
+            target.* = .unsupported;
+        },
+        .mapped => |mapped| {
+            const copy = try allocator.dupe(u8, mapped);
+            deinitThinkingLevelOverride(allocator, target);
+            target.* = .{ .mapped = copy };
+        },
+    }
+}
+
+fn cloneModelCompat(
+    allocator: std.mem.Allocator,
+    compat: ai.ModelCompat,
+) !ai.ModelCompat {
+    var result = compat;
+    if (compat.cache_control_format) |format| {
+        result.cache_control_format = try allocator.dupe(u8, format);
+    }
+    return result;
+}
+
+fn deinitModelCompat(allocator: std.mem.Allocator, compat: *ai.ModelCompat) void {
+    if (compat.cache_control_format) |format| allocator.free(format);
+    compat.* = .{};
+}
+
+fn mergeModelCompat(
+    allocator: std.mem.Allocator,
+    target: *ai.ModelCompat,
+    override: ai.ModelCompat,
+) !void {
+    if (override.supports_store) |value| target.supports_store = value;
+    if (override.supports_developer_role) |value| target.supports_developer_role = value;
+    if (override.supports_reasoning_effort) |value| target.supports_reasoning_effort = value;
+    if (override.supports_usage_in_streaming) |value| target.supports_usage_in_streaming = value;
+    if (override.max_tokens_field) |value| target.max_tokens_field = value;
+    if (override.requires_tool_result_name) |value| target.requires_tool_result_name = value;
+    if (override.requires_assistant_after_tool_result) |value| target.requires_assistant_after_tool_result = value;
+    if (override.requires_thinking_as_text) |value| target.requires_thinking_as_text = value;
+    if (override.requires_reasoning_content_on_assistant_messages) |value| target.requires_reasoning_content_on_assistant_messages = value;
+    if (override.thinking_format) |value| target.thinking_format = value;
+    if (override.cache_control_format) |format| {
+        const copy = try allocator.dupe(u8, format);
+        if (target.cache_control_format) |existing| allocator.free(existing);
+        target.cache_control_format = copy;
+    }
+    if (override.zai_tool_stream) |value| target.zai_tool_stream = value;
+    if (override.supports_strict_mode) |value| target.supports_strict_mode = value;
+    if (override.send_session_affinity_headers) |value| target.send_session_affinity_headers = value;
+    if (override.send_session_id_header) |value| target.send_session_id_header = value;
+    if (override.supports_long_cache_retention) |value| target.supports_long_cache_retention = value;
+    if (override.supports_eager_tool_input_streaming) |value| target.supports_eager_tool_input_streaming = value;
+    if (override.supports_cache_control_on_tools) |value| target.supports_cache_control_on_tools = value;
+    if (override.supports_temperature) |value| target.supports_temperature = value;
+    if (override.force_adaptive_thinking) |value| target.force_adaptive_thinking = value;
+    if (override.allow_empty_signature) |value| target.allow_empty_signature = value;
 }
 
 fn cloneStringSlice(allocator: std.mem.Allocator, values: []const []const u8) ![]const []const u8 {
@@ -773,6 +1074,108 @@ fn parseCost(maybe_value: ?std.json.Value) !ai.ModelCost {
     };
 }
 
+fn parsePartialCost(maybe_value: ?std.json.Value) !?PartialModelCost {
+    const value = maybe_value orelse return null;
+    if (value != .object) return error.InvalidModelsJson;
+    return .{
+        .input = try optionalF64(value.object, "input"),
+        .output = try optionalF64(value.object, "output"),
+        .cache_read = try optionalF64(value.object, "cacheRead"),
+        .cache_write = try optionalF64(value.object, "cacheWrite"),
+    };
+}
+
+fn parseThinkingLevelMapAlloc(
+    allocator: std.mem.Allocator,
+    maybe_value: ?std.json.Value,
+) !ai.ThinkingLevelMap {
+    const value = maybe_value orelse return .{};
+    if (value != .object) return error.InvalidModelsJson;
+    var result = ai.ThinkingLevelMap{};
+    errdefer deinitThinkingLevelMap(allocator, &result);
+    result.off = try parseThinkingLevelOverrideAlloc(allocator, value.object.get("off"));
+    result.minimal = try parseThinkingLevelOverrideAlloc(allocator, value.object.get("minimal"));
+    result.low = try parseThinkingLevelOverrideAlloc(allocator, value.object.get("low"));
+    result.medium = try parseThinkingLevelOverrideAlloc(allocator, value.object.get("medium"));
+    result.high = try parseThinkingLevelOverrideAlloc(allocator, value.object.get("high"));
+    result.xhigh = try parseThinkingLevelOverrideAlloc(allocator, value.object.get("xhigh"));
+    return result;
+}
+
+fn parseThinkingLevelOverrideAlloc(
+    allocator: std.mem.Allocator,
+    maybe_value: ?std.json.Value,
+) !ai.ThinkingLevelOverride {
+    const value = maybe_value orelse return .unset;
+    return switch (value) {
+        .null => .unsupported,
+        .string => |mapped| .{ .mapped = try allocator.dupe(u8, mapped) },
+        else => error.InvalidModelsJson,
+    };
+}
+
+fn parseCompatObjectAlloc(
+    allocator: std.mem.Allocator,
+    maybe_value: ?std.json.Value,
+) !ai.ModelCompat {
+    const value = maybe_value orelse return .{};
+    if (value != .object) return error.InvalidModelsJson;
+    const object = value.object;
+
+    var compat = ai.ModelCompat{
+        .supports_store = try optionalBool(object, "supportsStore"),
+        .supports_developer_role = try optionalBool(object, "supportsDeveloperRole"),
+        .supports_reasoning_effort = try optionalBool(object, "supportsReasoningEffort"),
+        .supports_usage_in_streaming = try optionalBool(object, "supportsUsageInStreaming"),
+        .max_tokens_field = try parseMaxTokensField(object.get("maxTokensField")),
+        .requires_tool_result_name = try optionalBool(object, "requiresToolResultName"),
+        .requires_assistant_after_tool_result = try optionalBool(object, "requiresAssistantAfterToolResult"),
+        .requires_thinking_as_text = try optionalBool(object, "requiresThinkingAsText"),
+        .requires_reasoning_content_on_assistant_messages = try optionalBool(object, "requiresReasoningContentOnAssistantMessages"),
+        .thinking_format = try parseThinkingFormat(object.get("thinkingFormat")),
+        .zai_tool_stream = try optionalBool(object, "zaiToolStream"),
+        .supports_strict_mode = try optionalBool(object, "supportsStrictMode"),
+        .send_session_affinity_headers = try optionalBool(object, "sendSessionAffinityHeaders"),
+        .send_session_id_header = try optionalBool(object, "sendSessionIdHeader"),
+        .supports_long_cache_retention = try optionalBool(object, "supportsLongCacheRetention"),
+        .supports_eager_tool_input_streaming = try optionalBool(object, "supportsEagerToolInputStreaming"),
+        .supports_cache_control_on_tools = try optionalBool(object, "supportsCacheControlOnTools"),
+        .supports_temperature = try optionalBool(object, "supportsTemperature"),
+        .force_adaptive_thinking = try optionalBool(object, "forceAdaptiveThinking"),
+        .allow_empty_signature = try optionalBool(object, "allowEmptySignature"),
+    };
+    errdefer deinitModelCompat(allocator, &compat);
+
+    if (try optionalString(object, "cacheControlFormat")) |format| {
+        if (!std.mem.eql(u8, format, "anthropic")) return error.InvalidModelsJson;
+        compat.cache_control_format = try allocator.dupe(u8, format);
+    }
+
+    return compat;
+}
+
+fn parseMaxTokensField(maybe_value: ?std.json.Value) !?ai.MaxTokensField {
+    const value = maybe_value orelse return null;
+    if (value != .string) return error.InvalidModelsJson;
+    if (std.mem.eql(u8, value.string, "max_completion_tokens")) return .max_completion_tokens;
+    if (std.mem.eql(u8, value.string, "max_tokens")) return .max_tokens;
+    return error.InvalidModelsJson;
+}
+
+fn parseThinkingFormat(maybe_value: ?std.json.Value) !?ai.ThinkingFormat {
+    const value = maybe_value orelse return null;
+    if (value != .string) return error.InvalidModelsJson;
+    if (std.mem.eql(u8, value.string, "openai")) return .openai;
+    if (std.mem.eql(u8, value.string, "openrouter")) return .openrouter;
+    if (std.mem.eql(u8, value.string, "deepseek")) return .deepseek;
+    if (std.mem.eql(u8, value.string, "together")) return .together;
+    if (std.mem.eql(u8, value.string, "zai")) return .zai;
+    if (std.mem.eql(u8, value.string, "qwen")) return .qwen;
+    if (std.mem.eql(u8, value.string, "qwen-chat-template")) return .qwen_chat_template;
+    if (std.mem.eql(u8, value.string, "string-thinking")) return .string_thinking;
+    return error.InvalidModelsJson;
+}
+
 fn optionalString(object: std.json.ObjectMap, key: []const u8) !?[]const u8 {
     const value = object.get(key) orelse return null;
     return if (value == .string) value.string else error.InvalidModelsJson;
@@ -865,29 +1268,68 @@ fn modelRequestKeyAlloc(allocator: std.mem.Allocator, provider: []const u8, mode
     return try std.fmt.allocPrint(allocator, "{s}:{s}", .{ provider, model_id });
 }
 
-fn putOwnedString(
+fn storeProviderOverride(
     allocator: std.mem.Allocator,
-    map: *std.StringHashMap([]u8),
-    key_value: []const u8,
-    value: []const u8,
+    map: *std.StringHashMap(ProviderOverride),
+    provider: []const u8,
+    override: ProviderOverride,
 ) !void {
-    const value_copy = try allocator.dupe(u8, value);
-    errdefer allocator.free(value_copy);
-    if (map.getPtr(key_value)) |existing| {
-        allocator.free(existing.*);
-        existing.* = value_copy;
+    var owned = override;
+    errdefer owned.deinit(allocator);
+
+    if (map.getPtr(provider)) |existing| {
+        existing.deinit(allocator);
+        existing.* = owned;
         return;
     }
-    const key_copy = try allocator.dupe(u8, key_value);
-    errdefer allocator.free(key_copy);
-    try map.put(key_copy, value_copy);
+
+    const key = try allocator.dupe(u8, provider);
+    errdefer allocator.free(key);
+    try map.put(key, owned);
 }
 
-fn deinitStringMap(allocator: std.mem.Allocator, map: *std.StringHashMap([]u8)) void {
+fn storeModelOverride(
+    allocator: std.mem.Allocator,
+    map: *std.StringHashMap(ModelOverride),
+    provider: []const u8,
+    model_id: []const u8,
+    override: ModelOverride,
+) !void {
+    var owned = override;
+    errdefer owned.deinit(allocator);
+
+    const key = try modelRequestKeyAlloc(allocator, provider, model_id);
+    errdefer allocator.free(key);
+    if (map.getPtr(key)) |existing| {
+        existing.deinit(allocator);
+        existing.* = owned;
+        allocator.free(key);
+        return;
+    }
+
+    try map.put(key, owned);
+}
+
+fn deinitProviderOverrides(
+    allocator: std.mem.Allocator,
+    map: *std.StringHashMap(ProviderOverride),
+) void {
     var iterator = map.iterator();
     while (iterator.next()) |entry| {
         allocator.free(entry.key_ptr.*);
-        allocator.free(entry.value_ptr.*);
+        entry.value_ptr.deinit(allocator);
+    }
+    map.deinit();
+}
+
+fn deinitModelOverrides(
+    allocator: std.mem.Allocator,
+    map: *std.StringHashMap(ModelOverride),
+) void {
+    var iterator = map.iterator();
+    while (iterator.next()) |entry| {
+        allocator.free(entry.key_ptr.*);
+        entry.value_ptr.deinit(allocator);
     }
     map.deinit();
 }
@@ -1160,4 +1602,112 @@ test "model registry resolves provider model headers and authHeader per request"
         }
     }
     try std.testing.expectEqual(@as(usize, 2), runner.calls);
+}
+
+// Ported from packages/coding-agent/test/model-registry.test.ts modelOverrides cases.
+test "model registry applies built-in model overrides and refresh restores them" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    var runner: TestCommandRunner = .{};
+    const content =
+        \\{"providers":{"openrouter":{"baseUrl":"https://my-proxy.example.com/v1","modelOverrides":{"anthropic/claude-sonnet-4":{"name":"Proxied Sonnet","reasoning":false,"input":["text"],"cost":{"input":99},"contextWindow":1234,"maxTokens":4321,"headers":{"X-Custom-Model-Header":"value"}}}}}}
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "models.json", .data = content });
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, "models.json", allocator);
+    defer allocator.free(path);
+
+    var harness = try makeTestRegistry(allocator, &env, &runner, path);
+    defer harness.deinit();
+
+    const sonnet = harness.registry.find("openrouter", "anthropic/claude-sonnet-4") orelse return error.ModelMissing;
+    try std.testing.expectEqualStrings("https://my-proxy.example.com/v1", sonnet.base_url);
+    try std.testing.expectEqualStrings("Proxied Sonnet", sonnet.name);
+    try std.testing.expect(!sonnet.reasoning);
+    try std.testing.expectEqual(@as(usize, 1), sonnet.input.len);
+    try std.testing.expectEqualStrings("text", sonnet.input[0]);
+    try std.testing.expectEqual(@as(f64, 99), sonnet.cost.input);
+    try std.testing.expect(sonnet.cost.output > 0);
+    try std.testing.expectEqual(@as(u64, 1234), sonnet.context_window);
+    try std.testing.expectEqual(@as(u64, 4321), sonnet.max_tokens);
+
+    var request_auth = try harness.registry.getApiKeyAndHeadersAlloc(allocator, sonnet);
+    defer request_auth.deinit(allocator);
+    switch (request_auth) {
+        .ok => |auth| try std.testing.expectEqualStrings("value", auth.getHeader("X-Custom-Model-Header").?),
+        .failure => return error.UnexpectedFailure,
+    }
+
+    const opus = harness.registry.find("openrouter", "anthropic/claude-opus-4") orelse return error.ModelMissing;
+    try std.testing.expectEqualStrings("https://my-proxy.example.com/v1", opus.base_url);
+    try std.testing.expect(!std.mem.eql(u8, "Proxied Sonnet", opus.name));
+
+    const updated_content =
+        \\{"providers":{"openrouter":{"modelOverrides":{"anthropic/claude-sonnet-4":{"name":"Second Name"}}}}}
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "models.json", .data = updated_content });
+    try harness.registry.refresh();
+    const updated = harness.registry.find("openrouter", "anthropic/claude-sonnet-4") orelse return error.ModelMissing;
+    try std.testing.expectEqualStrings("Second Name", updated.name);
+
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "models.json", .data = "{\"providers\":{}}" });
+    try harness.registry.refresh();
+    const restored = harness.registry.find("openrouter", "anthropic/claude-sonnet-4") orelse return error.ModelMissing;
+    try std.testing.expect(!std.mem.eql(u8, "Second Name", restored.name));
+}
+
+test "model registry parses custom model thinking map and merged compat" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    var runner: TestCommandRunner = .{};
+    const content =
+        \\{"providers":{"demo":{"baseUrl":"https://example.com/v1","apiKey":"DEMO_KEY","api":"openai-completions","compat":{"supportsUsageInStreaming":false,"maxTokensField":"max_tokens"},"models":[{"id":"demo-model","reasoning":true,"input":["text"],"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0},"contextWindow":1000,"maxTokens":100,"thinkingLevelMap":{"minimal":null,"high":"max"},"compat":{"supportsUsageInStreaming":true,"maxTokensField":"max_completion_tokens","supportsStrictMode":false,"cacheControlFormat":"anthropic"}}]}}}
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "models.json", .data = content });
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, "models.json", allocator);
+    defer allocator.free(path);
+
+    var harness = try makeTestRegistry(allocator, &env, &runner, path);
+    defer harness.deinit();
+    try std.testing.expectEqual(@as(?[]const u8, null), harness.registry.getError());
+
+    const model = harness.registry.find("demo", "demo-model") orelse return error.ModelMissing;
+    switch (model.thinking_level_map.minimal) {
+        .unsupported => {},
+        else => return error.ExpectedUnsupportedThinkingLevel,
+    }
+    switch (model.thinking_level_map.high) {
+        .mapped => |value| try std.testing.expectEqualStrings("max", value),
+        else => return error.ExpectedMappedThinkingLevel,
+    }
+    try std.testing.expectEqual(@as(?bool, true), model.compat.supports_usage_in_streaming);
+    try std.testing.expectEqual(@as(?ai.MaxTokensField, .max_completion_tokens), model.compat.max_tokens_field);
+    try std.testing.expectEqual(@as(?bool, false), model.compat.supports_strict_mode);
+    try std.testing.expectEqualStrings("anthropic", model.compat.cache_control_format.?);
+}
+
+test "model registry applies provider compat overrides to built-in models" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    var runner: TestCommandRunner = .{};
+    const content =
+        \\{"providers":{"openrouter":{"compat":{"supportsUsageInStreaming":false,"supportsStrictMode":false}}}}
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "models.json", .data = content });
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, "models.json", allocator);
+    defer allocator.free(path);
+
+    var harness = try makeTestRegistry(allocator, &env, &runner, path);
+    defer harness.deinit();
+    const sonnet = harness.registry.find("openrouter", "anthropic/claude-sonnet-4") orelse return error.ModelMissing;
+    try std.testing.expectEqual(@as(?bool, false), sonnet.compat.supports_usage_in_streaming);
+    try std.testing.expectEqual(@as(?bool, false), sonnet.compat.supports_strict_mode);
 }

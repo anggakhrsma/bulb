@@ -341,6 +341,7 @@ pub const ModelCompat = struct {
     requires_thinking_as_text: ?bool = null,
     requires_reasoning_content_on_assistant_messages: ?bool = null,
     thinking_format: ?ThinkingFormat = null,
+    cache_control_format: ?[]const u8 = null,
     zai_tool_stream: ?bool = null,
     supports_strict_mode: ?bool = null,
     send_session_affinity_headers: ?bool = null,

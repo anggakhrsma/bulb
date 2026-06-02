@@ -1171,7 +1171,7 @@ pub fn getCompat(model: types.Model) ResolvedOpenAICompletionsCompat {
         .thinking_format = compat.thinking_format orelse detected.thinking_format,
         .zai_tool_stream = compat.zai_tool_stream orelse detected.zai_tool_stream,
         .supports_strict_mode = compat.supports_strict_mode orelse detected.supports_strict_mode,
-        .cache_control_format = detected.cache_control_format,
+        .cache_control_format = compat.cache_control_format orelse detected.cache_control_format,
         .send_session_affinity_headers = compat.send_session_affinity_headers orelse detected.send_session_affinity_headers,
         .supports_long_cache_retention = compat.supports_long_cache_retention orelse detected.supports_long_cache_retention,
     };
