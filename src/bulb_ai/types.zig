@@ -75,6 +75,25 @@ pub const Usage = struct {
     }
 };
 
+pub const DiagnosticCode = union(enum) {
+    string: []const u8,
+    number: i64,
+};
+
+pub const DiagnosticErrorInfo = struct {
+    name: ?[]const u8 = null,
+    message: []const u8,
+    stack: ?[]const u8 = null,
+    code: ?DiagnosticCode = null,
+};
+
+pub const AssistantMessageDiagnostic = struct {
+    type: []const u8,
+    timestamp_ms: i64,
+    @"error": ?DiagnosticErrorInfo = null,
+    details_json: ?[]const u8 = null,
+};
+
 pub const TextContent = struct {
     text: []const u8,
 };
@@ -119,6 +138,7 @@ pub const AssistantMessage = struct {
     stop_reason: StopReason = .stop,
     error_message: ?[]const u8 = null,
     response_id: ?[]const u8 = null,
+    diagnostics: []const AssistantMessageDiagnostic = &.{},
     timestamp_ms: i64 = 0,
 };
 
