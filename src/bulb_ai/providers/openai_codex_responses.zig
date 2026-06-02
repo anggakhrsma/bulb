@@ -3,6 +3,7 @@ const models = @import("../models.zig");
 const openai_prompt_cache = @import("openai_prompt_cache.zig");
 const openai_responses_shared = @import("openai_responses_shared.zig");
 const simple_options = @import("simple_options.zig");
+const diagnostics = @import("../utils/diagnostics.zig");
 const sse = @import("../utils/sse.zig");
 const types = @import("../types.zig");
 
@@ -267,9 +268,21 @@ pub const BuiltCodexParams = struct {
 
 pub const ParsedStream = openai_responses_shared.ParsedResponsesStream;
 
+const WebSocketTransportFailureDiagnostic = struct {
+    message: []const u8,
+    phase: OpenAICodexWebSocketFailurePhase,
+    configured_transport: types.Transport,
+    fallback_transport: ?types.Transport = null,
+    request_bytes: usize,
+
+    fn deinit(self: *WebSocketTransportFailureDiagnostic, allocator: std.mem.Allocator) void {
+        allocator.free(self.message);
+    }
+};
+
 const WebSocketStreamAttempt = union(enum) {
     parsed: ParsedStream,
-    fallback_to_sse: void,
+    fallback_to_sse: ?WebSocketTransportFailureDiagnostic,
 };
 
 pub fn streamOpenAICodexResponses(
@@ -307,18 +320,22 @@ pub fn streamOpenAICodexResponses(
     }
 
     const stream_transport = base_options.transport orelse .auto;
+    var pending_websocket_diagnostic: ?WebSocketTransportFailureDiagnostic = null;
+    defer if (pending_websocket_diagnostic) |*failure| failure.deinit(allocator);
+
     if (stream_transport != .sse) {
         const websocket_attempt = try streamOpenAICodexResponsesWebSocket(
             allocator,
             model,
             params.value,
+            payload_json.len,
             config,
             base_options,
             options,
         );
         switch (websocket_attempt) {
             .parsed => |parsed| return parsed,
-            .fallback_to_sse => {},
+            .fallback_to_sse => |diagnostic| pending_websocket_diagnostic = diagnostic,
         }
     }
 
@@ -341,17 +358,21 @@ pub fn streamOpenAICodexResponses(
                     .source = .transport,
                 }, model);
                 sleepForRetry(options, delay_ms, base_options.signal) catch |sleep_err| {
-                    return terminalParsedStream(
+                    var parsed = try terminalParsedStream(
                         allocator,
                         model,
                         retrySleepStopReason(sleep_err),
                         retrySleepErrorMessage(sleep_err),
                     );
+                    try attachPendingWebSocketDiagnostic(&parsed, pending_websocket_diagnostic);
+                    return parsed;
                 };
                 attempt += 1;
                 continue;
             }
-            return terminalParsedStream(allocator, model, .@"error", @errorName(err));
+            var parsed = try terminalParsedStream(allocator, model, .@"error", @errorName(err));
+            try attachPendingWebSocketDiagnostic(&parsed, pending_websocket_diagnostic);
+            return parsed;
         };
 
         if (options) |opts| {
@@ -381,12 +402,14 @@ pub fn streamOpenAICodexResponses(
             attempt += 1;
             response.deinit();
             sleepForRetry(options, delay_ms, base_options.signal) catch |sleep_err| {
-                return terminalParsedStream(
+                var parsed = try terminalParsedStream(
                     allocator,
                     model,
                     retrySleepStopReason(sleep_err),
                     retrySleepErrorMessage(sleep_err),
                 );
+                try attachPendingWebSocketDiagnostic(&parsed, pending_websocket_diagnostic);
+                return parsed;
             };
             continue;
         }
@@ -395,10 +418,12 @@ pub fn streamOpenAICodexResponses(
             const message = try httpErrorMessage(allocator, response.status, response.body);
             defer allocator.free(message);
             response.deinit();
-            return terminalParsedStream(allocator, model, .@"error", message);
+            var parsed = try terminalParsedStream(allocator, model, .@"error", message);
+            try attachPendingWebSocketDiagnostic(&parsed, pending_websocket_diagnostic);
+            return parsed;
         }
 
-        const parsed = parseSseResponse(
+        var parsed = parseSseResponse(
             allocator,
             model,
             response.body,
@@ -408,6 +433,7 @@ pub fn streamOpenAICodexResponses(
             return err;
         };
         response.deinit();
+        try attachPendingWebSocketDiagnostic(&parsed, pending_websocket_diagnostic);
         return parsed;
     }
 }
@@ -444,14 +470,15 @@ fn streamOpenAICodexResponsesWebSocket(
     allocator: std.mem.Allocator,
     model: types.Model,
     full_body: std.json.Value,
+    original_request_bytes: usize,
     config: OpenAICodexResponsesClientConfig,
     base_options: types.StreamOptions,
     options: ?OpenAICodexResponsesOptions,
 ) !WebSocketStreamAttempt {
-    const opts = options orelse return .{ .fallback_to_sse = {} };
+    const opts = options orelse return .{ .fallback_to_sse = null };
     const websocket_transport = opts.websocket_transport orelse {
         recordWebSocketFallbackFailure(opts.websocket_stats, "WebSocket transport is not available in this runtime");
-        return .{ .fallback_to_sse = {} };
+        return .{ .fallback_to_sse = null };
     };
 
     const stream_transport = base_options.transport orelse .auto;
@@ -505,7 +532,13 @@ fn streamOpenAICodexResponsesWebSocket(
         .cached_context = use_cached_context,
     }) catch |err| {
         recordWebSocketFallbackFailure(opts.websocket_stats, @errorName(err));
-        return .{ .fallback_to_sse = {} };
+        return .{ .fallback_to_sse = try createWebSocketFallbackDiagnostic(
+            allocator,
+            @errorName(err),
+            .before_message_stream_start,
+            stream_transport,
+            original_request_bytes,
+        ) };
     };
     defer response.deinit();
 
@@ -514,9 +547,22 @@ fn streamOpenAICodexResponsesWebSocket(
             recordWebSocketFailureForPhase(opts.websocket_stats, failure);
             if (failure.phase == .before_message_stream_start) {
                 recordWebSocketSseFallbackMaybe(opts.websocket_stats);
-                return .{ .fallback_to_sse = {} };
+                return .{ .fallback_to_sse = try createWebSocketFallbackDiagnostic(
+                    allocator,
+                    failure.message,
+                    failure.phase,
+                    stream_transport,
+                    original_request_bytes,
+                ) };
             }
-            return .{ .parsed = try terminalParsedStream(allocator, model, .@"error", failure.message) };
+            var parsed = try terminalParsedStream(allocator, model, .@"error", failure.message);
+            try attachWebSocketTransportFailureDiagnostic(&parsed, .{
+                .message = failure.message,
+                .phase = failure.phase,
+                .configured_transport = stream_transport,
+                .request_bytes = original_request_bytes,
+            });
+            return .{ .parsed = parsed };
         },
         .events_json => |events_json| {
             if (!webSocketEventsHaveCompletion(allocator, events_json)) {
@@ -529,9 +575,22 @@ fn streamOpenAICodexResponsesWebSocket(
                 recordWebSocketFailureForPhase(opts.websocket_stats, failure);
                 if (phase == .before_message_stream_start) {
                     recordWebSocketSseFallbackMaybe(opts.websocket_stats);
-                    return .{ .fallback_to_sse = {} };
+                    return .{ .fallback_to_sse = try createWebSocketFallbackDiagnostic(
+                        allocator,
+                        message,
+                        phase,
+                        stream_transport,
+                        original_request_bytes,
+                    ) };
                 }
-                return .{ .parsed = try terminalParsedStream(allocator, model, .@"error", message) };
+                var parsed = try terminalParsedStream(allocator, model, .@"error", message);
+                try attachWebSocketTransportFailureDiagnostic(&parsed, .{
+                    .message = message,
+                    .phase = phase,
+                    .configured_transport = stream_transport,
+                    .request_bytes = original_request_bytes,
+                });
+                return .{ .parsed = parsed };
             }
 
             var normalized_events = try normalizeCodexWebSocketEvents(allocator, events_json);
@@ -851,6 +910,105 @@ fn recordWebSocketFailureForPhase(
 
 fn recordWebSocketSseFallbackMaybe(stats: ?*OpenAICodexWebSocketDebugStats) void {
     if (stats) |value| recordWebSocketSseFallback(value, true);
+}
+
+fn createWebSocketFallbackDiagnostic(
+    allocator: std.mem.Allocator,
+    message: []const u8,
+    phase: OpenAICodexWebSocketFailurePhase,
+    configured_transport: types.Transport,
+    request_bytes: usize,
+) !WebSocketTransportFailureDiagnostic {
+    return .{
+        .message = try allocator.dupe(u8, message),
+        .phase = phase,
+        .configured_transport = configured_transport,
+        .fallback_transport = .sse,
+        .request_bytes = request_bytes,
+    };
+}
+
+fn attachPendingWebSocketDiagnostic(
+    parsed: *ParsedStream,
+    failure: ?WebSocketTransportFailureDiagnostic,
+) !void {
+    if (failure) |value| try attachWebSocketTransportFailureDiagnostic(parsed, value);
+}
+
+fn attachWebSocketTransportFailureDiagnostic(
+    parsed: *ParsedStream,
+    failure: WebSocketTransportFailureDiagnostic,
+) !void {
+    const arena_allocator = parsed.arena.allocator();
+    const diagnostic = try makeWebSocketTransportFailureDiagnostic(arena_allocator, failure);
+    try diagnostics.appendAssistantMessageDiagnostic(arena_allocator, &parsed.result.message, diagnostic);
+    syncErrorEventDiagnostics(&parsed.result);
+}
+
+fn makeWebSocketTransportFailureDiagnostic(
+    allocator: std.mem.Allocator,
+    failure: WebSocketTransportFailureDiagnostic,
+) !types.AssistantMessageDiagnostic {
+    const details_json = try webSocketTransportFailureDetailsJson(allocator, failure);
+    errdefer allocator.free(details_json);
+    return .{
+        .type = "provider_transport_failure",
+        .timestamp_ms = diagnostics.currentTimestampMs(),
+        .@"error" = .{
+            .name = "Error",
+            .message = try allocator.dupe(u8, failure.message),
+        },
+        .details_json = details_json,
+    };
+}
+
+fn webSocketTransportFailureDetailsJson(
+    allocator: std.mem.Allocator,
+    failure: WebSocketTransportFailureDiagnostic,
+) ![]u8 {
+    const configured_transport = transportJsonName(failure.configured_transport);
+    const events_emitted = failure.phase == .after_message_stream_start;
+    if (failure.fallback_transport) |fallback_transport| {
+        return std.fmt.allocPrint(
+            allocator,
+            "{{\"configuredTransport\":\"{s}\",\"fallbackTransport\":\"{s}\",\"eventsEmitted\":{},\"phase\":\"{s}\",\"requestBytes\":{d}}}",
+            .{
+                configured_transport,
+                transportJsonName(fallback_transport),
+                events_emitted,
+                @tagName(failure.phase),
+                failure.request_bytes,
+            },
+        );
+    }
+    return std.fmt.allocPrint(
+        allocator,
+        "{{\"configuredTransport\":\"{s}\",\"eventsEmitted\":{},\"phase\":\"{s}\",\"requestBytes\":{d}}}",
+        .{
+            configured_transport,
+            events_emitted,
+            @tagName(failure.phase),
+            failure.request_bytes,
+        },
+    );
+}
+
+fn transportJsonName(transport: types.Transport) []const u8 {
+    return switch (transport) {
+        .sse => "sse",
+        .websocket => "websocket",
+        .websocket_cached => "websocket-cached",
+        .auto => "auto",
+    };
+}
+
+fn syncErrorEventDiagnostics(result: *types.StreamResult) void {
+    for (result.events.items) |*event| {
+        switch (event.*) {
+            .@"error" => |*terminal| terminal.message.diagnostics = result.message.diagnostics,
+            else => {},
+        }
+    }
 }
 
 const OwnedJsonEventList = struct {
@@ -2197,6 +2355,22 @@ test "OpenAI Codex Responses falls back to SSE on WebSocket connect timeout" {
     try std.testing.expectEqual(@as(u64, 1), stats.sse_fallbacks);
     try std.testing.expect(stats.websocket_fallback_active);
     try std.testing.expectEqualStrings("WebSocket connect timeout after 50ms", stats.last_websocket_error.?);
+    try std.testing.expectEqual(@as(usize, 1), parsed.result.message.diagnostics.len);
+    const diagnostic = parsed.result.message.diagnostics[0];
+    try std.testing.expectEqualStrings("provider_transport_failure", diagnostic.type);
+    try std.testing.expectEqualStrings("Error", diagnostic.@"error".?.name.?);
+    try std.testing.expectEqualStrings("WebSocket connect timeout after 50ms", diagnostic.@"error".?.message);
+
+    var details = try std.json.parseFromSlice(std.json.Value, allocator, diagnostic.details_json.?, .{});
+    defer details.deinit();
+    try std.testing.expectEqualStrings("auto", getStringField(details.value, "configuredTransport").?);
+    try std.testing.expectEqualStrings("sse", getStringField(details.value, "fallbackTransport").?);
+    try std.testing.expectEqual(false, getBoolField(details.value, "eventsEmitted").?);
+    try std.testing.expectEqualStrings("before_message_stream_start", getStringField(details.value, "phase").?);
+    try std.testing.expectEqual(
+        @as(i64, @intCast(sse_transport.records.items[0].payload_json.len)),
+        details.value.object.get("requestBytes").?.integer,
+    );
 }
 
 test "OpenAI Codex Responses falls back to SSE when WebSocket idles before first event" {
@@ -2273,6 +2447,37 @@ test "OpenAI Codex Responses errors when WebSocket idles after stream start" {
     try std.testing.expectEqual(@as(u64, 1), stats.websocket_failures);
     try std.testing.expectEqual(@as(u64, 0), stats.sse_fallbacks);
     try std.testing.expect(stats.websocket_fallback_active);
+    try std.testing.expectEqual(@as(usize, 1), parsed.result.message.diagnostics.len);
+    const diagnostic = parsed.result.message.diagnostics[0];
+    try std.testing.expectEqualStrings("provider_transport_failure", diagnostic.type);
+    try std.testing.expectEqualStrings("Error", diagnostic.@"error".?.name.?);
+    try std.testing.expectEqualStrings("WebSocket idle timeout after 50ms", diagnostic.@"error".?.message);
+
+    var details = try std.json.parseFromSlice(std.json.Value, allocator, diagnostic.details_json.?, .{});
+    defer details.deinit();
+    try std.testing.expectEqualStrings("auto", getStringField(details.value, "configuredTransport").?);
+    try std.testing.expect(getStringField(details.value, "fallbackTransport") == null);
+    try std.testing.expectEqual(true, getBoolField(details.value, "eventsEmitted").?);
+    try std.testing.expectEqualStrings("after_message_stream_start", getStringField(details.value, "phase").?);
+    var expected_params = try buildParams(allocator, model, basicContext(), .{
+        .base = .{
+            .api_key = token,
+            .transport = .auto,
+            .timeout_ms = 50,
+        },
+    });
+    defer expected_params.deinit();
+    const expected_payload_json = try stringifyJsonValue(allocator, expected_params.value);
+    defer allocator.free(expected_payload_json);
+    try std.testing.expectEqual(
+        @as(i64, @intCast(expected_payload_json.len)),
+        details.value.object.get("requestBytes").?.integer,
+    );
+    try std.testing.expectEqual(@as(usize, 1), parsed.result.events.items.len);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        parsed.result.events.items[0].@"error".message.diagnostics.len,
+    );
 }
 
 test "OpenAI Codex Responses sends only response input deltas in cached WebSocket mode" {
