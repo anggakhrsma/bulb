@@ -122,7 +122,7 @@ packages/ai/src/providers/mistral.ts	bulb_ai	source	pending
 packages/ai/src/providers/openai-codex-responses.ts	bulb_ai	source	pending		
 packages/ai/src/providers/openai-completions.ts	bulb_ai	source	in_progress	src/bulb_ai/providers/openai_completions.zig	OpenAI-compatible compat detection, message/tool conversion, prompt cache fields, Anthropic cache markers, reasoning option mapping, tool_choice, response metadata, usage mapping, client config/header/base URL/request-option construction, stable tool-call delta coalescing, chunk-to-event parsing, native std.http POST/SSE execution, test transport, and retry policy ported; response-header extraction, precise timeouts, and live/provider edge cases remain
 packages/ai/src/providers/openai-prompt-cache.ts	bulb_ai	source	implemented	src/bulb_ai/providers/openai_prompt_cache.zig	OpenAI prompt-cache key clamping and prompt-cache retention helpers ported with Unicode-aware truncation
-packages/ai/src/providers/openai-responses-shared.ts	bulb_ai	source	pending		
+packages/ai/src/providers/openai-responses-shared.ts	bulb_ai	source	in_progress	src/bulb_ai/providers/openai_responses_shared.zig	Responses input/tool conversion, fallback text-message IDs, foreign tool-call item hashing, tool-result image output shape, usage/stop mapping, and partial tool-JSON cleanup ported; full provider stream/event coverage and service-tier pricing remain
 packages/ai/src/providers/openai-responses.ts	bulb_ai	source	pending		
 packages/ai/src/providers/register-builtins.ts	bulb_ai	source	pending		
 packages/ai/src/providers/simple-options.ts	bulb_ai	source	implemented	src/bulb_ai/providers/simple_options.zig	Native base-option copy, xhigh-to-high reasoning clamp, and thinking-budget token adjustment ported
@@ -210,9 +210,9 @@ packages/ai/test/openai-completions-tool-choice.test.ts	bulb_ai	test	in_progress
 packages/ai/test/openai-completions-tool-result-images.test.ts	bulb_ai	test	implemented	src/bulb_ai/providers/openai_completions.zig	Consecutive tool-result images are batched into a follow-up user image message for vision-capable OpenAI-compatible models
 packages/ai/test/openai-responses-cache-affinity-e2e.test.ts	bulb_ai	test	pending		
 packages/ai/test/openai-responses-copilot-provider.test.ts	bulb_ai	test	pending		
-packages/ai/test/openai-responses-foreign-toolcall-id.test.ts	bulb_ai	test	pending		
-packages/ai/test/openai-responses-message-id.test.ts	bulb_ai	test	pending		
-packages/ai/test/openai-responses-partial-json-cleanup.test.ts	bulb_ai	test	pending		
+packages/ai/test/openai-responses-foreign-toolcall-id.test.ts	bulb_ai	test	implemented	src/bulb_ai/providers/openai_responses_shared.zig	Foreign Copilot Responses tool-call item IDs are normalized to bounded fc_<shortHash> identifiers while preserving call IDs
+packages/ai/test/openai-responses-message-id.test.ts	bulb_ai	test	implemented	src/bulb_ai/providers/openai_responses_shared.zig	Responses replay conversion emits unique fallback msg_pi IDs for multiple assistant text blocks produced from one prior turn
+packages/ai/test/openai-responses-partial-json-cleanup.test.ts	bulb_ai	test	implemented	src/bulb_ai/providers/openai_responses_shared.zig	Responses function-call streaming finalization parses partial JSON and persists only final arguments without the scratch buffer
 packages/ai/test/openai-responses-reasoning-replay-e2e.test.ts	bulb_ai	test	pending		
 packages/ai/test/openai-responses-tool-result-images.test.ts	bulb_ai	test	pending		
 packages/ai/test/openrouter-cache-write-repro.test.ts	bulb_ai	test	in_progress	src/bulb_ai/providers/openai_completions.zig	Cache-write token preservation ported in native OpenAI completions usage parsing; credentialed OpenRouter E2E remains opt-in
