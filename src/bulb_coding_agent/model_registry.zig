@@ -518,6 +518,7 @@ pub const ModelRegistry = struct {
 
         try self.loadBuiltInModels(&provider_overrides, &model_overrides);
         try self.mergeCustomModels(custom_models.items);
+        try self.applyOAuthModelModifiers();
     }
 
     fn applyRegisteredProviders(self: *ModelRegistry) !void {
@@ -550,6 +551,7 @@ pub const ModelRegistry = struct {
                 errdefer deinitModel(self.allocator, &cloned);
                 try self.models.append(self.allocator, cloned);
             }
+            if (config.oauth) |oauth| try self.applyOAuthModelModifier(oauth);
         } else if (config.base_url) |base_url| {
             for (self.models.items) |*model| {
                 if (std.mem.eql(u8, model.provider, provider_name)) {
@@ -557,6 +559,46 @@ pub const ModelRegistry = struct {
                 }
             }
         }
+    }
+
+    fn applyOAuthModelModifiers(self: *ModelRegistry) !void {
+        for (self.auth_storage.getOAuthProviders()) |oauth| {
+            try self.applyOAuthModelModifier(oauth);
+        }
+    }
+
+    fn applyOAuthModelModifier(
+        self: *ModelRegistry,
+        oauth: ai.oauth.OAuthProviderInterface,
+    ) !void {
+        if (oauth.modify_models_fn == null) return;
+        const credential = self.auth_storage.get(oauth.id) orelse return;
+        const credentials = switch (credential.*) {
+            .api_key => return,
+            .oauth => |value| value,
+        };
+
+        var modified = try oauth.modifyModels(self.allocator, self.models.items, credentials);
+        defer modified.deinit();
+        try self.replaceModels(modified.models);
+    }
+
+    fn replaceModels(self: *ModelRegistry, models: []const ai.Model) !void {
+        var replacement: std.ArrayList(ai.Model) = .empty;
+        errdefer {
+            deinitModelItems(self.allocator, replacement.items);
+            replacement.deinit(self.allocator);
+        }
+        try replacement.ensureTotalCapacity(self.allocator, models.len);
+        for (models) |model| {
+            replacement.appendAssumeCapacity(try cloneModel(self.allocator, model, null));
+        }
+
+        const previous = self.models;
+        self.models = replacement;
+        replacement = previous;
+        deinitModelItems(self.allocator, replacement.items);
+        replacement.deinit(self.allocator);
     }
 
     fn removeModelsForProvider(self: *ModelRegistry, provider_name: []const u8) void {
@@ -2335,6 +2377,37 @@ const DynamicTestOAuth = struct {
     fn getApiKey(_: *anyopaque, credentials: ai.oauth.OAuthCredentials) []const u8 {
         return credentials.access;
     }
+
+    fn modifyingProvider(context: *ModifierContext, name: []const u8) ai.oauth.OAuthProviderInterface {
+        var result = provider(undefined, name);
+        result.context = context;
+        result.modify_models_fn = modifyModels;
+        return result;
+    }
+
+    const ModifierContext = struct {
+        provider: []const u8,
+        base_url: []const u8,
+        calls: usize = 0,
+    };
+
+    fn modifyModels(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        models: []const ai.Model,
+        _: ai.oauth.OAuthCredentials,
+    ) !ai.oauth_types.ModifiedModels {
+        const context: *ModifierContext = @ptrCast(@alignCast(ptr));
+        context.calls += 1;
+        var modified = try ai.oauth_types.ModifiedModels.init(allocator, models);
+        errdefer modified.deinit();
+        for (modified.models) |*model| {
+            if (std.mem.eql(u8, model.provider, context.provider)) {
+                model.base_url = try modified.arena.allocator().dupe(u8, context.base_url);
+            }
+        }
+        return modified;
+    }
 };
 
 // Ported from packages/coding-agent/test/model-registry.test.ts dynamic provider
@@ -2503,6 +2576,81 @@ test "model registry resolves dynamic display names OAuth restoration and legacy
     try std.testing.expectEqualStrings(
         "Anthropic (Claude Pro/Max)",
         harness.oauth_registry.getOAuthProvider("anthropic").?.name,
+    );
+}
+
+test "model registry applies stored OAuth model modifiers during refresh" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    var runner: TestCommandRunner = .{};
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "models.json", .data = "{\"providers\":{}}" });
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, "models.json", allocator);
+    defer allocator.free(path);
+
+    var harness = try makeTestRegistry(allocator, &env, &runner, path);
+    defer harness.deinit();
+    try std.testing.expect(countModelsForProvider(&harness.registry, "github-copilot") > 0);
+
+    var credentials = try ai.oauth.OAuthCredentials.init(
+        allocator,
+        "refresh",
+        "tid=test;exp=9999999999;proxy-ep=proxy.business.githubcopilot.com;",
+        123,
+    );
+    defer credentials.deinit();
+    try credentials.putExtra(ai.oauth.enterprise_url_key, "https://company.ghe.com/path");
+    try harness.storage.setOAuth("github-copilot", credentials);
+    try harness.registry.refresh();
+
+    for (harness.registry.getAll()) |model| {
+        if (std.mem.eql(u8, model.provider, "github-copilot")) {
+            try std.testing.expectEqualStrings("https://api.business.githubcopilot.com", model.base_url);
+        }
+    }
+}
+
+test "model registry applies dynamic OAuth model modifiers after replacement and refresh" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    var runner: TestCommandRunner = .{};
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "models.json", .data = "{\"providers\":{}}" });
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, "models.json", allocator);
+    defer allocator.free(path);
+
+    var harness = try makeTestRegistry(allocator, &env, &runner, path);
+    defer harness.deinit();
+    var credentials = try ai.oauth.OAuthCredentials.init(allocator, "refresh", "access", 123);
+    defer credentials.deinit();
+    try harness.storage.setOAuth("oauth-provider", credentials);
+
+    var context = DynamicTestOAuth.ModifierContext{
+        .provider = "oauth-provider",
+        .base_url = "https://oauth.test/modified",
+    };
+    const models = [_]ai.Model{dynamicTestModel("oauth-model")};
+    try harness.registry.registerProvider("oauth-provider", .{
+        .base_url = "https://oauth.test/original",
+        .api = "openai-completions",
+        .oauth = DynamicTestOAuth.modifyingProvider(&context, "OAuth Provider"),
+        .models = &models,
+    });
+    try std.testing.expectEqual(@as(usize, 1), context.calls);
+    try std.testing.expectEqualStrings(
+        "https://oauth.test/modified",
+        harness.registry.find("oauth-provider", "oauth-model").?.base_url,
+    );
+
+    try harness.registry.refresh();
+    try std.testing.expectEqual(@as(usize, 2), context.calls);
+    try std.testing.expectEqualStrings(
+        "https://oauth.test/modified",
+        harness.registry.find("oauth-provider", "oauth-model").?.base_url,
     );
 }
 
