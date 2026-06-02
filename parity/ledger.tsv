@@ -139,12 +139,12 @@ packages/ai/src/utils/json-parse.ts	bulb_ai	source	in_progress	src/bulb_ai/utils
 packages/ai/src/utils/node-http-proxy.ts	bulb_ai	source	pending		
 packages/ai/src/utils/oauth/anthropic.ts	bulb_ai	source	pending		
 packages/ai/src/utils/oauth/device-code.ts	bulb_ai	source	implemented	src/bulb_ai/utils/oauth/device_code.zig	Immediate polling, minimum/default interval behavior, slow_down interval increases, cancellation, timeout diagnostics, and injectable clock/sleeper hooks ported
-packages/ai/src/utils/oauth/github-copilot.ts	bulb_ai	source	pending		
+packages/ai/src/utils/oauth/github-copilot.ts	bulb_ai	source	implemented	src/bulb_ai/utils/oauth/github_copilot.zig	Copilot enterprise-domain normalization, device-code login, immediate and slow_down polling, cancellation-aware timeout behavior, token refresh, token-derived and enterprise base URLs, model policy activation, provider facade, native HTTP transport, and deterministic fake transport ported
 packages/ai/src/utils/oauth/index.ts	bulb_ai	source	pending		
 packages/ai/src/utils/oauth/oauth-page.ts	bulb_ai	source	implemented	src/bulb_ai/utils/oauth/oauth_page.zig	Shared OAuth success/error callback HTML, Bulb branding, and dynamic HTML escaping ported
 packages/ai/src/utils/oauth/openai-codex.ts	bulb_ai	source	in_progress	src/bulb_ai/utils/oauth/openai_codex.zig	Codex device-code login, token exchange/refresh, JWT account extraction, provider login selector, request content-types, decoded auth input parsing, PKCE authorize URL construction, Bulb originator, native/fake HTTP transports, localhost callback server, BULB_OAUTH_CALLBACK_HOST override, callback route validation, and pasted-code fallback ported; concurrent manual-code race remains
 packages/ai/src/utils/oauth/pkce.ts	bulb_ai	source	implemented	src/bulb_ai/utils/oauth/openai_codex.zig	Native random verifier generation and SHA-256 base64url challenge construction ported for Codex authorization URLs
-packages/ai/src/utils/oauth/types.ts	bulb_ai	source	in_progress	src/bulb_ai/utils/oauth/openai_codex.zig	Native credential, device-code, auth, prompt, selector, callback-server, provider metadata, and transport structs added for OpenAI Codex OAuth; shared OAuth registry types remain
+packages/ai/src/utils/oauth/types.ts	bulb_ai	source	in_progress	src/bulb_ai/utils/oauth/types.zig	Shared native device-code, auth, prompt, progress, and selector callback structs extracted for Codex and Copilot OAuth; credential registry and provider interface types remain
 packages/ai/src/utils/overflow.ts	bulb_ai	source	implemented	src/bulb_ai/utils/overflow.zig	Provider error patterns, exclusions, silent overflow, and length-stop overflow ported
 packages/ai/src/utils/sanitize-unicode.ts	bulb_ai	source	implemented	src/bulb_ai/utils/sanitize_unicode.zig	WTF-8 surrogate cleanup for native UTF-8 provider payloads
 packages/ai/src/utils/typebox-helpers.ts	bulb_ai	source	implemented	src/bulb_ai/utils/typebox_helpers.zig	Native StringEnum helper emits provider-compatible JSON schema without TypeScript/TypeBox runtime
@@ -181,7 +181,7 @@ packages/ai/test/env-api-keys.test.ts	bulb_ai	test	implemented	src/bulb_ai/utils
 packages/ai/test/faux-provider.test.ts	bulb_ai	test	in_progress	src/bulb_ai/faux_provider.zig	Native regression coverage ported for models, metadata, queues, factories, usage, cache simulation, stream events, aborts, and unregister
 packages/ai/test/fireworks-models.test.ts	bulb_ai	test	in_progress	src/bulb_ai/models.zig	Generated Fireworks model metadata, env-key mapping, and router discovery ported; Anthropic request compatibility tests remain with provider transport
 packages/ai/test/github-copilot-anthropic.test.ts	bulb_ai	test	pending		
-packages/ai/test/github-copilot-oauth.test.ts	bulb_ai	test	pending		
+packages/ai/test/github-copilot-oauth.test.ts	bulb_ai	test	implemented	src/bulb_ai/utils/oauth/github_copilot.zig	Upstream device-code callback, immediate polling, slow_down interval increase, and slow_down timeout regressions ported with deterministic clock and transport hooks; domain and base-URL helper coverage added
 packages/ai/test/google-shared-convert-tools.test.ts	bulb_ai	test	pending		
 packages/ai/test/google-shared-gemini3-unsigned-tool-call.test.ts	bulb_ai	test	pending		
 packages/ai/test/google-shared-image-tool-result-routing.test.ts	bulb_ai	test	pending		

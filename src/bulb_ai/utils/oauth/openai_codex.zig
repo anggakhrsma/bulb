@@ -3,6 +3,7 @@ const openai_codex_responses = @import("../../providers/openai_codex_responses.z
 const types = @import("../../types.zig");
 const device_code = @import("device_code.zig");
 const oauth_page = @import("oauth_page.zig");
+const oauth_types = @import("types.zig");
 
 pub const callback_host_env = "BULB_OAUTH_CALLBACK_HOST";
 pub const client_id = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -95,69 +96,15 @@ pub const OAuthHttpTransport = struct {
     }
 };
 
-pub const OAuthDeviceCodeInfo = struct {
-    user_code: []const u8,
-    verification_uri: []const u8,
-    interval_seconds: f64,
-    expires_in_seconds: u64,
-};
-
-pub const DeviceCodeCallback = struct {
-    ptr: ?*anyopaque = null,
-    call: *const fn (?*anyopaque, OAuthDeviceCodeInfo) anyerror!void,
-
-    pub fn invoke(self: DeviceCodeCallback, info: OAuthDeviceCodeInfo) !void {
-        try self.call(self.ptr, info);
-    }
-};
-
-pub const OAuthAuthInfo = struct {
-    url: []const u8,
-    instructions: ?[]const u8 = null,
-};
-
-pub const AuthCallback = struct {
-    ptr: ?*anyopaque = null,
-    call: *const fn (?*anyopaque, OAuthAuthInfo) anyerror!void,
-
-    pub fn invoke(self: AuthCallback, info: OAuthAuthInfo) !void {
-        try self.call(self.ptr, info);
-    }
-};
-
-pub const OAuthPrompt = struct {
-    message: []const u8,
-    placeholder: ?[]const u8 = null,
-    allow_empty: bool = false,
-};
-
-pub const PromptCallback = struct {
-    ptr: ?*anyopaque = null,
-    call: *const fn (?*anyopaque, OAuthPrompt) anyerror![]const u8,
-
-    pub fn invoke(self: PromptCallback, prompt: OAuthPrompt) ![]const u8 {
-        return self.call(self.ptr, prompt);
-    }
-};
-
-pub const OAuthSelectOption = struct {
-    id: []const u8,
-    label: []const u8,
-};
-
-pub const OAuthSelectPrompt = struct {
-    message: []const u8,
-    options: []const OAuthSelectOption,
-};
-
-pub const SelectCallback = struct {
-    ptr: ?*anyopaque = null,
-    call: *const fn (?*anyopaque, OAuthSelectPrompt) anyerror!?[]const u8,
-
-    pub fn invoke(self: SelectCallback, prompt: OAuthSelectPrompt) !?[]const u8 {
-        return self.call(self.ptr, prompt);
-    }
-};
+pub const OAuthDeviceCodeInfo = oauth_types.OAuthDeviceCodeInfo;
+pub const DeviceCodeCallback = oauth_types.DeviceCodeCallback;
+pub const OAuthAuthInfo = oauth_types.OAuthAuthInfo;
+pub const AuthCallback = oauth_types.AuthCallback;
+pub const OAuthPrompt = oauth_types.OAuthPrompt;
+pub const PromptCallback = oauth_types.PromptCallback;
+pub const OAuthSelectOption = oauth_types.OAuthSelectOption;
+pub const OAuthSelectPrompt = oauth_types.OAuthSelectPrompt;
+pub const SelectCallback = oauth_types.SelectCallback;
 
 pub const OpenAICodexDeviceCodeLoginOptions = struct {
     transport: ?OAuthHttpTransport = null,
@@ -1413,8 +1360,8 @@ test "OpenAI Codex OAuth logs in with the device code flow" {
     try std.testing.expectEqual(@as(usize, 1), infos.infos.items.len);
     try std.testing.expectEqualStrings("ABCD-1234", infos.infos.items[0].user_code);
     try std.testing.expectEqualStrings(device_verification_uri, infos.infos.items[0].verification_uri);
-    try std.testing.expectEqual(@as(f64, 5), infos.infos.items[0].interval_seconds);
-    try std.testing.expectEqual(@as(u64, 900), infos.infos.items[0].expires_in_seconds);
+    try std.testing.expectEqual(@as(?f64, 5), infos.infos.items[0].interval_seconds);
+    try std.testing.expectEqual(@as(?u64, 900), infos.infos.items[0].expires_in_seconds);
     try std.testing.expectEqual(@as(usize, 1), sleeper.delays.items.len);
     try std.testing.expectEqual(@as(u64, 5000), sleeper.delays.items[0]);
 
