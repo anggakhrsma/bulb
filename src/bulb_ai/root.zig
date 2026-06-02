@@ -25,6 +25,7 @@ pub const json_parse = @import("utils/json_parse.zig");
 pub const oauth_anthropic = @import("utils/oauth/anthropic.zig");
 pub const oauth_device_code = @import("utils/oauth/device_code.zig");
 pub const oauth_github_copilot = @import("utils/oauth/github_copilot.zig");
+pub const oauth = @import("utils/oauth/index.zig");
 pub const oauth_openai_codex = @import("utils/oauth/openai_codex.zig");
 pub const oauth_page = @import("utils/oauth/oauth_page.zig");
 pub const oauth_types = @import("utils/oauth/types.zig");
@@ -97,6 +98,7 @@ test {
     _ = @import("utils/oauth/anthropic.zig");
     _ = @import("utils/oauth/device_code.zig");
     _ = @import("utils/oauth/github_copilot.zig");
+    _ = @import("utils/oauth/index.zig");
     _ = @import("utils/oauth/openai_codex.zig");
     _ = @import("utils/oauth/oauth_page.zig");
     _ = @import("utils/oauth/types.zig");
