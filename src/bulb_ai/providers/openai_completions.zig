@@ -20,6 +20,51 @@ pub const OpenAICompletionsOptions = struct {
     reasoning_effort: ?types.ThinkingLevel = null,
 };
 
+pub const OpenAICompletionsRequestOptions = struct {
+    timeout_ms: ?u64 = null,
+    max_retries: u32 = 0,
+};
+
+pub const ClientHeaderMap = struct {
+    map: std.StringHashMap(?[]const u8),
+
+    pub fn init(allocator: std.mem.Allocator) ClientHeaderMap {
+        return .{ .map = std.StringHashMap(?[]const u8).init(allocator) };
+    }
+
+    pub fn deinit(self: *ClientHeaderMap) void {
+        self.map.deinit();
+    }
+
+    pub fn get(self: *const ClientHeaderMap, key: []const u8) ??[]const u8 {
+        return self.map.get(key);
+    }
+
+    pub fn getString(self: *const ClientHeaderMap, key: []const u8) ?[]const u8 {
+        return (self.map.get(key) orelse return null) orelse null;
+    }
+
+    pub fn isNull(self: *const ClientHeaderMap, key: []const u8) bool {
+        const value = self.map.get(key) orelse return false;
+        return value == null;
+    }
+};
+
+pub const OpenAICompletionsClientConfig = struct {
+    arena: std.heap.ArenaAllocator,
+    api_key: []const u8,
+    base_url: []const u8,
+    request_url: []const u8,
+    dangerously_allow_browser: bool = true,
+    headers: ClientHeaderMap,
+    request_options: OpenAICompletionsRequestOptions,
+
+    pub fn deinit(self: *OpenAICompletionsClientConfig) void {
+        self.headers.deinit();
+        self.arena.deinit();
+    }
+};
+
 pub const ResolvedOpenAICompletionsCompat = struct {
     supports_store: bool,
     supports_developer_role: bool,
@@ -764,6 +809,46 @@ pub fn getCompat(model: types.Model) ResolvedOpenAICompletionsCompat {
     };
 }
 
+pub fn buildClientConfig(
+    allocator: std.mem.Allocator,
+    model: types.Model,
+    context: types.Context,
+    options: ?OpenAICompletionsOptions,
+    env: ?*const std.process.Environ.Map,
+    compat_override: ?ResolvedOpenAICompletionsCompat,
+) !OpenAICompletionsClientConfig {
+    const base_options = if (options) |opts| opts.base else types.StreamOptions{};
+    const api_key = base_options.api_key orelse return error.NoApiKey;
+    const compat = compat_override orelse getCompat(model);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+
+    const resolved_base_url = if (isCloudflareProvider(model.provider))
+        try resolveCloudflareBaseUrl(a, model, env)
+    else
+        try a.dupe(u8, model.base_url);
+
+    const headers = try buildClientHeaderMap(a, model, context, api_key, options, compat);
+    errdefer {
+        var mutable_headers = headers;
+        mutable_headers.deinit();
+    }
+
+    return .{
+        .arena = arena,
+        .api_key = try a.dupe(u8, api_key),
+        .base_url = resolved_base_url,
+        .request_url = try chatCompletionsUrl(a, resolved_base_url),
+        .headers = headers,
+        .request_options = .{
+            .timeout_ms = base_options.timeout_ms,
+            .max_retries = base_options.max_retries orelse 0,
+        },
+    };
+}
+
 pub fn clientHeaders(
     allocator: std.mem.Allocator,
     model: types.Model,
@@ -790,6 +875,154 @@ pub fn clientHeaders(
         for (opts.base.headers) |header| try headers.put(header.name, header.value);
     }
     return headers;
+}
+
+fn buildClientHeaderMap(
+    allocator: std.mem.Allocator,
+    model: types.Model,
+    context: types.Context,
+    api_key: []const u8,
+    options: ?OpenAICompletionsOptions,
+    compat: ResolvedOpenAICompletionsCompat,
+) !ClientHeaderMap {
+    var headers = ClientHeaderMap.init(allocator);
+    errdefer headers.deinit();
+
+    for (model.headers) |header| try putClientHeader(allocator, &headers, header.name, header.value);
+
+    if (eql(model.provider, "github-copilot")) {
+        try putClientHeader(allocator, &headers, "X-Initiator", inferCopilotInitiator(context.messages));
+        try putClientHeader(allocator, &headers, "Openai-Intent", "conversation-edits");
+        if (hasCopilotVisionInput(context.messages)) {
+            try putClientHeader(allocator, &headers, "Copilot-Vision-Request", "true");
+        }
+    }
+
+    const retention = if (options) |opts| opts.base.cache_retention else types.CacheRetention.short;
+    const session_id = if (retention == .none) null else if (options) |opts| opts.base.session_id else null;
+    if (session_id) |id| {
+        if (compat.send_session_affinity_headers) {
+            try putClientHeader(allocator, &headers, "session_id", id);
+            try putClientHeader(allocator, &headers, "x-client-request-id", id);
+            try putClientHeader(allocator, &headers, "x-session-affinity", id);
+        }
+    }
+
+    if (options) |opts| {
+        for (opts.base.headers) |header| try putClientHeader(allocator, &headers, header.name, header.value);
+    }
+
+    if (eql(model.provider, "cloudflare-ai-gateway")) {
+        if (headers.map.get("Authorization") == null) try putClientNullHeader(allocator, &headers, "Authorization");
+        try putClientHeader(allocator, &headers, "cf-aig-authorization", try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key}));
+    }
+
+    return headers;
+}
+
+fn putClientHeader(
+    allocator: std.mem.Allocator,
+    headers: *ClientHeaderMap,
+    key: []const u8,
+    value: []const u8,
+) !void {
+    try headers.map.put(try allocator.dupe(u8, key), try allocator.dupe(u8, value));
+}
+
+fn putClientNullHeader(
+    allocator: std.mem.Allocator,
+    headers: *ClientHeaderMap,
+    key: []const u8,
+) !void {
+    try headers.map.put(try allocator.dupe(u8, key), null);
+}
+
+fn isCloudflareProvider(provider: []const u8) bool {
+    return eql(provider, "cloudflare-workers-ai") or eql(provider, "cloudflare-ai-gateway");
+}
+
+fn resolveCloudflareBaseUrl(
+    allocator: std.mem.Allocator,
+    model: types.Model,
+    env: ?*const std.process.Environ.Map,
+) ![]const u8 {
+    if (!contains(model.base_url, "{")) return allocator.dupe(u8, model.base_url);
+
+    const environ = env orelse return error.MissingCloudflareEnvironment;
+    var result = std.ArrayList(u8).empty;
+    errdefer result.deinit(allocator);
+
+    var index: usize = 0;
+    while (index < model.base_url.len) {
+        if (model.base_url[index] != '{') {
+            try result.append(allocator, model.base_url[index]);
+            index += 1;
+            continue;
+        }
+
+        const close_offset = std.mem.indexOfScalar(u8, model.base_url[index + 1 ..], '}') orelse {
+            try result.append(allocator, model.base_url[index]);
+            index += 1;
+            continue;
+        };
+        const end = index + 1 + close_offset;
+        const name = model.base_url[index + 1 .. end];
+        if (!isEnvPlaceholderName(name)) {
+            try result.appendSlice(allocator, model.base_url[index .. end + 1]);
+            index = end + 1;
+            continue;
+        }
+
+        const replacement = environ.get(name) orelse return error.MissingCloudflareEnvironment;
+        try result.appendSlice(allocator, replacement);
+        index = end + 1;
+    }
+
+    return result.toOwnedSlice(allocator);
+}
+
+fn isEnvPlaceholderName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    if (!isEnvPlaceholderStart(name[0])) return false;
+    for (name[1..]) |byte| {
+        if (!isEnvPlaceholderChar(byte)) return false;
+    }
+    return true;
+}
+
+fn isEnvPlaceholderStart(byte: u8) bool {
+    return byte == '_' or (byte >= 'A' and byte <= 'Z');
+}
+
+fn isEnvPlaceholderChar(byte: u8) bool {
+    return isEnvPlaceholderStart(byte) or (byte >= '0' and byte <= '9');
+}
+
+fn chatCompletionsUrl(allocator: std.mem.Allocator, base_url: []const u8) ![]const u8 {
+    const trimmed = std.mem.trimEnd(u8, base_url, "/");
+    return std.fmt.allocPrint(allocator, "{s}/chat/completions", .{trimmed});
+}
+
+fn inferCopilotInitiator(messages: []const types.Message) []const u8 {
+    if (messages.len == 0) return "user";
+    return if (std.meta.activeTag(messages[messages.len - 1]) == .user) "user" else "agent";
+}
+
+fn hasCopilotVisionInput(messages: []const types.Message) bool {
+    for (messages) |message| switch (message) {
+        .user => |user| {
+            for (user.content) |content| {
+                if (content == .image) return true;
+            }
+        },
+        .tool_result => |tool_result| {
+            for (tool_result.content) |content| {
+                if (content == .image) return true;
+            }
+        },
+        .assistant => {},
+    };
+    return false;
 }
 
 const LastRole = enum {
@@ -1512,6 +1745,126 @@ test "OpenAI completions sends explicit max tokens with provider field preferenc
     try std.testing.expect(proxy_params.value.object.get("max_completion_tokens") == null);
 }
 
+// Ported from packages/ai/test/openai-completions-empty-tools.test.ts.
+test "OpenAI completions builds conservative Cloudflare AI Gateway client config" {
+    const allocator = std.testing.allocator;
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put("CLOUDFLARE_ACCOUNT_ID", "account-id");
+    try env.put("CLOUDFLARE_GATEWAY_ID", "gateway-id");
+
+    const model = (models.getModel("cloudflare-ai-gateway", "workers-ai/@cf/moonshotai/kimi-k2.6") orelse return error.ModelMissing).*;
+    const user_content = [_]types.UserContent{.{ .text = .{ .text = "hi" } }};
+    const messages = [_]types.Message{.{ .user = .{ .content = &user_content } }};
+    const context: types.Context = .{ .system_prompt = "You are helpful.", .messages = &messages };
+    const options: OpenAICompletionsOptions = .{
+        .base = .{
+            .api_key = "test",
+            .max_tokens = 1234,
+            .max_retries = 2,
+            .timeout_ms = 30_000,
+        },
+        .reasoning_effort = .high,
+    };
+
+    var params = try buildParams(allocator, model, context, options, null, null);
+    defer params.deinit();
+    try std.testing.expectEqualStrings("system", getStringField(params.value.object.get("messages").?.array.items[0], "role").?);
+    try std.testing.expectEqual(@as(i64, 1234), params.value.object.get("max_tokens").?.integer);
+    try std.testing.expect(params.value.object.get("max_completion_tokens") == null);
+    try std.testing.expect(params.value.object.get("reasoning_effort") == null);
+    try std.testing.expect(params.value.object.get("store") == null);
+
+    var config = try buildClientConfig(allocator, model, context, options, &env, null);
+    defer config.deinit();
+    try std.testing.expectEqualStrings("test", config.api_key);
+    try std.testing.expectEqualStrings("https://gateway.ai.cloudflare.com/v1/account-id/gateway-id/compat", config.base_url);
+    try std.testing.expectEqualStrings("https://gateway.ai.cloudflare.com/v1/account-id/gateway-id/compat/chat/completions", config.request_url);
+    try std.testing.expect(config.dangerously_allow_browser);
+    try std.testing.expect(config.headers.isNull("Authorization"));
+    try std.testing.expectEqualStrings("Bearer test", config.headers.getString("cf-aig-authorization").?);
+    try std.testing.expectEqual(@as(u32, 2), config.request_options.max_retries);
+    try std.testing.expectEqual(@as(?u64, 30_000), config.request_options.timeout_ms);
+}
+
+// Ported from packages/ai/test/openai-completions-empty-tools.test.ts.
+test "OpenAI completions preserves Cloudflare BYOK Authorization header" {
+    const allocator = std.testing.allocator;
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put("CLOUDFLARE_ACCOUNT_ID", "account-id");
+    try env.put("CLOUDFLARE_GATEWAY_ID", "gateway-id");
+
+    const model = (models.getModel("cloudflare-ai-gateway", "gpt-5.1") orelse return error.ModelMissing).*;
+    const user_content = [_]types.UserContent{.{ .text = .{ .text = "hi" } }};
+    const messages = [_]types.Message{.{ .user = .{ .content = &user_content } }};
+    const headers = [_]types.Header{.{ .name = "Authorization", .value = "Bearer upstream-token" }};
+    const options: OpenAICompletionsOptions = .{ .base = .{
+        .api_key = "cf-token",
+        .headers = &headers,
+    } };
+
+    var config = try buildClientConfig(allocator, model, .{ .messages = &messages }, options, &env, null);
+    defer config.deinit();
+    try std.testing.expectEqualStrings("Bearer upstream-token", config.headers.getString("Authorization").?);
+    try std.testing.expectEqualStrings("Bearer cf-token", config.headers.getString("cf-aig-authorization").?);
+}
+
+// Ported from packages/ai/test/openai-completions-empty-tools.test.ts.
+test "OpenAI completions sends session affinity headers through Cloudflare AI Gateway" {
+    const allocator = std.testing.allocator;
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put("CLOUDFLARE_ACCOUNT_ID", "account-id");
+    try env.put("CLOUDFLARE_GATEWAY_ID", "gateway-id");
+
+    const model = (models.getModel("cloudflare-ai-gateway", "workers-ai/@cf/moonshotai/kimi-k2.6") orelse return error.ModelMissing).*;
+    const user_content = [_]types.UserContent{.{ .text = .{ .text = "hi" } }};
+    const messages = [_]types.Message{.{ .user = .{ .content = &user_content } }};
+    const options: OpenAICompletionsOptions = .{ .base = .{
+        .api_key = "test",
+        .session_id = "session-1",
+    } };
+
+    var config = try buildClientConfig(allocator, model, .{ .messages = &messages }, options, &env, null);
+    defer config.deinit();
+    try std.testing.expectEqualStrings("session-1", config.headers.getString("session_id").?);
+    try std.testing.expectEqualStrings("session-1", config.headers.getString("x-client-request-id").?);
+    try std.testing.expectEqualStrings("session-1", config.headers.getString("x-session-affinity").?);
+}
+
+// Ported from packages/ai/src/providers/github-copilot-headers.ts.
+test "OpenAI completions builds GitHub Copilot dynamic headers" {
+    const allocator = std.testing.allocator;
+    const model_headers = [_]types.Header{.{ .name = "User-Agent", .value = "GitHubCopilotChat/0.35.0" }};
+    const image_content = [_]types.UserContent{.{ .image = .{ .data = "ZmFrZQ==", .mime_type = "image/png" } }};
+    const assistant_content = [_]types.AssistantContent{.{ .text = .{ .text = "done" } }};
+    const messages = [_]types.Message{
+        .{ .user = .{ .content = &image_content } },
+        .{ .assistant = .{
+            .content = &assistant_content,
+            .api = types.api.openai_completions,
+            .provider = "github-copilot",
+            .model = "gpt-5.1",
+        } },
+    };
+    const model: types.Model = .{
+        .id = "gpt-5.1",
+        .name = "GPT 5.1",
+        .api = types.api.openai_completions,
+        .provider = "github-copilot",
+        .base_url = "https://api.individual.githubcopilot.com",
+        .headers = &model_headers,
+    };
+
+    var config = try buildClientConfig(allocator, model, .{ .messages = &messages }, .{ .base = .{ .api_key = "copilot-token" } }, null, null);
+    defer config.deinit();
+    try std.testing.expectEqualStrings("GitHubCopilotChat/0.35.0", config.headers.getString("User-Agent").?);
+    try std.testing.expectEqualStrings("agent", config.headers.getString("X-Initiator").?);
+    try std.testing.expectEqualStrings("conversation-edits", config.headers.getString("Openai-Intent").?);
+    try std.testing.expectEqualStrings("true", config.headers.getString("Copilot-Vision-Request").?);
+}
+
 // Ported from packages/ai/test/openai-completions-tool-choice.test.ts.
 test "OpenAI completions forwards tool choice and strict tool compatibility" {
     const allocator = std.testing.allocator;
@@ -1627,15 +1980,37 @@ test "OpenAI completions prompt cache fields and session affinity headers" {
     var affinity_model = proxy;
     affinity_model.compat.send_session_affinity_headers = true;
     affinity_model.compat.supports_long_cache_retention = true;
-    const override_headers = [_]types.Header{.{ .name = "session_id", .value = "override-session" }};
+
+    var generated_headers = try clientHeaders(allocator, affinity_model, .{ .base = .{
+        .session_id = "session-affinity",
+    } }, null);
+    defer generated_headers.deinit();
+    try std.testing.expectEqualStrings("session-affinity", generated_headers.get("session_id").?);
+    try std.testing.expectEqualStrings("session-affinity", generated_headers.get("x-client-request-id").?);
+    try std.testing.expectEqualStrings("session-affinity", generated_headers.get("x-session-affinity").?);
+
+    var none_headers = try clientHeaders(allocator, affinity_model, .{ .base = .{
+        .cache_retention = .none,
+        .session_id = "session-affinity",
+    } }, null);
+    defer none_headers.deinit();
+    try std.testing.expect(none_headers.get("session_id") == null);
+    try std.testing.expect(none_headers.get("x-client-request-id") == null);
+    try std.testing.expect(none_headers.get("x-session-affinity") == null);
+
+    const override_headers = [_]types.Header{
+        .{ .name = "session_id", .value = "override-session" },
+        .{ .name = "x-client-request-id", .value = "override-request" },
+        .{ .name = "x-session-affinity", .value = "override-affinity" },
+    };
     var headers = try clientHeaders(allocator, affinity_model, .{ .base = .{
         .session_id = "session-affinity",
         .headers = &override_headers,
     } }, null);
     defer headers.deinit();
     try std.testing.expectEqualStrings("override-session", headers.get("session_id").?);
-    try std.testing.expectEqualStrings("session-affinity", headers.get("x-client-request-id").?);
-    try std.testing.expectEqualStrings("session-affinity", headers.get("x-session-affinity").?);
+    try std.testing.expectEqualStrings("override-request", headers.get("x-client-request-id").?);
+    try std.testing.expectEqualStrings("override-affinity", headers.get("x-session-affinity").?);
 }
 
 // Ported from packages/ai/test/openai-completions-thinking-as-text.test.ts.

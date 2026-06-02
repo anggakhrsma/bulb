@@ -110,9 +110,9 @@ packages/ai/src/oauth.ts	bulb_ai	source	pending
 packages/ai/src/providers/amazon-bedrock.ts	bulb_ai	source	pending		
 packages/ai/src/providers/anthropic.ts	bulb_ai	source	in_progress	src/bulb_ai/providers/anthropic_sse.zig	Raw SSE decoder, Anthropic message-event filtering, malformed JSON repair, usage/stop mapping, text accumulation, and streamed tool-JSON reconstruction ported; HTTP/auth/request transform remains
 packages/ai/src/providers/azure-openai-responses.ts	bulb_ai	source	pending		
-packages/ai/src/providers/cloudflare.ts	bulb_ai	source	pending		
+packages/ai/src/providers/cloudflare.ts	bulb_ai	source	in_progress	src/bulb_ai/providers/openai_completions.zig	Cloudflare provider detection and base URL environment placeholder substitution ported for OpenAI Completions client configuration; shared use by other providers remains
 packages/ai/src/providers/faux.ts	bulb_ai	source	in_progress	src/bulb_ai/faux_provider.zig	Registration, models, queueing, factories, usage, cache simulation, registry dispatch, delta streams, aborts, and unregister ported; paced async delivery remains
-packages/ai/src/providers/github-copilot-headers.ts	bulb_ai	source	pending		
+packages/ai/src/providers/github-copilot-headers.ts	bulb_ai	source	in_progress	src/bulb_ai/providers/openai_completions.zig	Copilot initiator, intent, and vision-request dynamic header inference ported for OpenAI Completions client configuration; shared provider integrations remain
 packages/ai/src/providers/google-shared.ts	bulb_ai	source	pending		
 packages/ai/src/providers/google-vertex.ts	bulb_ai	source	pending		
 packages/ai/src/providers/google.ts	bulb_ai	source	pending		
@@ -120,7 +120,7 @@ packages/ai/src/providers/images/openrouter.ts	bulb_ai	source	pending
 packages/ai/src/providers/images/register-builtins.ts	bulb_ai	source	pending		
 packages/ai/src/providers/mistral.ts	bulb_ai	source	pending		
 packages/ai/src/providers/openai-codex-responses.ts	bulb_ai	source	pending		
-packages/ai/src/providers/openai-completions.ts	bulb_ai	source	in_progress	src/bulb_ai/providers/openai_completions.zig	OpenAI-compatible compat detection, message/tool conversion, prompt cache fields, Anthropic cache markers, reasoning option mapping, tool_choice, response metadata, usage mapping, stable tool-call delta coalescing, and chunk-to-event stream parsing ported; native HTTP/SSE client wiring remains
+packages/ai/src/providers/openai-completions.ts	bulb_ai	source	in_progress	src/bulb_ai/providers/openai_completions.zig	OpenAI-compatible compat detection, message/tool conversion, prompt cache fields, Anthropic cache markers, reasoning option mapping, tool_choice, response metadata, usage mapping, client config/header/base URL/request-option construction, stable tool-call delta coalescing, and chunk-to-event stream parsing ported; native HTTP/SSE execution remains
 packages/ai/src/providers/openai-prompt-cache.ts	bulb_ai	source	implemented	src/bulb_ai/providers/openai_prompt_cache.zig	OpenAI prompt-cache key clamping and prompt-cache retention helpers ported with Unicode-aware truncation
 packages/ai/src/providers/openai-responses-shared.ts	bulb_ai	source	pending		
 packages/ai/src/providers/openai-responses.ts	bulb_ai	source	pending		
@@ -201,8 +201,8 @@ packages/ai/test/openai-codex-cache-affinity-e2e.test.ts	bulb_ai	test	pending
 packages/ai/test/openai-codex-oauth.test.ts	bulb_ai	test	pending		
 packages/ai/test/openai-codex-stream.test.ts	bulb_ai	test	pending		
 packages/ai/test/openai-completions-cache-control-format.test.ts	bulb_ai	test	implemented	src/bulb_ai/providers/openai_completions.zig	Anthropic-style cache_control markers on instruction messages, last tools, and last conversation content ported with cacheRetention none coverage
-packages/ai/test/openai-completions-empty-tools.test.ts	bulb_ai	test	in_progress	src/bulb_ai/providers/openai_completions.zig	Empty tool omission, explicit max token field selection, and tool-history tools: [] regression ported; Cloudflare client construction remains
-packages/ai/test/openai-completions-prompt-cache.test.ts	bulb_ai	test	in_progress	src/bulb_ai/providers/openai_completions.zig	Prompt cache key/retention fields, proxy compatibility, and session-affinity header override coverage ported using Bulb cache variable semantics; SDK client capture remains
+packages/ai/test/openai-completions-empty-tools.test.ts	bulb_ai	test	in_progress	src/bulb_ai/providers/openai_completions.zig	Empty tool omission, explicit max token field selection, tool-history tools: [], Cloudflare AI Gateway /compat construction, BYOK Authorization preservation, and gateway session-affinity regressions ported; native HTTP execution remains
+packages/ai/test/openai-completions-prompt-cache.test.ts	bulb_ai	test	in_progress	src/bulb_ai/providers/openai_completions.zig	Prompt cache key/retention fields, proxy compatibility, and session-affinity generated/override/none coverage ported using Bulb cache variable semantics; native client execution remains
 packages/ai/test/openai-completions-response-model.test.ts	bulb_ai	test	implemented	src/bulb_ai/providers/openai_completions.zig	Routed chunk.model is exposed as response_model while preserving the requested model id
 packages/ai/test/openai-completions-retry.test.ts	bulb_ai	test	pending		
 packages/ai/test/openai-completions-thinking-as-text.test.ts	bulb_ai	test	in_progress	src/bulb_ai/providers/openai_completions.zig	Thinking replay to assistant text parts ported; endpoint/SSE transport regression remains
