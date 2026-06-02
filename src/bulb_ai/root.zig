@@ -9,6 +9,7 @@ pub const anthropic_sse = @import("providers/anthropic_sse.zig");
 pub const cache_retention = @import("providers/cache_retention.zig");
 pub const azure_openai_responses = @import("providers/azure_openai_responses.zig");
 pub const openai_completions = @import("providers/openai_completions.zig");
+pub const openai_codex_responses = @import("providers/openai_codex_responses.zig");
 pub const openai_prompt_cache = @import("providers/openai_prompt_cache.zig");
 pub const openai_responses = @import("providers/openai_responses.zig");
 pub const openai_responses_shared = @import("providers/openai_responses_shared.zig");
@@ -74,6 +75,7 @@ test {
     _ = @import("providers/cache_retention.zig");
     _ = @import("providers/azure_openai_responses.zig");
     _ = @import("providers/openai_completions.zig");
+    _ = @import("providers/openai_codex_responses.zig");
     _ = @import("providers/openai_prompt_cache.zig");
     _ = @import("providers/openai_responses.zig");
     _ = @import("providers/openai_responses_shared.zig");
