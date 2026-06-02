@@ -4,6 +4,8 @@ const ai = @import("bulb_ai");
 const config_value = @import("resolve_config_value.zig");
 
 const max_auth_file_bytes = 1024 * 1024;
+const auth_lock_max_attempts = 10;
+const auth_lock_retry_delay_ms = 20;
 
 pub const ApiKeyCredential = struct {
     key: []u8,
@@ -52,6 +54,19 @@ pub const FallbackResolver = struct {
     }
 };
 
+pub const AuthStorageLockProbe = struct {
+    ptr: ?*anyopaque = null,
+    after_acquire_fn: *const fn (?*anyopaque) anyerror!bool,
+
+    pub fn afterAcquire(self: AuthStorageLockProbe) !bool {
+        return self.after_acquire_fn(self.ptr);
+    }
+};
+
+const StorageUpdate = struct {
+    next: ?[]u8 = null,
+};
+
 const Backend = union(enum) {
     memory: ?[]u8,
     file: []u8,
@@ -86,6 +101,46 @@ const Backend = union(enum) {
             .file => |path| try writeFileSecure(path, content),
         }
     }
+
+    fn withLockUpdate(
+        self: *Backend,
+        allocator: std.mem.Allocator,
+        probe: ?AuthStorageLockProbe,
+        context: anytype,
+        comptime callback: fn (@TypeOf(context), std.mem.Allocator, ?[]const u8) anyerror!StorageUpdate,
+    ) !void {
+        switch (self.*) {
+            .memory => |content| {
+                if (probe) |lock_probe| {
+                    if (try lock_probe.afterAcquire()) return error.AuthStorageLockCompromised;
+                }
+                const update = try callback(context, allocator, content);
+                if (update.next) |next| {
+                    defer allocator.free(next);
+                    try self.write(allocator, next);
+                }
+            },
+            .file => |path| {
+                try ensureFileExists(path);
+                const io = std.Io.Threaded.global_single_threaded.io();
+                var file = try openFileLockedWithRetry(io, path);
+                defer file.close(io);
+                defer file.unlock(io);
+
+                if (probe) |lock_probe| {
+                    if (try lock_probe.afterAcquire()) return error.AuthStorageLockCompromised;
+                }
+
+                const current = try readOpenFileAlloc(file, io, allocator);
+                defer allocator.free(current);
+                const update = try callback(context, allocator, current);
+                if (update.next) |next| {
+                    defer allocator.free(next);
+                    try self.write(allocator, next);
+                }
+            },
+        }
+    }
 };
 
 pub const AuthStorage = struct {
@@ -97,6 +152,7 @@ pub const AuthStorage = struct {
     data: std.StringHashMap(AuthCredential),
     runtime_overrides: std.StringHashMap([]u8),
     fallback_resolver: ?FallbackResolver = null,
+    lock_probe: ?AuthStorageLockProbe = null,
     load_error: bool = false,
     errors: std.ArrayList([]u8) = .empty,
 
@@ -163,21 +219,12 @@ pub const AuthStorage = struct {
     }
 
     pub fn reload(self: *AuthStorage) !void {
-        const content = self.backend.readAlloc(self.allocator) catch |err| {
+        var context = ReloadContext{ .storage = self };
+        self.backend.withLockUpdate(self.allocator, self.lock_probe, &context, reloadLocked) catch |err| {
             self.recordError(@errorName(err));
             self.load_error = true;
             return;
         };
-        defer if (content) |value| self.allocator.free(value);
-
-        const loaded = parseStorageData(self.allocator, content orelse "{}") catch |err| {
-            self.recordError(@errorName(err));
-            self.load_error = true;
-            return;
-        };
-        deinitCredentialMap(self.allocator, &self.data);
-        self.data = loaded;
-        self.load_error = false;
     }
 
     pub fn setRuntimeApiKey(self: *AuthStorage, provider: []const u8, api_key: []const u8) !void {
@@ -190,6 +237,10 @@ pub const AuthStorage = struct {
 
     pub fn setFallbackResolver(self: *AuthStorage, resolver: FallbackResolver) void {
         self.fallback_resolver = resolver;
+    }
+
+    pub fn setLockProbe(self: *AuthStorage, probe: ?AuthStorageLockProbe) void {
+        self.lock_probe = probe;
     }
 
     pub fn setApiKey(self: *AuthStorage, provider: []const u8, api_key: []const u8) !void {
@@ -256,6 +307,27 @@ pub const AuthStorage = struct {
         return drained;
     }
 
+    pub fn login(self: *AuthStorage, provider: []const u8, callbacks: ai.oauth.OAuthLoginCallbacks) !void {
+        const oauth_provider = self.oauth_registry.getOAuthProvider(provider) orelse return error.UnknownOAuthProvider;
+        var result = try oauth_provider.login(self.allocator, callbacks);
+        defer result.deinit();
+        switch (result) {
+            .credentials => |credentials| try self.setOAuth(provider, credentials),
+            .failed => |failure| {
+                self.recordError(failure.message);
+                return error.OAuthLoginFailed;
+            },
+        }
+    }
+
+    pub fn logout(self: *AuthStorage, provider: []const u8) void {
+        self.remove(provider);
+    }
+
+    pub fn getOAuthProviders(self: *const AuthStorage) []const ai.oauth.OAuthProviderInterface {
+        return self.oauth_registry.getOAuthProviders();
+    }
+
     pub fn getApiKeyAlloc(
         self: *AuthStorage,
         allocator: std.mem.Allocator,
@@ -272,7 +344,7 @@ pub const AuthStorage = struct {
                     if (options.clock.now() < oauth_credentials.expires) {
                         return try allocator.dupe(u8, oauth_provider.getApiKey(oauth_credentials));
                     }
-                    return self.refreshOAuthApiKeyAlloc(allocator, provider, options.clock);
+                    return self.refreshOAuthApiKeyAlloc(allocator, provider, options.clock, oauth_provider);
                 },
             }
         }
@@ -291,73 +363,39 @@ pub const AuthStorage = struct {
         allocator: std.mem.Allocator,
         provider: []const u8,
         clock: ai.oauth_device_code.Clock,
+        oauth_provider: ai.oauth.OAuthProviderInterface,
     ) !?[]u8 {
-        var credentials = std.StringHashMap(ai.oauth.OAuthCredentials).init(self.allocator);
-        defer credentials.deinit();
-        var iterator = self.data.iterator();
-        while (iterator.next()) |entry| {
-            switch (entry.value_ptr.*) {
-                .oauth => |oauth_credentials| try credentials.put(entry.key_ptr.*, oauth_credentials),
-                .api_key => {},
-            }
-        }
-
-        var result = self.oauth_registry.getOAuthApiKey(self.allocator, provider, &credentials, clock) catch |err| {
+        var context = RefreshOAuthContext{
+            .storage = self,
+            .output_allocator = allocator,
+            .provider = provider,
+            .clock = clock,
+            .oauth_provider = oauth_provider,
+        };
+        self.backend.withLockUpdate(self.allocator, self.lock_probe, &context, refreshOAuthLocked) catch |err| {
             self.recordError(@errorName(err));
+            try self.reload();
+            if (self.data.getPtr(provider)) |updated| {
+                switch (updated.*) {
+                    .oauth => |oauth_credentials| {
+                        if (clock.now() < oauth_credentials.expires) {
+                            return try allocator.dupe(u8, oauth_provider.getApiKey(oauth_credentials));
+                        }
+                    },
+                    .api_key => {},
+                }
+            }
             return null;
         };
-        defer result.deinit();
-        switch (result) {
-            .missing => return null,
-            .failed => |failure| {
-                self.recordError(failure.message);
-                return null;
-            },
-            .resolved => |resolved| {
-                try putOwnedCredential(
-                    self.allocator,
-                    &self.data,
-                    provider,
-                    .{ .oauth = try resolved.credentials.clone(self.allocator) },
-                );
-                self.persistProviderChange(provider);
-                return try allocator.dupe(u8, resolved.api_key);
-            },
-        }
+        return context.api_key;
     }
 
     fn persistProviderChange(self: *AuthStorage, provider: []const u8) void {
         if (self.load_error) return;
-        const content = self.backend.readAlloc(self.allocator) catch |err| {
+        var context = PersistProviderContext{ .storage = self, .provider = provider };
+        self.backend.withLockUpdate(self.allocator, self.lock_probe, &context, persistProviderLocked) catch |err| {
             self.recordError(@errorName(err));
-            return;
         };
-        defer if (content) |value| self.allocator.free(value);
-
-        var merged = parseStorageData(self.allocator, content orelse "{}") catch |err| {
-            self.recordError(@errorName(err));
-            return;
-        };
-        defer deinitCredentialMap(self.allocator, &merged);
-
-        if (self.data.get(provider)) |credential| {
-            putOwnedCredential(self.allocator, &merged, provider, credential.clone(self.allocator) catch |err| {
-                self.recordError(@errorName(err));
-                return;
-            }) catch |err| {
-                self.recordError(@errorName(err));
-                return;
-            };
-        } else {
-            removeCredential(self.allocator, &merged, provider);
-        }
-
-        const next = stringifyStorageData(self.allocator, &merged) catch |err| {
-            self.recordError(@errorName(err));
-            return;
-        };
-        defer self.allocator.free(next);
-        self.backend.write(self.allocator, next) catch |err| self.recordError(@errorName(err));
     }
 
     fn recordError(self: *AuthStorage, message: []const u8) void {
@@ -370,6 +408,134 @@ pub const GetApiKeyOptions = struct {
     include_fallback: bool = true,
     clock: ai.oauth_device_code.Clock = .{},
 };
+
+const ReloadContext = struct {
+    storage: *AuthStorage,
+};
+
+fn reloadLocked(context: *ReloadContext, _: std.mem.Allocator, current: ?[]const u8) !StorageUpdate {
+    const self = context.storage;
+    const loaded = parseStorageData(self.allocator, storageContentOrDefault(current)) catch |err| {
+        self.recordError(@errorName(err));
+        self.load_error = true;
+        return .{};
+    };
+    deinitCredentialMap(self.allocator, &self.data);
+    self.data = loaded;
+    self.load_error = false;
+    return .{};
+}
+
+const PersistProviderContext = struct {
+    storage: *AuthStorage,
+    provider: []const u8,
+};
+
+fn persistProviderLocked(
+    context: *PersistProviderContext,
+    _: std.mem.Allocator,
+    current: ?[]const u8,
+) !StorageUpdate {
+    const self = context.storage;
+    var merged = parseStorageData(self.allocator, storageContentOrDefault(current)) catch |err| {
+        self.recordError(@errorName(err));
+        return .{};
+    };
+    defer deinitCredentialMap(self.allocator, &merged);
+
+    if (self.data.get(context.provider)) |credential| {
+        try putOwnedCredential(self.allocator, &merged, context.provider, try credential.clone(self.allocator));
+    } else {
+        removeCredential(self.allocator, &merged, context.provider);
+    }
+
+    return .{ .next = try stringifyStorageData(self.allocator, &merged) };
+}
+
+const RefreshOAuthContext = struct {
+    storage: *AuthStorage,
+    output_allocator: std.mem.Allocator,
+    provider: []const u8,
+    clock: ai.oauth_device_code.Clock,
+    oauth_provider: ai.oauth.OAuthProviderInterface,
+    api_key: ?[]u8 = null,
+};
+
+fn refreshOAuthLocked(
+    context: *RefreshOAuthContext,
+    _: std.mem.Allocator,
+    current: ?[]const u8,
+) !StorageUpdate {
+    const self = context.storage;
+    const loaded = parseStorageData(self.allocator, storageContentOrDefault(current)) catch |err| {
+        self.recordError(@errorName(err));
+        self.load_error = true;
+        return .{};
+    };
+    deinitCredentialMap(self.allocator, &self.data);
+    self.data = loaded;
+    self.load_error = false;
+
+    const credential = self.data.getPtr(context.provider) orelse return .{};
+    switch (credential.*) {
+        .api_key => return .{},
+        .oauth => |oauth_credentials| {
+            if (context.clock.now() < oauth_credentials.expires) {
+                context.api_key = try context.output_allocator.dupe(
+                    u8,
+                    context.oauth_provider.getApiKey(oauth_credentials),
+                );
+                return .{};
+            }
+        },
+    }
+
+    var credentials = std.StringHashMap(ai.oauth.OAuthCredentials).init(self.allocator);
+    defer credentials.deinit();
+    var iterator = self.data.iterator();
+    while (iterator.next()) |entry| {
+        switch (entry.value_ptr.*) {
+            .oauth => |oauth_credentials| try credentials.put(entry.key_ptr.*, oauth_credentials),
+            .api_key => {},
+        }
+    }
+
+    var result = self.oauth_registry.getOAuthApiKey(
+        self.allocator,
+        context.provider,
+        &credentials,
+        context.clock,
+    ) catch |err| {
+        self.recordError(@errorName(err));
+        return .{};
+    };
+    defer result.deinit();
+    switch (result) {
+        .missing => return .{},
+        .failed => |failure| {
+            self.recordError(failure.message);
+            return .{};
+        },
+        .resolved => |resolved| {
+            const api_key = try context.output_allocator.dupe(u8, resolved.api_key);
+            errdefer context.output_allocator.free(api_key);
+            try putOwnedCredential(
+                self.allocator,
+                &self.data,
+                context.provider,
+                .{ .oauth = try resolved.credentials.clone(self.allocator) },
+            );
+            const next = try stringifyStorageData(self.allocator, &self.data);
+            context.api_key = api_key;
+            return .{ .next = next };
+        },
+    }
+}
+
+fn storageContentOrDefault(content: ?[]const u8) []const u8 {
+    const value = content orelse return "{}";
+    return if (value.len == 0) "{}" else value;
+}
 
 fn parseStorageData(allocator: std.mem.Allocator, content: []const u8) !std.StringHashMap(AuthCredential) {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, content, .{});
@@ -470,6 +636,61 @@ fn stringifyStorageData(
     }
     try json.endObject();
     return output.toOwnedSlice();
+}
+
+fn ensureFileExists(path: []const u8) !void {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const cwd = std.Io.Dir.cwd();
+    if (std.fs.path.dirname(path)) |parent| {
+        _ = try cwd.createDirPathStatus(io, parent, privateDirPermissions());
+    }
+    var file = cwd.openFile(io, path, .{
+        .mode = .read_write,
+        .allow_directory = false,
+    }) catch |err| switch (err) {
+        error.FileNotFound => {
+            try cwd.writeFile(io, .{
+                .sub_path = path,
+                .data = "{}",
+                .flags = .{
+                    .read = true,
+                    .truncate = true,
+                    .permissions = privateFilePermissions(),
+                },
+            });
+            return;
+        },
+        else => |open_error| return open_error,
+    };
+    defer file.close(io);
+}
+
+fn openFileLockedWithRetry(io: std.Io, path: []const u8) !std.Io.File {
+    const cwd = std.Io.Dir.cwd();
+    for (0..auth_lock_max_attempts) |attempt| {
+        return cwd.openFile(io, path, .{
+            .mode = .read_write,
+            .allow_directory = false,
+            .lock = .exclusive,
+            .lock_nonblocking = true,
+        }) catch |err| switch (err) {
+            error.WouldBlock => {
+                if (attempt + 1 == auth_lock_max_attempts) return error.AuthStorageLockUnavailable;
+                try std.Io.sleep(io, .fromMilliseconds(auth_lock_retry_delay_ms), .awake);
+                continue;
+            },
+            else => |open_error| return open_error,
+        };
+    }
+    return error.AuthStorageLockUnavailable;
+}
+
+fn readOpenFileAlloc(file: std.Io.File, io: std.Io, allocator: std.mem.Allocator) ![]u8 {
+    var reader = file.reader(io, &.{});
+    return reader.interface.allocRemaining(allocator, .limited(max_auth_file_bytes)) catch |err| switch (err) {
+        error.ReadFailed => return reader.err.?,
+        else => |read_error| return read_error,
+    };
 }
 
 fn writeFileSecure(path: []const u8, content: []const u8) !void {
@@ -761,6 +982,122 @@ test "auth storage refreshes expired OAuth credentials and persists open metadat
     try std.testing.expectEqualStrings("account-new", reparsed.get("test-oauth").?.oauth.getExtra("accountId").?);
 }
 
+test "auth storage exposes OAuth providers and login logout persistence" {
+    const allocator = std.testing.allocator;
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    var registry = try ai.oauth.Registry.init(allocator);
+    defer registry.deinit();
+    var provider_state: TestOAuthProvider = .{};
+    try registry.registerOAuthProvider(provider_state.provider());
+    var resolver = config_value.Resolver.init(allocator, &env);
+    defer resolver.deinit();
+    var storage = try makeTestStorage(allocator, &env, &registry, &resolver);
+    defer storage.deinit();
+
+    const providers = storage.getOAuthProviders();
+    var found = false;
+    for (providers) |provider| {
+        if (std.mem.eql(u8, provider.id, "test-oauth")) found = true;
+    }
+    try std.testing.expect(found);
+
+    try storage.login("test-oauth", .{});
+    try std.testing.expect(storage.has("test-oauth"));
+    try std.testing.expectEqualStrings("login-access", storage.get("test-oauth").?.oauth.access);
+
+    storage.logout("test-oauth");
+    try std.testing.expect(!storage.has("test-oauth"));
+}
+
+test "auth storage locked OAuth refresh rereads persisted credentials first" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    var registry = try ai.oauth.Registry.init(allocator);
+    defer registry.deinit();
+    var provider_state: TestOAuthProvider = .{};
+    try registry.registerOAuthProvider(provider_state.provider());
+    var resolver = config_value.Resolver.init(allocator, &env);
+    defer resolver.deinit();
+
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "auth.json",
+        .data = "{\"test-oauth\":{\"type\":\"oauth\",\"refresh\":\"refresh-token\",\"access\":\"expired-access\",\"expires\":100}}",
+    });
+    const path = try tmp.dir.realPathFileAlloc(io, "auth.json", allocator);
+    defer allocator.free(path);
+    var storage = try AuthStorage.initFile(allocator, &env, &registry, &resolver, path);
+    defer storage.deinit();
+
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "auth.json",
+        .data = "{\"test-oauth\":{\"type\":\"oauth\",\"refresh\":\"fresh-refresh\",\"access\":\"fresh-access\",\"expires\":1000}}",
+    });
+    var clock: TestClock = .{ .now_value = 200 };
+    const key = (try storage.getApiKeyAlloc(
+        allocator,
+        "test-oauth",
+        .{ .clock = .{ .ptr = &clock, .now_ms = TestClock.now } },
+    )).?;
+    defer allocator.free(key);
+
+    try std.testing.expectEqualStrings("fresh-access", key);
+    try std.testing.expectEqual(@as(usize, 0), provider_state.refresh_calls);
+    try std.testing.expectEqualStrings("fresh-access", storage.get("test-oauth").?.oauth.access);
+}
+
+test "auth storage compromised refresh lock returns null and allows retry" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    var registry = try ai.oauth.Registry.init(allocator);
+    defer registry.deinit();
+    var provider_state: TestOAuthProvider = .{};
+    try registry.registerOAuthProvider(provider_state.provider());
+    var resolver = config_value.Resolver.init(allocator, &env);
+    defer resolver.deinit();
+
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "auth.json",
+        .data = "{\"test-oauth\":{\"type\":\"oauth\",\"refresh\":\"refresh-token\",\"access\":\"expired-access\",\"expires\":100}}",
+    });
+    const path = try tmp.dir.realPathFileAlloc(io, "auth.json", allocator);
+    defer allocator.free(path);
+    var storage = try AuthStorage.initFile(allocator, &env, &registry, &resolver, path);
+    defer storage.deinit();
+    var probe: OneShotLockProbe = .{};
+    storage.setLockProbe(.{ .ptr = &probe, .after_acquire_fn = OneShotLockProbe.afterAcquire });
+
+    var clock: TestClock = .{ .now_value = 200 };
+    const first = try storage.getApiKeyAlloc(
+        allocator,
+        "test-oauth",
+        .{ .clock = .{ .ptr = &clock, .now_ms = TestClock.now } },
+    );
+    try std.testing.expect(first == null);
+    try std.testing.expectEqual(@as(usize, 0), provider_state.refresh_calls);
+    const errors = try storage.drainErrors(allocator);
+    defer allocator.free(errors);
+    defer for (errors) |message| allocator.free(message);
+    try std.testing.expect(errors.len > 0);
+
+    const second = (try storage.getApiKeyAlloc(
+        allocator,
+        "test-oauth",
+        .{ .clock = .{ .ptr = &clock, .now_ms = TestClock.now } },
+    )).?;
+    defer allocator.free(second);
+    try std.testing.expectEqualStrings("refreshed-access", second);
+    try std.testing.expectEqual(@as(usize, 1), provider_state.refresh_calls);
+}
+
 const TestFallback = struct {
     value: ?[]const u8,
 
@@ -826,5 +1163,16 @@ const TestClock = struct {
     fn now(ptr: ?*anyopaque) i64 {
         const self: *TestClock = @ptrCast(@alignCast(ptr.?));
         return self.now_value;
+    }
+};
+
+const OneShotLockProbe = struct {
+    remaining: usize = 1,
+
+    fn afterAcquire(ptr: ?*anyopaque) !bool {
+        const self: *OneShotLockProbe = @ptrCast(@alignCast(ptr.?));
+        if (self.remaining == 0) return false;
+        self.remaining -= 1;
+        return true;
     }
 };

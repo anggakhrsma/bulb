@@ -414,7 +414,7 @@ packages/coding-agent/src/core/agent-session-runtime.ts	bulb_coding_agent	source
 packages/coding-agent/src/core/agent-session-services.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/core/agent-session.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/core/auth-guidance.ts	bulb_coding_agent	source	pending		
-packages/coding-agent/src/core/auth-storage.ts	bulb_coding_agent	source	in_progress	src/bulb_coding_agent/auth_storage.zig	Owned API-key and OAuth JSON credentials, secure file and in-memory backends, merge-preserving provider writes, malformed-file protection, error drains, runtime/stored/environment/fallback precedence, auth status, and registry-backed OAuth refresh ported; cross-process refresh locking and login callback integration remain
+packages/coding-agent/src/core/auth-storage.ts	bulb_coding_agent	source	in_progress	src/bulb_coding_agent/auth_storage.zig	Owned API-key and OAuth JSON credentials, secure file and in-memory backends, locked merge-preserving provider writes, malformed-file protection, error drains, runtime/stored/environment/fallback precedence, auth status, provider listing, login/logout, lock-aware OAuth refresh, stale persisted-token reread, and compromised-lock retry behavior ported; externally pluggable storage backend API remains
 packages/coding-agent/src/core/bash-executor.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/core/compaction/branch-summarization.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/core/compaction/compaction.ts	bulb_coding_agent	source	pending		
@@ -568,7 +568,7 @@ packages/coding-agent/test/agent-session-tree-navigation.test.ts	bulb_coding_age
 packages/coding-agent/test/ansi-utils.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/args.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/assistant-message.test.ts	bulb_coding_agent	test	pending		
-packages/coding-agent/test/auth-storage.test.ts	bulb_coding_agent	test	in_progress	src/bulb_coding_agent/auth_storage.zig	Runtime/stored/environment/fallback precedence, merge-preserving persistence, malformed-file protection, drained reload errors, and secret-free auth status regressions ported; cross-process lock compromise and broader command-cache storage integration remain
+packages/coding-agent/test/auth-storage.test.ts	bulb_coding_agent	test	in_progress	src/bulb_coding_agent/auth_storage.zig	Runtime/stored/environment/fallback precedence, command-cache storage integration, merge-preserving persistence, malformed-file protection, drained reload errors, secret-free auth status, stale persisted OAuth reread, lock compromise retry, and login/logout regressions ported; remaining exact API-key literal/env command cases continue through resolve-config-value coverage
 packages/coding-agent/test/bash-close-hang-windows.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/bash-execution-width.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/block-images.test.ts	bulb_coding_agent	test	pending		
