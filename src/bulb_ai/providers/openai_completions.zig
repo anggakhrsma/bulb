@@ -4,6 +4,7 @@ const json_parse = @import("../utils/json_parse.zig");
 const models = @import("../models.zig");
 const openai_prompt_cache = @import("openai_prompt_cache.zig");
 const sanitize_unicode = @import("../utils/sanitize_unicode.zig");
+const sse = @import("../utils/sse.zig");
 const transform_messages = @import("transform_messages.zig");
 const types = @import("../types.zig");
 
@@ -18,11 +19,60 @@ pub const OpenAICompletionsOptions = struct {
     base: types.StreamOptions = .{},
     tool_choice: ?ToolChoice = null,
     reasoning_effort: ?types.ThinkingLevel = null,
+    on_payload: ?PayloadObserver = null,
+    on_response: ?ResponseObserver = null,
+    transport: ?OpenAICompletionsTransport = null,
 };
 
 pub const OpenAICompletionsRequestOptions = struct {
     timeout_ms: ?u64 = null,
     max_retries: u32 = 0,
+};
+
+pub const OpenAICompletionsHttpRequest = struct {
+    url: []const u8,
+    payload_json: []const u8,
+    headers: []const types.Header,
+    timeout_ms: ?u64 = null,
+    attempt: u32 = 0,
+    max_retries: u32 = 0,
+};
+
+pub const OpenAICompletionsHttpResponse = struct {
+    arena: std.heap.ArenaAllocator,
+    status: u16,
+    body: []const u8,
+    headers: []const types.Header = &.{},
+
+    pub fn deinit(self: *OpenAICompletionsHttpResponse) void {
+        self.arena.deinit();
+    }
+};
+
+pub const OpenAICompletionsResponseInfo = struct {
+    status: u16,
+    headers: []const types.Header = &.{},
+};
+
+pub const PayloadObserver = *const fn (payload: *std.json.Value, model: types.Model) anyerror!void;
+pub const ResponseObserver = *const fn (response: OpenAICompletionsResponseInfo, model: types.Model) anyerror!void;
+pub const OpenAICompletionsTransportFn = *const fn (
+    ptr: *anyopaque,
+    allocator: std.mem.Allocator,
+    request: OpenAICompletionsHttpRequest,
+) anyerror!OpenAICompletionsHttpResponse;
+
+pub const OpenAICompletionsTransport = struct {
+    ptr: *anyopaque,
+    request: OpenAICompletionsTransportFn,
+
+    pub fn send(
+        self: OpenAICompletionsTransport,
+        allocator: std.mem.Allocator,
+        request: OpenAICompletionsHttpRequest,
+    ) !OpenAICompletionsHttpResponse {
+        return self.request(self.ptr, allocator, request);
+    }
 };
 
 pub const ClientHeaderMap = struct {
@@ -181,6 +231,323 @@ pub fn mapStopReason(allocator: std.mem.Allocator, reason: []const u8) !StopReas
         .stop_reason = .@"error",
         .error_message = try std.fmt.allocPrint(allocator, "Provider finish_reason: {s}", .{reason}),
     };
+}
+
+pub fn streamOpenAICompletions(
+    allocator: std.mem.Allocator,
+    model: types.Model,
+    context: types.Context,
+    options: ?OpenAICompletionsOptions,
+    env: ?*const std.process.Environ.Map,
+) !ParsedStream {
+    const compat = getCompat(model);
+    var params = try buildParams(allocator, model, context, options, compat, env);
+    defer params.deinit();
+
+    if (options) |opts| {
+        if (opts.on_payload) |observer| try observer(&params.value, model);
+    }
+
+    const payload_json = try stringifyJsonValue(allocator, params.value);
+    defer allocator.free(payload_json);
+
+    var config = try buildClientConfig(allocator, model, context, options, env, compat);
+    defer config.deinit();
+
+    var request_headers = try buildHttpHeaders(allocator, config);
+    defer request_headers.deinit();
+
+    var std_transport_state: StdOpenAICompletionsTransport = .{};
+    const default_transport: OpenAICompletionsTransport = .{
+        .ptr = &std_transport_state,
+        .request = stdOpenAICompletionsTransportRequest,
+    };
+    const transport = if (options) |opts| opts.transport orelse default_transport else default_transport;
+    const base_options = if (options) |opts| opts.base else types.StreamOptions{};
+
+    if (isAborted(base_options)) {
+        return terminalParsedStream(allocator, model, .aborted, "Request was aborted");
+    }
+
+    var attempt: u32 = 0;
+    while (true) {
+        var response = transport.send(allocator, .{
+            .url = config.request_url,
+            .payload_json = payload_json,
+            .headers = request_headers.headers,
+            .timeout_ms = config.request_options.timeout_ms,
+            .attempt = attempt,
+            .max_retries = config.request_options.max_retries,
+        }) catch |err| {
+            if (attempt < config.request_options.max_retries and isRetryableTransportError(err)) {
+                attempt += 1;
+                continue;
+            }
+            return terminalParsedStream(allocator, model, .@"error", @errorName(err));
+        };
+
+        if (options) |opts| {
+            if (opts.on_response) |observer| {
+                observer(.{
+                    .status = response.status,
+                    .headers = response.headers,
+                }, model) catch |err| {
+                    response.deinit();
+                    return err;
+                };
+            }
+        }
+
+        if (isRetryableStatus(response.status) and attempt < config.request_options.max_retries) {
+            attempt += 1;
+            response.deinit();
+            continue;
+        }
+
+        if (!isSuccessStatus(response.status)) {
+            const message = try httpErrorMessage(allocator, response.status, response.body);
+            defer allocator.free(message);
+            response.deinit();
+            return terminalParsedStream(
+                allocator,
+                model,
+                .@"error",
+                message,
+            );
+        }
+
+        const parsed = parseSseResponse(allocator, model, response.body, base_options) catch |err| {
+            response.deinit();
+            return err;
+        };
+        response.deinit();
+        return parsed;
+    }
+}
+
+pub fn parseSseResponse(
+    allocator: std.mem.Allocator,
+    model: types.Model,
+    body: []const u8,
+    options: types.StreamOptions,
+) !ParsedStream {
+    var decoded = try sse.decodeAll(allocator, body);
+    defer decoded.deinit();
+
+    var chunks = std.ArrayList(?[]const u8).empty;
+    defer chunks.deinit(allocator);
+    for (decoded.events) |event| {
+        if (std.mem.eql(u8, std.mem.trim(u8, event.data, " \t\r\n"), "[DONE]")) continue;
+        if (event.data.len == 0) continue;
+        try chunks.append(allocator, event.data);
+    }
+
+    return parseStreamChunks(allocator, model, chunks.items, options);
+}
+
+const OwnedHeaderList = struct {
+    allocator: std.mem.Allocator,
+    headers: []types.Header,
+
+    fn deinit(self: *OwnedHeaderList) void {
+        for (self.headers) |header| {
+            self.allocator.free(header.name);
+            self.allocator.free(header.value);
+        }
+        self.allocator.free(self.headers);
+    }
+};
+
+fn buildHttpHeaders(allocator: std.mem.Allocator, config: OpenAICompletionsClientConfig) !OwnedHeaderList {
+    var headers = std.ArrayList(types.Header).empty;
+    errdefer {
+        deinitHeaderItems(allocator, headers.items);
+        headers.deinit(allocator);
+    }
+
+    const content_type = config.headers.getString("Content-Type") orelse "application/json";
+    try appendHeader(allocator, &headers, "Content-Type", content_type);
+    const accept = config.headers.getString("Accept") orelse "text/event-stream";
+    try appendHeader(allocator, &headers, "Accept", accept);
+
+    if (config.headers.map.get("Authorization")) |authorization| {
+        if (authorization) |value| try appendHeader(allocator, &headers, "Authorization", value);
+    } else {
+        const bearer = try std.fmt.allocPrint(allocator, "Bearer {s}", .{config.api_key});
+        defer allocator.free(bearer);
+        try appendHeader(
+            allocator,
+            &headers,
+            "Authorization",
+            bearer,
+        );
+    }
+
+    var iterator = config.headers.map.iterator();
+    while (iterator.next()) |entry| {
+        const value = entry.value_ptr.* orelse continue;
+        if (std.mem.eql(u8, entry.key_ptr.*, "Authorization")) continue;
+        if (std.mem.eql(u8, entry.key_ptr.*, "Content-Type")) continue;
+        if (std.mem.eql(u8, entry.key_ptr.*, "Accept")) continue;
+        try appendHeader(allocator, &headers, entry.key_ptr.*, value);
+    }
+
+    return .{
+        .allocator = allocator,
+        .headers = try headers.toOwnedSlice(allocator),
+    };
+}
+
+fn appendHeader(
+    allocator: std.mem.Allocator,
+    headers: *std.ArrayList(types.Header),
+    name: []const u8,
+    value: []const u8,
+) !void {
+    const owned_name = try allocator.dupe(u8, name);
+    errdefer allocator.free(owned_name);
+    const owned_value = try allocator.dupe(u8, value);
+    errdefer allocator.free(owned_value);
+    try headers.append(allocator, .{
+        .name = owned_name,
+        .value = owned_value,
+    });
+}
+
+fn deinitHeaderItems(allocator: std.mem.Allocator, headers: []types.Header) void {
+    for (headers) |header| {
+        allocator.free(header.name);
+        allocator.free(header.value);
+    }
+}
+
+fn terminalParsedStream(
+    allocator: std.mem.Allocator,
+    model: types.Model,
+    reason: types.StopReason,
+    message: []const u8,
+) !ParsedStream {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+
+    var events = std.ArrayList(types.StreamEvent).empty;
+    errdefer events.deinit(allocator);
+    const output: types.AssistantMessage = .{
+        .content = &.{},
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
+        .usage = .{},
+        .stop_reason = reason,
+        .error_message = try a.dupe(u8, message),
+    };
+    try events.append(allocator, .{ .@"error" = .{
+        .reason = reason,
+        .message = output,
+    } });
+
+    return .{
+        .arena = arena,
+        .result = .{
+            .allocator = allocator,
+            .events = events,
+            .message = output,
+        },
+    };
+}
+
+fn httpErrorMessage(allocator: std.mem.Allocator, status: u16, body: []const u8) ![]const u8 {
+    const trimmed = std.mem.trim(u8, body, " \t\r\n");
+    if (trimmed.len == 0) return std.fmt.allocPrint(allocator, "HTTP {d}", .{status});
+    return std.fmt.allocPrint(allocator, "HTTP {d}: {s}", .{ status, trimmed });
+}
+
+fn isSuccessStatus(status: u16) bool {
+    return status >= 200 and status < 300;
+}
+
+fn isRetryableStatus(status: u16) bool {
+    return status == 408 or status == 409 or status == 429 or status >= 500;
+}
+
+fn isRetryableTransportError(err: anyerror) bool {
+    return switch (err) {
+        error.OutOfMemory => false,
+        else => true,
+    };
+}
+
+const StdOpenAICompletionsTransport = struct {};
+
+fn stdOpenAICompletionsTransportRequest(
+    ptr: *anyopaque,
+    allocator: std.mem.Allocator,
+    request: OpenAICompletionsHttpRequest,
+) anyerror!OpenAICompletionsHttpResponse {
+    _ = ptr;
+
+    var client = std.http.Client{
+        .allocator = allocator,
+        .io = std.Io.Threaded.global_single_threaded.io(),
+    };
+    defer client.deinit();
+
+    var response_writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer response_writer.deinit();
+
+    const headers = try stdHttpHeaders(allocator, request.headers);
+    defer allocator.free(headers);
+
+    const result = try client.fetch(.{
+        .location = .{ .url = request.url },
+        .method = .POST,
+        .payload = request.payload_json,
+        .headers = .{
+            .authorization = .omit,
+            .content_type = .omit,
+        },
+        .extra_headers = headers,
+        .response_writer = &response_writer.writer,
+        .keep_alive = false,
+        .redirect_behavior = .not_allowed,
+    });
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const raw_body = try response_writer.toOwnedSlice();
+    defer allocator.free(raw_body);
+    const body = try arena.allocator().dupe(u8, raw_body);
+    response_writer.deinit();
+
+    return .{
+        .arena = arena,
+        .status = @intFromEnum(result.status),
+        .body = body,
+    };
+}
+
+fn stdHttpHeaders(allocator: std.mem.Allocator, headers: []const types.Header) ![]std.http.Header {
+    var result = try allocator.alloc(std.http.Header, headers.len);
+    errdefer allocator.free(result);
+    for (headers, 0..) |header, index| {
+        result[index] = .{
+            .name = header.name,
+            .value = header.value,
+        };
+    }
+    return result;
+}
+
+fn stringifyJsonValue(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    var stream: std.json.Stringify = .{
+        .writer = &out.writer,
+        .options = .{},
+    };
+    try stream.write(value);
+    return out.toOwnedSlice();
 }
 
 const StreamParser = struct {
@@ -836,11 +1203,14 @@ pub fn buildClientConfig(
         mutable_headers.deinit();
     }
 
+    const owned_api_key = try a.dupe(u8, api_key);
+    const request_url = try chatCompletionsUrl(a, resolved_base_url);
+
     return .{
         .arena = arena,
-        .api_key = try a.dupe(u8, api_key),
+        .api_key = owned_api_key,
         .base_url = resolved_base_url,
-        .request_url = try chatCompletionsUrl(a, resolved_base_url),
+        .request_url = request_url,
         .headers = headers,
         .request_options = .{
             .timeout_ms = base_options.timeout_ms,
@@ -1629,6 +1999,189 @@ const full_compat: ResolvedOpenAICompletionsCompat = .{
 
 fn emptyUsage() types.Usage {
     return .{};
+}
+
+const openai_retry_success_sse =
+    "data: {\"id\":\"chatcmpl-test\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n" ++
+    "data: {\"id\":\"chatcmpl-test\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" ++
+    "data: [DONE]\n\n";
+
+const RecordedOpenAICompletionsRequest = struct {
+    attempt: u32,
+    max_retries: u32,
+    timeout_ms: ?u64,
+    authorization: ?[]u8 = null,
+
+    fn deinit(self: *RecordedOpenAICompletionsRequest, allocator: std.mem.Allocator) void {
+        if (self.authorization) |value| allocator.free(value);
+    }
+};
+
+const FakeOpenAICompletionsTransport = struct {
+    allocator: std.mem.Allocator,
+    statuses: []const u16 = &.{200},
+    body: []const u8 = openai_retry_success_sse,
+    records: std.ArrayList(RecordedOpenAICompletionsRequest) = .empty,
+
+    fn init(allocator: std.mem.Allocator) FakeOpenAICompletionsTransport {
+        return .{ .allocator = allocator };
+    }
+
+    fn deinit(self: *FakeOpenAICompletionsTransport) void {
+        for (self.records.items) |*record| record.deinit(self.allocator);
+        self.records.deinit(self.allocator);
+    }
+
+    fn transport(self: *FakeOpenAICompletionsTransport) OpenAICompletionsTransport {
+        return .{
+            .ptr = self,
+            .request = fakeOpenAICompletionsTransportRequest,
+        };
+    }
+
+    fn statusForAttempt(self: *const FakeOpenAICompletionsTransport, attempt: u32) u16 {
+        if (self.statuses.len == 0) return 200;
+        const index: usize = @min(attempt, self.statuses.len - 1);
+        return self.statuses[index];
+    }
+};
+
+fn fakeOpenAICompletionsTransportRequest(
+    ptr: *anyopaque,
+    allocator: std.mem.Allocator,
+    request: OpenAICompletionsHttpRequest,
+) anyerror!OpenAICompletionsHttpResponse {
+    const state: *FakeOpenAICompletionsTransport = @ptrCast(@alignCast(ptr));
+    var record: RecordedOpenAICompletionsRequest = .{
+        .attempt = request.attempt,
+        .max_retries = request.max_retries,
+        .timeout_ms = request.timeout_ms,
+    };
+    if (findHeader(request.headers, "Authorization")) |authorization| {
+        record.authorization = try state.allocator.dupe(u8, authorization);
+    }
+    errdefer record.deinit(state.allocator);
+    try state.records.append(state.allocator, record);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const body = try arena.allocator().dupe(u8, state.body);
+    return .{
+        .arena = arena,
+        .status = state.statusForAttempt(request.attempt),
+        .body = body,
+    };
+}
+
+fn findHeader(headers: []const types.Header, name: []const u8) ?[]const u8 {
+    for (headers) |header| {
+        if (std.mem.eql(u8, header.name, name)) return header.value;
+    }
+    return null;
+}
+
+fn openAICompletionsRetryTestModel() types.Model {
+    return .{
+        .id = "test-model",
+        .name = "Test Model",
+        .api = types.api.openai_completions,
+        .provider = "opencode-go",
+        .base_url = "https://opencode.ai/zen/go/v1",
+        .reasoning = false,
+        .input = &.{"text"},
+        .context_window = 1000,
+        .max_tokens = 100,
+    };
+}
+
+fn openAICompletionsRetryTestContext() types.Context {
+    const user_content = &[_]types.UserContent{.{ .text = .{ .text = "hi" } }};
+    const messages = &[_]types.Message{.{ .user = .{ .content = user_content } }};
+    return .{
+        .system_prompt = "",
+        .messages = messages,
+        .tools = &.{},
+    };
+}
+
+// Ported from packages/ai/test/openai-completions-retry.test.ts.
+test "OpenAI completions native stream disables retries by default" {
+    var transport = FakeOpenAICompletionsTransport.init(std.testing.allocator);
+    defer transport.deinit();
+
+    var parsed = try streamOpenAICompletions(
+        std.testing.allocator,
+        openAICompletionsRetryTestModel(),
+        openAICompletionsRetryTestContext(),
+        .{
+            .base = .{ .api_key = "test" },
+            .transport = transport.transport(),
+        },
+        null,
+    );
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(types.StopReason.stop, parsed.result.message.stop_reason);
+    try std.testing.expectEqualStrings("ok", parsed.result.message.content[0].text.text);
+    try std.testing.expectEqual(@as(usize, 1), transport.records.items.len);
+    try std.testing.expectEqual(@as(u32, 0), transport.records.items[0].attempt);
+    try std.testing.expectEqual(@as(u32, 0), transport.records.items[0].max_retries);
+    try std.testing.expectEqualStrings("Bearer test", transport.records.items[0].authorization.?);
+}
+
+// Ported from packages/ai/test/openai-completions-retry.test.ts.
+test "OpenAI completions native stream honors explicit provider retry settings" {
+    var transport = FakeOpenAICompletionsTransport.init(std.testing.allocator);
+    defer transport.deinit();
+
+    var parsed = try streamOpenAICompletions(
+        std.testing.allocator,
+        openAICompletionsRetryTestModel(),
+        openAICompletionsRetryTestContext(),
+        .{
+            .base = .{
+                .api_key = "test",
+                .max_retries = 2,
+                .timeout_ms = 1234,
+            },
+            .transport = transport.transport(),
+        },
+        null,
+    );
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), transport.records.items.len);
+    try std.testing.expectEqual(@as(u32, 2), transport.records.items[0].max_retries);
+    try std.testing.expectEqual(@as(u64, 1234), transport.records.items[0].timeout_ms.?);
+    try std.testing.expectEqual(types.StopReason.stop, parsed.result.message.stop_reason);
+}
+
+// Native translation of the OpenAI SDK retry contract from
+// packages/ai/test/openai-completions-retry.test.ts.
+test "OpenAI completions native stream retries transient HTTP statuses when enabled" {
+    var transport = FakeOpenAICompletionsTransport.init(std.testing.allocator);
+    transport.statuses = &.{ 500, 200 };
+    defer transport.deinit();
+
+    var parsed = try streamOpenAICompletions(
+        std.testing.allocator,
+        openAICompletionsRetryTestModel(),
+        openAICompletionsRetryTestContext(),
+        .{
+            .base = .{
+                .api_key = "test",
+                .max_retries = 2,
+            },
+            .transport = transport.transport(),
+        },
+        null,
+    );
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(types.StopReason.stop, parsed.result.message.stop_reason);
+    try std.testing.expectEqual(@as(usize, 2), transport.records.items.len);
+    try std.testing.expectEqual(@as(u32, 0), transport.records.items[0].attempt);
+    try std.testing.expectEqual(@as(u32, 1), transport.records.items[1].attempt);
 }
 
 // Ported from packages/ai/test/openai-completions-tool-result-images.test.ts.
