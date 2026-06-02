@@ -22,6 +22,8 @@ pub const event_stream = @import("utils/event_stream.zig");
 pub const hash = @import("utils/hash.zig");
 pub const headers = @import("utils/headers.zig");
 pub const json_parse = @import("utils/json_parse.zig");
+pub const oauth_device_code = @import("utils/oauth/device_code.zig");
+pub const oauth_openai_codex = @import("utils/oauth/openai_codex.zig");
 pub const overflow = @import("utils/overflow.zig");
 pub const sanitize_unicode = @import("utils/sanitize_unicode.zig");
 pub const sse = @import("utils/sse.zig");
@@ -88,6 +90,8 @@ test {
     _ = @import("utils/hash.zig");
     _ = @import("utils/headers.zig");
     _ = @import("utils/json_parse.zig");
+    _ = @import("utils/oauth/device_code.zig");
+    _ = @import("utils/oauth/openai_codex.zig");
     _ = @import("utils/overflow.zig");
     _ = @import("utils/sanitize_unicode.zig");
     _ = @import("utils/sse.zig");
