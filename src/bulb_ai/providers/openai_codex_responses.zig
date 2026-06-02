@@ -46,6 +46,7 @@ pub const OpenAICodexResponsesOptions = struct {
     websocket_transport: ?OpenAICodexWebSocketTransport = null,
     websocket_cache_entry: ?*OpenAICodexWebSocketCacheEntry = null,
     websocket_stats: ?*OpenAICodexWebSocketDebugStats = null,
+    websocket_session_store: ?*OpenAICodexWebSocketSessionStore = null,
 };
 
 pub const OpenAICodexResponsesRequestOptions = struct {
@@ -238,6 +239,161 @@ pub const OpenAICodexWebSocketCacheEntry = struct {
     }
 };
 
+pub const OpenAICodexWebSocketDebugStatsSnapshot = struct {
+    arena: std.heap.ArenaAllocator,
+    stats: OpenAICodexWebSocketDebugStats,
+
+    pub fn deinit(self: *OpenAICodexWebSocketDebugStatsSnapshot) void {
+        self.arena.deinit();
+    }
+};
+
+pub const OpenAICodexWebSocketSessionEntry = struct {
+    cache_entry: OpenAICodexWebSocketCacheEntry = .{},
+    stats: OpenAICodexWebSocketDebugStats = .{},
+
+    fn deinit(self: *OpenAICodexWebSocketSessionEntry, allocator: std.mem.Allocator) void {
+        self.cache_entry.deinit();
+        clearOwnedDebugStats(allocator, &self.stats);
+    }
+};
+
+pub const OpenAICodexWebSocketSessionStore = struct {
+    allocator: std.mem.Allocator,
+    sessions: std.StringHashMapUnmanaged(OpenAICodexWebSocketSessionEntry) = .empty,
+
+    pub fn init(allocator: std.mem.Allocator) OpenAICodexWebSocketSessionStore {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *OpenAICodexWebSocketSessionStore) void {
+        var iterator = self.sessions.iterator();
+        while (iterator.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.sessions.deinit(self.allocator);
+    }
+
+    pub fn getEntry(
+        self: *OpenAICodexWebSocketSessionStore,
+        session_id: []const u8,
+    ) ?*OpenAICodexWebSocketSessionEntry {
+        return self.sessions.getPtr(session_id);
+    }
+
+    pub fn getOrCreateEntry(
+        self: *OpenAICodexWebSocketSessionStore,
+        session_id: []const u8,
+    ) !*OpenAICodexWebSocketSessionEntry {
+        if (self.sessions.getPtr(session_id)) |entry| return entry;
+        const key = try self.allocator.dupe(u8, session_id);
+        errdefer self.allocator.free(key);
+        try self.sessions.put(self.allocator, key, .{});
+        return self.sessions.getPtr(key).?;
+    }
+
+    pub fn isFallbackActive(
+        self: *OpenAICodexWebSocketSessionStore,
+        session_id: []const u8,
+    ) bool {
+        const entry = self.sessions.getPtr(session_id) orelse return false;
+        return entry.stats.websocket_fallback_active;
+    }
+
+    pub fn getDebugStatsSnapshot(
+        self: *OpenAICodexWebSocketSessionStore,
+        allocator: std.mem.Allocator,
+        session_id: []const u8,
+    ) !?OpenAICodexWebSocketDebugStatsSnapshot {
+        const entry = self.sessions.getPtr(session_id) orelse return null;
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+        const a = arena.allocator();
+        var snapshot = entry.stats;
+        if (entry.stats.last_previous_response_id) |value| {
+            snapshot.last_previous_response_id = try a.dupe(u8, value);
+        }
+        if (entry.stats.last_websocket_error) |value| {
+            snapshot.last_websocket_error = try a.dupe(u8, value);
+        }
+        return .{ .arena = arena, .stats = snapshot };
+    }
+
+    pub fn resetDebugStats(
+        self: *OpenAICodexWebSocketSessionStore,
+        session_id: ?[]const u8,
+    ) void {
+        if (session_id) |id| {
+            if (self.sessions.getPtr(id)) |entry| clearOwnedDebugStats(self.allocator, &entry.stats);
+            return;
+        }
+        var iterator = self.sessions.iterator();
+        while (iterator.next()) |entry| clearOwnedDebugStats(self.allocator, &entry.value_ptr.stats);
+    }
+
+    pub fn closeSessions(
+        self: *OpenAICodexWebSocketSessionStore,
+        session_id: ?[]const u8,
+    ) void {
+        if (session_id) |id| {
+            if (self.sessions.getPtr(id)) |entry| {
+                entry.cache_entry.deinit();
+                entry.cache_entry = .{};
+            }
+            return;
+        }
+        var iterator = self.sessions.iterator();
+        while (iterator.next()) |entry| {
+            entry.value_ptr.cache_entry.deinit();
+            entry.value_ptr.cache_entry = .{};
+        }
+    }
+
+    fn recordRequestStats(
+        self: *OpenAICodexWebSocketSessionStore,
+        entry: *OpenAICodexWebSocketSessionEntry,
+        request_body: std.json.Value,
+        reused: bool,
+        use_cached_context: bool,
+    ) !void {
+        const previous_response_id = updateWebSocketRequestStatsCounters(
+            &entry.stats,
+            request_body,
+            reused,
+            use_cached_context,
+        );
+        try replaceOwnedOptionalString(self.allocator, &entry.stats.last_previous_response_id, previous_response_id);
+    }
+
+    fn recordFailure(
+        self: *OpenAICodexWebSocketSessionStore,
+        entry: *OpenAICodexWebSocketSessionEntry,
+        message: []const u8,
+    ) !void {
+        entry.stats.websocket_failures += 1;
+        entry.stats.websocket_fallback_active = true;
+        try replaceOwnedOptionalString(self.allocator, &entry.stats.last_websocket_error, message);
+    }
+};
+
+var default_websocket_session_store = OpenAICodexWebSocketSessionStore.init(std.heap.page_allocator);
+
+pub fn getOpenAICodexWebSocketDebugStats(
+    allocator: std.mem.Allocator,
+    session_id: []const u8,
+) !?OpenAICodexWebSocketDebugStatsSnapshot {
+    return default_websocket_session_store.getDebugStatsSnapshot(allocator, session_id);
+}
+
+pub fn resetOpenAICodexWebSocketDebugStats(session_id: ?[]const u8) void {
+    default_websocket_session_store.resetDebugStats(session_id);
+}
+
+pub fn closeOpenAICodexWebSocketSessions(session_id: ?[]const u8) void {
+    default_websocket_session_store.closeSessions(session_id);
+}
+
 pub const OpenAICodexResponsesClientConfig = struct {
     arena: std.heap.ArenaAllocator,
     api_key: []const u8,
@@ -283,6 +439,11 @@ const WebSocketTransportFailureDiagnostic = struct {
 const WebSocketStreamAttempt = union(enum) {
     parsed: ParsedStream,
     fallback_to_sse: ?WebSocketTransportFailureDiagnostic,
+};
+
+const WebSocketSessionRuntime = struct {
+    store: ?*OpenAICodexWebSocketSessionStore = null,
+    entry: ?*OpenAICodexWebSocketSessionEntry = null,
 };
 
 pub fn streamOpenAICodexResponses(
@@ -476,8 +637,18 @@ fn streamOpenAICodexResponsesWebSocket(
     options: ?OpenAICodexResponsesOptions,
 ) !WebSocketStreamAttempt {
     const opts = options orelse return .{ .fallback_to_sse = null };
+    const session_runtime = try resolveWebSocketSessionRuntime(opts, base_options.session_id);
+    if (isWebSocketFallbackActive(opts, session_runtime)) {
+        recordWebSocketSseFallbackForTargets(opts, session_runtime, true);
+        return .{ .fallback_to_sse = null };
+    }
+
     const websocket_transport = opts.websocket_transport orelse {
-        recordWebSocketFallbackFailure(opts.websocket_stats, "WebSocket transport is not available in this runtime");
+        try recordWebSocketFallbackFailureForTargets(
+            opts,
+            session_runtime,
+            "WebSocket transport is not available in this runtime",
+        );
         return .{ .fallback_to_sse = null };
     };
 
@@ -504,18 +675,19 @@ fn streamOpenAICodexResponsesWebSocket(
 
     var cached_body: ?BuiltCodexParams = null;
     defer if (cached_body) |*body| body.deinit();
+    const cache_entry = opts.websocket_cache_entry orelse if (session_runtime.entry) |entry| &entry.cache_entry else null;
     const request_body = if (use_cached_context) blk: {
-        if (opts.websocket_cache_entry) |entry| {
-            cached_body = try buildCachedWebSocketRequestBody(allocator, entry, full_body);
-            break :blk cached_body.?.value;
+        if (cache_entry) |entry| {
+            if (entry.continuation != null) {
+                cached_body = try buildCachedWebSocketRequestBody(allocator, entry, full_body);
+                break :blk cached_body.?.value;
+            }
         }
         break :blk full_body;
     } else full_body;
 
-    if (opts.websocket_stats) |stats| {
-        const reused = if (opts.websocket_cache_entry) |entry| entry.continuation != null else false;
-        recordWebSocketRequestStats(stats, request_body, reused, use_cached_context);
-    }
+    const reused = if (cache_entry) |entry| entry.continuation != null else false;
+    try recordWebSocketRequestStatsForTargets(opts, session_runtime, request_body, reused, use_cached_context);
 
     var create_payload = try buildWebSocketCreatePayload(allocator, request_body);
     defer create_payload.deinit();
@@ -531,7 +703,7 @@ fn streamOpenAICodexResponsesWebSocket(
         .connect_timeout_ms = base_options.websocket_connect_timeout_ms,
         .cached_context = use_cached_context,
     }) catch |err| {
-        recordWebSocketFallbackFailure(opts.websocket_stats, @errorName(err));
+        try recordWebSocketFallbackFailureForTargets(opts, session_runtime, @errorName(err));
         return .{ .fallback_to_sse = try createWebSocketFallbackDiagnostic(
             allocator,
             @errorName(err),
@@ -544,9 +716,9 @@ fn streamOpenAICodexResponsesWebSocket(
 
     switch (response.result) {
         .failure => |failure| {
-            recordWebSocketFailureForPhase(opts.websocket_stats, failure);
+            try recordWebSocketFailureForPhaseTargets(opts, session_runtime, failure);
             if (failure.phase == .before_message_stream_start) {
-                recordWebSocketSseFallbackMaybe(opts.websocket_stats);
+                recordWebSocketSseFallbackForTargets(opts, session_runtime, true);
                 return .{ .fallback_to_sse = try createWebSocketFallbackDiagnostic(
                     allocator,
                     failure.message,
@@ -572,9 +744,9 @@ fn streamOpenAICodexResponsesWebSocket(
                 else
                     .after_message_stream_start;
                 const failure: OpenAICodexWebSocketFailure = .{ .message = message, .phase = phase };
-                recordWebSocketFailureForPhase(opts.websocket_stats, failure);
+                try recordWebSocketFailureForPhaseTargets(opts, session_runtime, failure);
                 if (phase == .before_message_stream_start) {
-                    recordWebSocketSseFallbackMaybe(opts.websocket_stats);
+                    recordWebSocketSseFallbackForTargets(opts, session_runtime, true);
                     return .{ .fallback_to_sse = try createWebSocketFallbackDiagnostic(
                         allocator,
                         message,
@@ -601,9 +773,13 @@ fn streamOpenAICodexResponsesWebSocket(
             errdefer parsed.deinit();
             try applyWebSocketServiceTier(allocator, &parsed, model, normalized_events.items.items, opts.service_tier);
             if (use_cached_context) {
-                if (opts.websocket_cache_entry) |entry| {
+                if (cache_entry) |entry| {
                     if (!isAborted(base_options)) {
-                        try storeWebSocketContinuation(allocator, entry, model, full_body, parsed.result.message);
+                        const cache_allocator = if (opts.websocket_cache_entry == null and session_runtime.store != null)
+                            session_runtime.store.?.allocator
+                        else
+                            allocator;
+                        try storeWebSocketContinuation(cache_allocator, entry, model, full_body, parsed.result.message);
                     }
                 }
             }
@@ -910,6 +1086,95 @@ fn recordWebSocketFailureForPhase(
 
 fn recordWebSocketSseFallbackMaybe(stats: ?*OpenAICodexWebSocketDebugStats) void {
     if (stats) |value| recordWebSocketSseFallback(value, true);
+}
+
+fn resolveWebSocketSessionRuntime(
+    opts: OpenAICodexResponsesOptions,
+    session_id: ?[]const u8,
+) !WebSocketSessionRuntime {
+    const id = session_id orelse return .{};
+    const store = opts.websocket_session_store orelse &default_websocket_session_store;
+    return .{
+        .store = store,
+        .entry = try store.getOrCreateEntry(id),
+    };
+}
+
+fn isWebSocketFallbackActive(
+    opts: OpenAICodexResponsesOptions,
+    runtime: WebSocketSessionRuntime,
+) bool {
+    if (runtime.entry) |entry| {
+        if (entry.stats.websocket_fallback_active) return true;
+    }
+    if (opts.websocket_stats) |stats| return stats.websocket_fallback_active;
+    return false;
+}
+
+fn sameSessionStatsPtr(
+    stats: *OpenAICodexWebSocketDebugStats,
+    runtime: WebSocketSessionRuntime,
+) bool {
+    const entry = runtime.entry orelse return false;
+    return stats == &entry.stats;
+}
+
+fn recordWebSocketRequestStatsForTargets(
+    opts: OpenAICodexResponsesOptions,
+    runtime: WebSocketSessionRuntime,
+    request_body: std.json.Value,
+    reused: bool,
+    use_cached_context: bool,
+) !void {
+    if (opts.websocket_stats) |stats| {
+        if (!sameSessionStatsPtr(stats, runtime)) {
+            recordWebSocketRequestStats(stats, request_body, reused, use_cached_context);
+        }
+    }
+    if (runtime.store) |store| {
+        if (runtime.entry) |entry| try store.recordRequestStats(entry, request_body, reused, use_cached_context);
+    }
+}
+
+fn recordWebSocketFailureForTargets(
+    opts: OpenAICodexResponsesOptions,
+    runtime: WebSocketSessionRuntime,
+    message: []const u8,
+) !void {
+    if (opts.websocket_stats) |stats| {
+        if (!sameSessionStatsPtr(stats, runtime)) recordWebSocketFailure(stats, message);
+    }
+    if (runtime.store) |store| {
+        if (runtime.entry) |entry| try store.recordFailure(entry, message);
+    }
+}
+
+fn recordWebSocketFailureForPhaseTargets(
+    opts: OpenAICodexResponsesOptions,
+    runtime: WebSocketSessionRuntime,
+    failure: OpenAICodexWebSocketFailure,
+) !void {
+    try recordWebSocketFailureForTargets(opts, runtime, failure.message);
+}
+
+fn recordWebSocketSseFallbackForTargets(
+    opts: OpenAICodexResponsesOptions,
+    runtime: WebSocketSessionRuntime,
+    fallback_active: bool,
+) void {
+    if (opts.websocket_stats) |stats| {
+        if (!sameSessionStatsPtr(stats, runtime)) recordWebSocketSseFallback(stats, fallback_active);
+    }
+    if (runtime.entry) |entry| recordWebSocketSseFallback(&entry.stats, fallback_active);
+}
+
+fn recordWebSocketFallbackFailureForTargets(
+    opts: OpenAICodexResponsesOptions,
+    runtime: WebSocketSessionRuntime,
+    message: []const u8,
+) !void {
+    try recordWebSocketFailureForTargets(opts, runtime, message);
+    recordWebSocketSseFallbackForTargets(opts, runtime, true);
 }
 
 fn createWebSocketFallbackDiagnostic(
@@ -1285,6 +1550,20 @@ pub fn recordWebSocketRequestStats(
     reused: bool,
     use_cached_context: bool,
 ) void {
+    stats.last_previous_response_id = updateWebSocketRequestStatsCounters(
+        stats,
+        request_body,
+        reused,
+        use_cached_context,
+    );
+}
+
+fn updateWebSocketRequestStatsCounters(
+    stats: *OpenAICodexWebSocketDebugStats,
+    request_body: std.json.Value,
+    reused: bool,
+    use_cached_context: bool,
+) ?[]const u8 {
     stats.requests += 1;
     if (reused) {
         stats.connections_reused += 1;
@@ -1299,11 +1578,11 @@ pub fn recordWebSocketRequestStats(
     if (getStringField(request_body, "previous_response_id")) |previous_response_id| {
         stats.delta_requests += 1;
         stats.last_delta_input_items = stats.last_input_items;
-        stats.last_previous_response_id = previous_response_id;
+        return previous_response_id;
     } else {
         stats.full_context_requests += 1;
         stats.last_delta_input_items = null;
-        stats.last_previous_response_id = null;
+        return null;
     }
 }
 
@@ -1316,6 +1595,22 @@ pub fn recordWebSocketFailure(stats: *OpenAICodexWebSocketDebugStats, message: [
 pub fn recordWebSocketSseFallback(stats: *OpenAICodexWebSocketDebugStats, fallback_active: bool) void {
     stats.sse_fallbacks += 1;
     stats.websocket_fallback_active = fallback_active;
+}
+
+fn clearOwnedDebugStats(allocator: std.mem.Allocator, stats: *OpenAICodexWebSocketDebugStats) void {
+    if (stats.last_previous_response_id) |value| allocator.free(value);
+    if (stats.last_websocket_error) |value| allocator.free(value);
+    stats.* = .{};
+}
+
+fn replaceOwnedOptionalString(
+    allocator: std.mem.Allocator,
+    field: *?[]const u8,
+    value: ?[]const u8,
+) !void {
+    if (field.*) |old| allocator.free(old);
+    field.* = null;
+    if (value) |new_value| field.* = try allocator.dupe(u8, new_value);
 }
 
 pub fn usesCachedWebSocketContext(transport: ?types.Transport) bool {
@@ -1867,6 +2162,14 @@ const codex_done_ws_events = [_][]const u8{
     "{\"type\":\"response.output_text.delta\",\"delta\":\"Hello\"}",
     "{\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hello\"}]}}",
     "{\"type\":\"response.done\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":5,\"output_tokens\":3,\"total_tokens\":8,\"input_tokens_details\":{\"cached_tokens\":0}}}}",
+};
+
+const codex_done_ws_events_with_id = [_][]const u8{
+    "{\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}",
+    "{\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[]}}",
+    "{\"type\":\"response.output_text.delta\",\"delta\":\"Hello\"}",
+    "{\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hello\"}]}}",
+    "{\"type\":\"response.done\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"usage\":{\"input_tokens\":5,\"output_tokens\":3,\"total_tokens\":8,\"input_tokens_details\":{\"cached_tokens\":0}}}}",
 };
 
 const RecordedCodexRequest = struct {
@@ -2478,6 +2781,148 @@ test "OpenAI Codex Responses errors when WebSocket idles after stream start" {
         @as(usize, 1),
         parsed.result.events.items[0].@"error".message.diagnostics.len,
     );
+}
+
+test "OpenAI Codex Responses reuses session store cache and snapshots debug stats" {
+    const allocator = std.testing.allocator;
+    const token = try mockToken(allocator);
+    defer allocator.free(token);
+    const model = (models.getModel("openai-codex", "gpt-5.5") orelse return error.ModelMissing).*;
+
+    var store = OpenAICodexWebSocketSessionStore.init(allocator);
+    defer store.deinit();
+
+    const websocket_outcomes = [_]FakeCodexWebSocketOutcome{
+        .{ .events = &codex_done_ws_events_with_id },
+        .{ .events = &codex_done_ws_events_with_id },
+    };
+    var websocket = FakeCodexWebSocketTransport.init(allocator, &websocket_outcomes);
+    defer websocket.deinit();
+    var sse_transport = FakeCodexTransport.init(allocator);
+    defer sse_transport.deinit();
+
+    var first_parsed = try streamOpenAICodexResponses(allocator, model, basicContext(), .{
+        .base = .{
+            .api_key = token,
+            .session_id = "session-store-cache",
+            .transport = .auto,
+        },
+        .transport = sse_transport.transport(),
+        .websocket_transport = websocket.transport(),
+        .websocket_session_store = &store,
+    });
+    defer first_parsed.deinit();
+    try std.testing.expectEqual(types.StopReason.stop, first_parsed.result.message.stop_reason);
+    try std.testing.expectEqualStrings("resp_1", first_parsed.result.message.response_id.?);
+
+    const second_user_content = [_]types.UserContent{.{ .text = .{ .text = "Now finish" } }};
+    const second_messages = [_]types.Message{
+        .{ .user = .{ .content = &basic_user_content, .timestamp_ms = 1 } },
+        .{ .assistant = first_parsed.result.message },
+        .{ .user = .{ .content = &second_user_content, .timestamp_ms = 2 } },
+    };
+
+    var second_parsed = try streamOpenAICodexResponses(allocator, model, .{
+        .system_prompt = "System prompt",
+        .messages = &second_messages,
+    }, .{
+        .base = .{
+            .api_key = token,
+            .session_id = "session-store-cache",
+            .transport = .auto,
+        },
+        .transport = sse_transport.transport(),
+        .websocket_transport = websocket.transport(),
+        .websocket_session_store = &store,
+    });
+    defer second_parsed.deinit();
+
+    try std.testing.expectEqual(types.StopReason.stop, second_parsed.result.message.stop_reason);
+    try std.testing.expectEqual(@as(usize, 2), websocket.records.items.len);
+    try std.testing.expectEqual(@as(usize, 0), sse_transport.records.items.len);
+
+    var payload = try std.json.parseFromSlice(std.json.Value, allocator, websocket.records.items[1].payload_json, .{});
+    defer payload.deinit();
+    try std.testing.expectEqualStrings("resp_1", getStringField(payload.value, "previous_response_id").?);
+    const input = getArrayField(payload.value, "input") orelse return error.MissingInput;
+    try std.testing.expectEqual(@as(usize, 1), input.len);
+    const content = getArrayField(input[0], "content") orelse return error.MissingContent;
+    try std.testing.expectEqualStrings("Now finish", getStringField(content[0], "text").?);
+
+    var snapshot = (try store.getDebugStatsSnapshot(allocator, "session-store-cache")) orelse return error.MissingStats;
+    defer snapshot.deinit();
+    try std.testing.expectEqual(@as(u64, 2), snapshot.stats.requests);
+    try std.testing.expectEqual(@as(u64, 1), snapshot.stats.connections_created);
+    try std.testing.expectEqual(@as(u64, 1), snapshot.stats.connections_reused);
+    try std.testing.expectEqual(@as(u64, 2), snapshot.stats.cached_context_requests);
+    try std.testing.expectEqual(@as(u64, 1), snapshot.stats.full_context_requests);
+    try std.testing.expectEqual(@as(u64, 1), snapshot.stats.delta_requests);
+    try std.testing.expectEqual(@as(?usize, 1), snapshot.stats.last_delta_input_items);
+    try std.testing.expectEqualStrings("resp_1", snapshot.stats.last_previous_response_id.?);
+
+    store.closeSessions("session-store-cache");
+    try std.testing.expect(store.getEntry("session-store-cache").?.cache_entry.continuation == null);
+    var after_close = (try store.getDebugStatsSnapshot(allocator, "session-store-cache")) orelse return error.MissingStats;
+    defer after_close.deinit();
+    try std.testing.expectEqual(@as(u64, 2), after_close.stats.requests);
+}
+
+test "OpenAI Codex Responses remembers WebSocket SSE fallback by session" {
+    const allocator = std.testing.allocator;
+    const token = try mockToken(allocator);
+    defer allocator.free(token);
+    const model = (models.getModel("openai-codex", "gpt-5.5") orelse return error.ModelMissing).*;
+
+    var store = OpenAICodexWebSocketSessionStore.init(allocator);
+    defer store.deinit();
+
+    const websocket_outcomes = [_]FakeCodexWebSocketOutcome{
+        .{ .failure = .{
+            .message = "WebSocket connect timeout after 50ms",
+            .phase = .before_message_stream_start,
+        } },
+        .{ .events = &codex_done_ws_events },
+    };
+    var websocket = FakeCodexWebSocketTransport.init(allocator, &websocket_outcomes);
+    defer websocket.deinit();
+    var sse_transport = FakeCodexTransport.init(allocator);
+    defer sse_transport.deinit();
+
+    var first_parsed = try streamOpenAICodexResponses(allocator, model, basicContext(), .{
+        .base = .{
+            .api_key = token,
+            .session_id = "session-sticky-fallback",
+            .transport = .auto,
+        },
+        .transport = sse_transport.transport(),
+        .websocket_transport = websocket.transport(),
+        .websocket_session_store = &store,
+    });
+    defer first_parsed.deinit();
+    try std.testing.expectEqual(types.StopReason.stop, first_parsed.result.message.stop_reason);
+
+    var second_parsed = try streamOpenAICodexResponses(allocator, model, basicContext(), .{
+        .base = .{
+            .api_key = token,
+            .session_id = "session-sticky-fallback",
+            .transport = .auto,
+        },
+        .transport = sse_transport.transport(),
+        .websocket_transport = websocket.transport(),
+        .websocket_session_store = &store,
+    });
+    defer second_parsed.deinit();
+    try std.testing.expectEqual(types.StopReason.stop, second_parsed.result.message.stop_reason);
+
+    try std.testing.expectEqual(@as(usize, 1), websocket.records.items.len);
+    try std.testing.expectEqual(@as(usize, 2), sse_transport.records.items.len);
+
+    var snapshot = (try store.getDebugStatsSnapshot(allocator, "session-sticky-fallback")) orelse return error.MissingStats;
+    defer snapshot.deinit();
+    try std.testing.expectEqual(@as(u64, 1), snapshot.stats.websocket_failures);
+    try std.testing.expectEqual(@as(u64, 2), snapshot.stats.sse_fallbacks);
+    try std.testing.expect(snapshot.stats.websocket_fallback_active);
+    try std.testing.expectEqualStrings("WebSocket connect timeout after 50ms", snapshot.stats.last_websocket_error.?);
 }
 
 test "OpenAI Codex Responses sends only response input deltas in cached WebSocket mode" {
