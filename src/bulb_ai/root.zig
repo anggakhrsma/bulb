@@ -1,6 +1,15 @@
 pub const types = @import("types.zig");
 pub const api_registry = @import("api_registry.zig");
 pub const faux_provider = @import("faux_provider.zig");
+pub const session_resources = @import("session_resources.zig");
+pub const stream = @import("stream.zig");
+pub const abort_signals = @import("utils/abort_signals.zig");
+pub const env_api_keys = @import("utils/env_api_keys.zig");
+pub const hash = @import("utils/hash.zig");
+pub const json_parse = @import("utils/json_parse.zig");
+pub const overflow = @import("utils/overflow.zig");
+pub const sanitize_unicode = @import("utils/sanitize_unicode.zig");
+pub const validation = @import("utils/validation.zig");
 
 pub const Api = types.Api;
 pub const AbortSignal = types.AbortSignal;
@@ -33,4 +42,13 @@ test {
     _ = @import("types.zig");
     _ = @import("api_registry.zig");
     _ = @import("faux_provider.zig");
+    _ = @import("session_resources.zig");
+    _ = @import("stream.zig");
+    _ = @import("utils/abort_signals.zig");
+    _ = @import("utils/env_api_keys.zig");
+    _ = @import("utils/hash.zig");
+    _ = @import("utils/json_parse.zig");
+    _ = @import("utils/overflow.zig");
+    _ = @import("utils/sanitize_unicode.zig");
+    _ = @import("utils/validation.zig");
 }

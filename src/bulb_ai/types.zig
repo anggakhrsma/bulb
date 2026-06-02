@@ -150,9 +150,19 @@ pub const Context = struct {
 
 pub const AbortSignal = struct {
     aborted: bool = false,
+    reason: ?[]const u8 = null,
 
     pub fn abort(self: *AbortSignal) void {
         self.aborted = true;
+    }
+
+    pub fn abortWithReason(self: *AbortSignal, reason: []const u8) void {
+        self.aborted = true;
+        self.reason = reason;
+    }
+
+    pub fn isAborted(self: *const AbortSignal) bool {
+        return self.aborted;
     }
 };
 
@@ -198,6 +208,7 @@ pub const StreamEvent = union(enum) {
 pub const EventObserver = *const fn (signal: *AbortSignal, event: StreamEvent) void;
 
 pub const StreamOptions = struct {
+    api_key: ?[]const u8 = null,
     cache_retention: CacheRetention = .short,
     session_id: ?[]const u8 = null,
     signal: ?*AbortSignal = null,

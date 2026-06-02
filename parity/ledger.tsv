@@ -98,7 +98,7 @@ packages/ai/scripts/generate-test-image.ts	bulb_ai	source	pending
 packages/ai/src/api-registry.ts	bulb_ai	source	in_progress	src/bulb_ai/api_registry.zig	Native provider registration, dispatch, and unregister foundation
 packages/ai/src/bedrock-provider.ts	bulb_ai	source	pending		
 packages/ai/src/cli.ts	bulb_ai	source	pending		
-packages/ai/src/env-api-keys.ts	bulb_ai	source	pending		
+packages/ai/src/env-api-keys.ts	bulb_ai	source	in_progress	src/bulb_ai/utils/env_api_keys.zig	Provider key map, precedence, explicit Vertex API keys, and Bedrock ambient credential markers ported; filesystem-backed gcloud ADC remains
 packages/ai/src/image-models.generated.ts	bulb_ai	source	pending		
 packages/ai/src/image-models.ts	bulb_ai	source	pending		
 packages/ai/src/images-api-registry.ts	bulb_ai	source	pending		
@@ -127,15 +127,15 @@ packages/ai/src/providers/openai-responses.ts	bulb_ai	source	pending
 packages/ai/src/providers/register-builtins.ts	bulb_ai	source	pending		
 packages/ai/src/providers/simple-options.ts	bulb_ai	source	pending		
 packages/ai/src/providers/transform-messages.ts	bulb_ai	source	pending		
-packages/ai/src/session-resources.ts	bulb_ai	source	pending		
-packages/ai/src/stream.ts	bulb_ai	source	pending		
+packages/ai/src/session-resources.ts	bulb_ai	source	implemented	src/bulb_ai/session_resources.zig	Native cleanup registry with deduplication, unregister, and invoke-all error behavior
+packages/ai/src/stream.ts	bulb_ai	source	in_progress	src/bulb_ai/stream.zig	Native registry facade and environment API-key injection ported; simple-provider facade remains
 packages/ai/src/types.ts	bulb_ai	source	in_progress	src/bulb_ai/types.zig	Core messages, contexts, options, usage accounting, models, and stream event protocol started
-packages/ai/src/utils/abort-signals.ts	bulb_ai	source	pending		
+packages/ai/src/utils/abort-signals.ts	bulb_ai	source	implemented	src/bulb_ai/utils/abort_signals.zig	Native polling composition preserves abort propagation and cleanup contract
 packages/ai/src/utils/diagnostics.ts	bulb_ai	source	pending		
 packages/ai/src/utils/event-stream.ts	bulb_ai	source	pending		
-packages/ai/src/utils/hash.ts	bulb_ai	source	pending		
+packages/ai/src/utils/hash.ts	bulb_ai	source	implemented	src/bulb_ai/utils/hash.zig	Exact JavaScript-compatible UTF-16 short hash port
 packages/ai/src/utils/headers.ts	bulb_ai	source	pending		
-packages/ai/src/utils/json-parse.ts	bulb_ai	source	pending		
+packages/ai/src/utils/json-parse.ts	bulb_ai	source	in_progress	src/bulb_ai/utils/json_parse.zig	JSON literal repair and native partial-object completion ported; provider integration remains
 packages/ai/src/utils/node-http-proxy.ts	bulb_ai	source	pending		
 packages/ai/src/utils/oauth/anthropic.ts	bulb_ai	source	pending		
 packages/ai/src/utils/oauth/device-code.ts	bulb_ai	source	pending		
@@ -145,10 +145,10 @@ packages/ai/src/utils/oauth/oauth-page.ts	bulb_ai	source	pending
 packages/ai/src/utils/oauth/openai-codex.ts	bulb_ai	source	pending		
 packages/ai/src/utils/oauth/pkce.ts	bulb_ai	source	pending		
 packages/ai/src/utils/oauth/types.ts	bulb_ai	source	pending		
-packages/ai/src/utils/overflow.ts	bulb_ai	source	pending		
-packages/ai/src/utils/sanitize-unicode.ts	bulb_ai	source	pending		
+packages/ai/src/utils/overflow.ts	bulb_ai	source	implemented	src/bulb_ai/utils/overflow.zig	Provider error patterns, exclusions, silent overflow, and length-stop overflow ported
+packages/ai/src/utils/sanitize-unicode.ts	bulb_ai	source	implemented	src/bulb_ai/utils/sanitize_unicode.zig	WTF-8 surrogate cleanup for native UTF-8 provider payloads
 packages/ai/src/utils/typebox-helpers.ts	bulb_ai	source	pending		
-packages/ai/src/utils/validation.ts	bulb_ai	source	pending		
+packages/ai/src/utils/validation.ts	bulb_ai	source	in_progress	src/bulb_ai/utils/validation.zig	Plain JSON schema primitive, nested object, array, and additional-property coercion ported; complete schema diagnostics remain
 packages/ai/test/abort.test.ts	bulb_ai	test	pending		
 packages/ai/test/anthropic-adaptive-thinking-models.test.ts	bulb_ai	test	pending		
 packages/ai/test/anthropic-eager-tool-input-compat.test.ts	bulb_ai	test	pending		
@@ -177,7 +177,7 @@ packages/ai/test/context-overflow.test.ts	bulb_ai	test	pending
 packages/ai/test/cross-provider-handoff.test.ts	bulb_ai	test	pending		
 packages/ai/test/data/red-circle.png	bulb_ai	test	pending		
 packages/ai/test/empty.test.ts	bulb_ai	test	pending		
-packages/ai/test/env-api-keys.test.ts	bulb_ai	test	pending		
+packages/ai/test/env-api-keys.test.ts	bulb_ai	test	implemented	src/bulb_ai/utils/env_api_keys.zig	Copilot generic-token exclusion and explicit credential resolution regression coverage ported
 packages/ai/test/faux-provider.test.ts	bulb_ai	test	in_progress	src/bulb_ai/faux_provider.zig	Native regression coverage ported for models, metadata, queues, factories, usage, cache simulation, stream events, aborts, and unregister
 packages/ai/test/fireworks-models.test.ts	bulb_ai	test	pending		
 packages/ai/test/github-copilot-anthropic.test.ts	bulb_ai	test	pending		
@@ -217,7 +217,7 @@ packages/ai/test/openai-responses-reasoning-replay-e2e.test.ts	bulb_ai	test	pend
 packages/ai/test/openai-responses-tool-result-images.test.ts	bulb_ai	test	pending		
 packages/ai/test/openrouter-cache-write-repro.test.ts	bulb_ai	test	pending		
 packages/ai/test/openrouter-images.test.ts	bulb_ai	test	pending		
-packages/ai/test/overflow.test.ts	bulb_ai	test	pending		
+packages/ai/test/overflow.test.ts	bulb_ai	test	implemented	src/bulb_ai/utils/overflow.zig	Explicit provider, exclusion, silent, and length-stop overflow regressions ported
 packages/ai/test/responseid.test.ts	bulb_ai	test	pending		
 packages/ai/test/stream.test.ts	bulb_ai	test	pending		
 packages/ai/test/supports-xhigh.test.ts	bulb_ai	test	pending		
@@ -228,7 +228,7 @@ packages/ai/test/tool-call-without-result.test.ts	bulb_ai	test	pending
 packages/ai/test/total-tokens.test.ts	bulb_ai	test	in_progress	src/bulb_ai/types.zig	Total token accounting invariant started
 packages/ai/test/transform-messages-copilot-openai-to-anthropic.test.ts	bulb_ai	test	pending		
 packages/ai/test/unicode-surrogate.test.ts	bulb_ai	test	pending		
-packages/ai/test/validation.test.ts	bulb_ai	test	pending		
+packages/ai/test/validation.test.ts	bulb_ai	test	in_progress	src/bulb_ai/utils/validation.zig	Serialized plain-schema primitive coercion and rejection cases ported with additional nested coverage
 packages/ai/test/xhigh.test.ts	bulb_ai	test	pending		
 packages/ai/test/xiaomi-models.test.ts	bulb_ai	test	pending		
 packages/ai/test/xiaomi-token-plan-ams-anthropic-empty-signature-smoke.test.ts	bulb_ai	test	pending		
