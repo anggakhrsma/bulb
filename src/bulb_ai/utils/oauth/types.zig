@@ -54,6 +54,15 @@ pub const ProgressCallback = struct {
     }
 };
 
+pub const ManualCodeInputCallback = struct {
+    ptr: ?*anyopaque = null,
+    call: *const fn (?*anyopaque) anyerror![]const u8,
+
+    pub fn invoke(self: ManualCodeInputCallback) ![]const u8 {
+        return self.call(self.ptr);
+    }
+};
+
 pub const OAuthSelectOption = struct {
     id: []const u8,
     label: []const u8,
@@ -77,6 +86,7 @@ test "OAuth callback wrappers forward native prompt and progress values" {
     const Recorder = struct {
         prompt: ?OAuthPrompt = null,
         progress: ?[]const u8 = null,
+        manual_input: []const u8 = "http://localhost/callback?code=manual",
 
         fn onPrompt(ptr: ?*anyopaque, prompt: OAuthPrompt) anyerror![]const u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr.?));
@@ -87,6 +97,11 @@ test "OAuth callback wrappers forward native prompt and progress values" {
         fn onProgress(ptr: ?*anyopaque, message: []const u8) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(ptr.?));
             self.progress = message;
+        }
+
+        fn onManualCodeInput(ptr: ?*anyopaque) anyerror![]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            return self.manual_input;
         }
     };
 
@@ -104,4 +119,7 @@ test "OAuth callback wrappers forward native prompt and progress values" {
     const progress = ProgressCallback{ .ptr = &recorder, .call = Recorder.onProgress };
     try progress.invoke("Working");
     try std.testing.expectEqualStrings("Working", recorder.progress.?);
+
+    const manual_input = ManualCodeInputCallback{ .ptr = &recorder, .call = Recorder.onManualCodeInput };
+    try std.testing.expectEqualStrings(recorder.manual_input, try manual_input.invoke());
 }

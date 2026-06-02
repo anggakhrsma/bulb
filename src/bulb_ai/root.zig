@@ -22,6 +22,7 @@ pub const event_stream = @import("utils/event_stream.zig");
 pub const hash = @import("utils/hash.zig");
 pub const headers = @import("utils/headers.zig");
 pub const json_parse = @import("utils/json_parse.zig");
+pub const oauth_anthropic = @import("utils/oauth/anthropic.zig");
 pub const oauth_device_code = @import("utils/oauth/device_code.zig");
 pub const oauth_github_copilot = @import("utils/oauth/github_copilot.zig");
 pub const oauth_openai_codex = @import("utils/oauth/openai_codex.zig");
@@ -93,6 +94,7 @@ test {
     _ = @import("utils/hash.zig");
     _ = @import("utils/headers.zig");
     _ = @import("utils/json_parse.zig");
+    _ = @import("utils/oauth/anthropic.zig");
     _ = @import("utils/oauth/device_code.zig");
     _ = @import("utils/oauth/github_copilot.zig");
     _ = @import("utils/oauth/openai_codex.zig");
