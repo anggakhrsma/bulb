@@ -986,6 +986,7 @@ pub fn buildParams(
 
     const reasoning_effort = if (options) |opts| opts.reasoning_effort else null;
     try applyThinkingOptions(a, &root, model, compat, reasoning_effort);
+    try applyRoutingOptions(a, &root, model);
 
     return .{
         .arena = arena,
@@ -1806,6 +1807,44 @@ fn applyThinkingOptions(
     }
 }
 
+fn applyRoutingOptions(
+    allocator: std.mem.Allocator,
+    params: *std.json.Value,
+    model: types.Model,
+) !void {
+    if (contains(model.base_url, "openrouter.ai")) {
+        if (model.compat.open_router_routing_json) |routing_json| {
+            var parsed = try std.json.parseFromSlice(std.json.Value, allocator, routing_json, .{});
+            defer parsed.deinit();
+            if (parsed.value == .object) {
+                try putValue(allocator, params, "provider", try cloneJsonValue(allocator, parsed.value));
+            }
+        }
+    }
+
+    if (contains(model.base_url, "ai-gateway.vercel.sh")) {
+        if (model.compat.vercel_gateway_routing_json) |routing_json| {
+            var parsed = try std.json.parseFromSlice(std.json.Value, allocator, routing_json, .{});
+            defer parsed.deinit();
+            if (parsed.value != .object) return;
+
+            var gateway = objectValue();
+            if (parsed.value.object.get("only")) |only| {
+                if (only == .array) try putValue(allocator, &gateway, "only", try cloneJsonValue(allocator, only));
+            }
+            if (parsed.value.object.get("order")) |order| {
+                if (order == .array) try putValue(allocator, &gateway, "order", try cloneJsonValue(allocator, order));
+            }
+
+            if (gateway.object.count() > 0) {
+                var provider_options = objectValue();
+                try putValue(allocator, &provider_options, "gateway", gateway);
+                try putValue(allocator, params, "providerOptions", provider_options);
+            }
+        }
+    }
+}
+
 fn thinkingLevelValue(model: types.Model, level: types.ThinkingLevel) []const u8 {
     return switch (model.thinking_level_map.get(level)) {
         .mapped => |value| value,
@@ -2343,6 +2382,51 @@ test "OpenAI completions sends explicit max tokens with provider field preferenc
     defer proxy_params.deinit();
     try std.testing.expectEqual(@as(i64, 99), proxy_params.value.object.get("max_tokens").?.integer);
     try std.testing.expect(proxy_params.value.object.get("max_completion_tokens") == null);
+}
+
+// Ported from packages/ai/src/providers/openai-completions.ts routing compat.
+test "OpenAI completions emits OpenRouter and Vercel routing payloads" {
+    const allocator = std.testing.allocator;
+    const user_content = [_]types.UserContent{.{ .text = .{ .text = "hi" } }};
+    const messages = [_]types.Message{.{ .user = .{ .content = &user_content } }};
+    const context: types.Context = .{ .messages = &messages };
+
+    var openrouter = (models.getModel("openrouter", "anthropic/claude-sonnet-4") orelse return error.ModelMissing).*;
+    openrouter.compat.open_router_routing_json =
+        \\{"only":["amazon-bedrock"],"allow_fallbacks":false}
+    ;
+    var openrouter_params = try buildParams(allocator, openrouter, context, null, null, null);
+    defer openrouter_params.deinit();
+
+    const provider = openrouter_params.value.object.get("provider") orelse return error.MissingProviderRouting;
+    try std.testing.expect(!provider.object.get("allow_fallbacks").?.bool);
+    const only = provider.object.get("only").?.array;
+    try std.testing.expectEqual(@as(usize, 1), only.items.len);
+    try std.testing.expectEqualStrings("amazon-bedrock", only.items[0].string);
+
+    const vercel: types.Model = .{
+        .id = "openai/gpt-5",
+        .name = "Vercel GPT-5",
+        .api = types.api.openai_completions,
+        .provider = "vercel-ai-gateway",
+        .base_url = "https://ai-gateway.vercel.sh",
+        .input = &.{"text"},
+        .compat = .{
+            .vercel_gateway_routing_json =
+            \\{"only":["bedrock"],"order":["anthropic","openai"]}
+            ,
+        },
+    };
+    var vercel_params = try buildParams(allocator, vercel, context, null, null, null);
+    defer vercel_params.deinit();
+
+    const provider_options = vercel_params.value.object.get("providerOptions") orelse return error.MissingProviderOptions;
+    const gateway = provider_options.object.get("gateway") orelse return error.MissingGatewayOptions;
+    const gateway_only = gateway.object.get("only").?.array;
+    const gateway_order = gateway.object.get("order").?.array;
+    try std.testing.expectEqualStrings("bedrock", gateway_only.items[0].string);
+    try std.testing.expectEqualStrings("anthropic", gateway_order.items[0].string);
+    try std.testing.expectEqualStrings("openai", gateway_order.items[1].string);
 }
 
 // Ported from packages/ai/test/openai-completions-empty-tools.test.ts.

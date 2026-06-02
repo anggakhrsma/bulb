@@ -895,14 +895,27 @@ fn cloneModelCompat(
     compat: ai.ModelCompat,
 ) !ai.ModelCompat {
     var result = compat;
+    result.cache_control_format = null;
+    result.open_router_routing_json = null;
+    result.vercel_gateway_routing_json = null;
+    errdefer deinitModelCompat(allocator, &result);
+
     if (compat.cache_control_format) |format| {
         result.cache_control_format = try allocator.dupe(u8, format);
+    }
+    if (compat.open_router_routing_json) |routing| {
+        result.open_router_routing_json = try allocator.dupe(u8, routing);
+    }
+    if (compat.vercel_gateway_routing_json) |routing| {
+        result.vercel_gateway_routing_json = try allocator.dupe(u8, routing);
     }
     return result;
 }
 
 fn deinitModelCompat(allocator: std.mem.Allocator, compat: *ai.ModelCompat) void {
     if (compat.cache_control_format) |format| allocator.free(format);
+    if (compat.open_router_routing_json) |routing| allocator.free(routing);
+    if (compat.vercel_gateway_routing_json) |routing| allocator.free(routing);
     compat.* = .{};
 }
 
@@ -926,6 +939,12 @@ fn mergeModelCompat(
         if (target.cache_control_format) |existing| allocator.free(existing);
         target.cache_control_format = copy;
     }
+    if (override.open_router_routing_json) |routing| {
+        try mergeJsonObjectStringField(allocator, &target.open_router_routing_json, routing);
+    }
+    if (override.vercel_gateway_routing_json) |routing| {
+        try mergeJsonObjectStringField(allocator, &target.vercel_gateway_routing_json, routing);
+    }
     if (override.zai_tool_stream) |value| target.zai_tool_stream = value;
     if (override.supports_strict_mode) |value| target.supports_strict_mode = value;
     if (override.send_session_affinity_headers) |value| target.send_session_affinity_headers = value;
@@ -936,6 +955,41 @@ fn mergeModelCompat(
     if (override.supports_temperature) |value| target.supports_temperature = value;
     if (override.force_adaptive_thinking) |value| target.force_adaptive_thinking = value;
     if (override.allow_empty_signature) |value| target.allow_empty_signature = value;
+}
+
+fn mergeJsonObjectStringField(
+    allocator: std.mem.Allocator,
+    target: *?[]const u8,
+    override_json: []const u8,
+) !void {
+    const existing = target.* orelse {
+        target.* = try allocator.dupe(u8, override_json);
+        return;
+    };
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var base = try std.json.parseFromSlice(std.json.Value, a, existing, .{});
+    defer base.deinit();
+    var override = try std.json.parseFromSlice(std.json.Value, a, override_json, .{});
+    defer override.deinit();
+    if (base.value != .object or override.value != .object) return error.InvalidModelsJson;
+
+    var merged = std.json.Value{ .object = .empty };
+    var base_iterator = base.value.object.iterator();
+    while (base_iterator.next()) |entry| {
+        try merged.object.put(a, try a.dupe(u8, entry.key_ptr.*), entry.value_ptr.*);
+    }
+    var override_iterator = override.value.object.iterator();
+    while (override_iterator.next()) |entry| {
+        try merged.object.put(a, try a.dupe(u8, entry.key_ptr.*), entry.value_ptr.*);
+    }
+
+    const merged_json = try std.json.Stringify.valueAlloc(allocator, merged, .{});
+    allocator.free(existing);
+    target.* = merged_json;
 }
 
 fn cloneStringSlice(allocator: std.mem.Allocator, values: []const []const u8) ![]const []const u8 {
@@ -1150,8 +1204,110 @@ fn parseCompatObjectAlloc(
         if (!std.mem.eql(u8, format, "anthropic")) return error.InvalidModelsJson;
         compat.cache_control_format = try allocator.dupe(u8, format);
     }
+    compat.open_router_routing_json = try parseOpenRouterRoutingJsonAlloc(allocator, object.get("openRouterRouting"));
+    compat.vercel_gateway_routing_json = try parseVercelGatewayRoutingJsonAlloc(allocator, object.get("vercelGatewayRouting"));
 
     return compat;
+}
+
+fn parseOpenRouterRoutingJsonAlloc(
+    allocator: std.mem.Allocator,
+    maybe_value: ?std.json.Value,
+) !?[]u8 {
+    const value = maybe_value orelse return null;
+    if (value != .object) return error.InvalidModelsJson;
+    try validateOpenRouterRouting(value.object);
+    return try std.json.Stringify.valueAlloc(allocator, value, .{});
+}
+
+fn parseVercelGatewayRoutingJsonAlloc(
+    allocator: std.mem.Allocator,
+    maybe_value: ?std.json.Value,
+) !?[]u8 {
+    const value = maybe_value orelse return null;
+    if (value != .object) return error.InvalidModelsJson;
+    try validateOptionalStringArray(value.object, "only");
+    try validateOptionalStringArray(value.object, "order");
+    return try std.json.Stringify.valueAlloc(allocator, value, .{});
+}
+
+fn validateOpenRouterRouting(object: std.json.ObjectMap) !void {
+    try validateOptionalBool(object, "allow_fallbacks");
+    try validateOptionalBool(object, "require_parameters");
+    try validateOptionalBool(object, "zdr");
+    try validateOptionalBool(object, "enforce_distillable_text");
+    try validateOptionalStringArray(object, "order");
+    try validateOptionalStringArray(object, "only");
+    try validateOptionalStringArray(object, "ignore");
+    try validateOptionalStringArray(object, "quantizations");
+
+    if (object.get("data_collection")) |value| {
+        if (value != .string) return error.InvalidModelsJson;
+        if (!std.mem.eql(u8, value.string, "deny") and !std.mem.eql(u8, value.string, "allow")) {
+            return error.InvalidModelsJson;
+        }
+    }
+
+    if (object.get("sort")) |value| {
+        switch (value) {
+            .string => {},
+            .object => |sort| {
+                if (sort.get("by")) |by| if (by != .string) return error.InvalidModelsJson;
+                if (sort.get("partition")) |partition| switch (partition) {
+                    .string, .null => {},
+                    else => return error.InvalidModelsJson,
+                };
+            },
+            else => return error.InvalidModelsJson,
+        }
+    }
+
+    if (object.get("max_price")) |value| {
+        if (value != .object) return error.InvalidModelsJson;
+        const fields = [_][]const u8{ "prompt", "completion", "image", "audio", "request" };
+        for (fields) |field| {
+            if (value.object.get(field)) |price| {
+                if (!isJsonNumber(price) and price != .string) return error.InvalidModelsJson;
+            }
+        }
+    }
+
+    try validateOptionalOpenRouterPercentile(object, "preferred_min_throughput");
+    try validateOptionalOpenRouterPercentile(object, "preferred_max_latency");
+}
+
+fn validateOptionalBool(object: std.json.ObjectMap, key: []const u8) !void {
+    if (object.get(key)) |value| {
+        if (value != .bool) return error.InvalidModelsJson;
+    }
+}
+
+fn validateOptionalStringArray(object: std.json.ObjectMap, key: []const u8) !void {
+    if (object.get(key)) |value| {
+        if (value != .array) return error.InvalidModelsJson;
+        for (value.array.items) |item| {
+            if (item != .string) return error.InvalidModelsJson;
+        }
+    }
+}
+
+fn validateOptionalOpenRouterPercentile(object: std.json.ObjectMap, key: []const u8) !void {
+    const value = object.get(key) orelse return;
+    if (isJsonNumber(value)) return;
+    if (value != .object) return error.InvalidModelsJson;
+    const fields = [_][]const u8{ "p50", "p75", "p90", "p99" };
+    for (fields) |field| {
+        if (value.object.get(field)) |cutoff| {
+            if (!isJsonNumber(cutoff)) return error.InvalidModelsJson;
+        }
+    }
+}
+
+fn isJsonNumber(value: std.json.Value) bool {
+    return switch (value) {
+        .integer, .float, .number_string => true,
+        else => false,
+    };
 }
 
 fn parseMaxTokensField(maybe_value: ?std.json.Value) !?ai.MaxTokensField {
@@ -1447,6 +1603,27 @@ fn jsonStringAlloc(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
     return output.toOwnedSlice();
 }
 
+fn expectJsonStringArray(json: []const u8, field: []const u8, expected: []const []const u8) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.ExpectedJsonObject;
+    const value = parsed.value.object.get(field) orelse return error.MissingJsonField;
+    if (value != .array) return error.ExpectedJsonArray;
+    try std.testing.expectEqual(expected.len, value.array.items.len);
+    for (expected, 0..) |expected_item, index| {
+        try std.testing.expectEqualStrings(expected_item, value.array.items[index].string);
+    }
+}
+
+fn expectJsonBool(json: []const u8, field: []const u8, expected: bool) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.ExpectedJsonObject;
+    const value = parsed.value.object.get(field) orelse return error.MissingJsonField;
+    if (value != .bool) return error.ExpectedJsonBool;
+    try std.testing.expectEqual(expected, value.bool);
+}
+
 // Ported from packages/coding-agent/test/model-registry.test.ts API key resolution cases.
 test "model registry resolves models.json apiKey commands on every provider lookup" {
     const allocator = std.testing.allocator;
@@ -1689,6 +1866,36 @@ test "model registry parses custom model thinking map and merged compat" {
     try std.testing.expectEqual(@as(?ai.MaxTokensField, .max_completion_tokens), model.compat.max_tokens_field);
     try std.testing.expectEqual(@as(?bool, false), model.compat.supports_strict_mode);
     try std.testing.expectEqualStrings("anthropic", model.compat.cache_control_format.?);
+}
+
+// Ported from packages/coding-agent/test/model-registry.test.ts modelOverrides
+// compat.openRouterRouting cases.
+test "model registry parses and deep merges OpenRouter routing compat" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    var runner: TestCommandRunner = .{};
+    const content =
+        \\{"providers":{"openrouter":{"compat":{"openRouterRouting":{"only":["anthropic"],"allow_fallbacks":false}},"modelOverrides":{"anthropic/claude-sonnet-4":{"compat":{"openRouterRouting":{"order":["amazon-bedrock"]}}},"anthropic/claude-opus-4":{"compat":{"openRouterRouting":{"only":["amazon-bedrock"]}}}}}}}
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "models.json", .data = content });
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, "models.json", allocator);
+    defer allocator.free(path);
+
+    var harness = try makeTestRegistry(allocator, &env, &runner, path);
+    defer harness.deinit();
+
+    const sonnet = harness.registry.find("openrouter", "anthropic/claude-sonnet-4") orelse return error.ModelMissing;
+    const sonnet_routing = sonnet.compat.open_router_routing_json orelse return error.MissingRoutingCompat;
+    try expectJsonStringArray(sonnet_routing, "only", &.{"anthropic"});
+    try expectJsonStringArray(sonnet_routing, "order", &.{"amazon-bedrock"});
+    try expectJsonBool(sonnet_routing, "allow_fallbacks", false);
+
+    const opus = harness.registry.find("openrouter", "anthropic/claude-opus-4") orelse return error.ModelMissing;
+    const opus_routing = opus.compat.open_router_routing_json orelse return error.MissingRoutingCompat;
+    try expectJsonStringArray(opus_routing, "only", &.{"amazon-bedrock"});
 }
 
 test "model registry applies provider compat overrides to built-in models" {
