@@ -1,5 +1,6 @@
 const std = @import("std");
 const api_registry = @import("api_registry.zig");
+const simple_options = @import("providers/simple_options.zig");
 const env_api_keys = @import("utils/env_api_keys.zig");
 const types = @import("types.zig");
 
@@ -11,6 +12,16 @@ pub fn stream(
     options: types.StreamOptions,
 ) !types.StreamResult {
     return registry.stream(model, context, withEnvApiKey(env, model, options));
+}
+
+pub fn streamSimple(
+    registry: api_registry.Registry,
+    env: ?*const std.process.Environ.Map,
+    model: types.Model,
+    context: types.Context,
+    options: ?simple_options.SimpleStreamOptions,
+) !types.StreamResult {
+    return registry.streamSimple(model, context, withEnvApiKeySimple(env, model, options));
 }
 
 pub fn complete(
@@ -38,6 +49,16 @@ pub fn withEnvApiKey(
     return resolved;
 }
 
+pub fn withEnvApiKeySimple(
+    env: ?*const std.process.Environ.Map,
+    model: types.Model,
+    options: ?simple_options.SimpleStreamOptions,
+) simple_options.SimpleStreamOptions {
+    var resolved = options orelse simple_options.SimpleStreamOptions{};
+    resolved.base = withEnvApiKey(env, model, resolved.base);
+    return resolved;
+}
+
 test "stream facade injects provider environment key unless explicitly configured" {
     const allocator = std.testing.allocator;
     var env = std.process.Environ.Map.init(allocator);
@@ -59,4 +80,7 @@ test "stream facade injects provider environment key unless explicitly configure
 
     const whitespace = withEnvApiKey(&env, model, .{ .api_key = "  " });
     try std.testing.expectEqualStrings("environment-key", whitespace.api_key.?);
+
+    const simple = withEnvApiKeySimple(&env, model, null);
+    try std.testing.expectEqualStrings("environment-key", simple.base.api_key.?);
 }

@@ -57,6 +57,7 @@ pub const ProviderConfigInput = struct {
     headers: ?[]const config_value.HeaderInput = null,
     auth_header: ?bool = null,
     oauth: ?ai.oauth.OAuthProviderInterface = null,
+    stream_simple: ?ai.api_registry.SimpleStream = null,
     models: ?[]const ai.Model = null,
 };
 
@@ -73,6 +74,7 @@ const ProviderRequestConfig = struct {
 };
 
 const OwnedProviderConfig = struct {
+    source_id: ?[]u8 = null,
     name: ?[]u8 = null,
     base_url: ?[]u8 = null,
     api_key: ?[]u8 = null,
@@ -80,6 +82,7 @@ const OwnedProviderConfig = struct {
     headers: []config_value.HeaderInput = &.{},
     auth_header: ?bool = null,
     oauth: ?ai.oauth.OAuthProviderInterface = null,
+    stream_simple: ?ai.api_registry.SimpleStream = null,
     models: []ai.Model = &.{},
 
     fn cloneMerged(
@@ -93,6 +96,9 @@ const OwnedProviderConfig = struct {
         else
             OwnedProviderConfig{};
         errdefer result.deinit(allocator);
+        if (result.source_id == null) {
+            result.source_id = try std.fmt.allocPrint(allocator, "provider:{s}", .{provider_name});
+        }
 
         if (input.name) |value| try replaceOptionalOwnedString(allocator, &result.name, value);
         if (input.base_url) |value| try replaceOptionalOwnedString(allocator, &result.base_url, value);
@@ -113,6 +119,7 @@ const OwnedProviderConfig = struct {
             if (result.oauth) |previous| deinitOAuthProvider(allocator, previous);
             result.oauth = cloned;
         }
+        if (input.stream_simple) |stream_simple| result.stream_simple = stream_simple;
         if (input.models) |models| {
             const cloned = try cloneModelsForProvider(allocator, provider_name, models);
             deinitModelItems(allocator, result.models);
@@ -125,6 +132,7 @@ const OwnedProviderConfig = struct {
     fn clone(self: OwnedProviderConfig, allocator: std.mem.Allocator) !OwnedProviderConfig {
         var result = OwnedProviderConfig{};
         errdefer result.deinit(allocator);
+        result.source_id = if (self.source_id) |value| try allocator.dupe(u8, value) else null;
         result.name = if (self.name) |value| try allocator.dupe(u8, value) else null;
         result.base_url = if (self.base_url) |value| try allocator.dupe(u8, value) else null;
         result.api_key = if (self.api_key) |value| try allocator.dupe(u8, value) else null;
@@ -132,11 +140,13 @@ const OwnedProviderConfig = struct {
         result.headers = try cloneHeaderInputs(allocator, self.headers);
         result.auth_header = self.auth_header;
         result.oauth = if (self.oauth) |oauth| try cloneOAuthProvider(allocator, oauth.id, oauth) else null;
+        result.stream_simple = self.stream_simple;
         result.models = try cloneModels(allocator, self.models);
         return result;
     }
 
     fn deinit(self: *OwnedProviderConfig, allocator: std.mem.Allocator) void {
+        if (self.source_id) |value| allocator.free(value);
         if (self.name) |value| allocator.free(value);
         if (self.base_url) |value| allocator.free(value);
         if (self.api_key) |value| allocator.free(value);
@@ -193,6 +203,7 @@ pub const ModelRegistry = struct {
     provider_request_configs: std.StringHashMap(ProviderRequestConfig),
     model_request_headers: std.StringHashMap([]config_value.HeaderInput),
     registered_providers: std.StringHashMap(OwnedProviderConfig),
+    api_registry: ai.api_registry.Registry,
     models_json_path: ?[]u8 = null,
     load_error: ?[]u8 = null,
 
@@ -207,6 +218,7 @@ pub const ModelRegistry = struct {
             .provider_request_configs = std.StringHashMap(ProviderRequestConfig).init(allocator),
             .model_request_headers = std.StringHashMap([]config_value.HeaderInput).init(allocator),
             .registered_providers = std.StringHashMap(OwnedProviderConfig).init(allocator),
+            .api_registry = ai.api_registry.Registry.init(allocator),
             .models_json_path = if (models_json_path) |path| try allocator.dupe(u8, path) else null,
         };
         errdefer registry.deinit();
@@ -223,6 +235,7 @@ pub const ModelRegistry = struct {
 
     pub fn deinit(self: *ModelRegistry) void {
         self.auth_storage.oauth_registry.resetOAuthProviders() catch {};
+        self.api_registry.deinit();
         self.clearLoaded();
         deinitRegisteredProviders(self.allocator, &self.registered_providers);
         self.models.deinit(self.allocator);
@@ -234,6 +247,7 @@ pub const ModelRegistry = struct {
 
     pub fn refresh(self: *ModelRegistry) !void {
         try self.auth_storage.oauth_registry.resetOAuthProviders();
+        self.clearRegisteredApiProviders();
         self.clearLoaded();
         if (self.load_error) |message| {
             self.allocator.free(message);
@@ -284,6 +298,7 @@ pub const ModelRegistry = struct {
         // references before replacing a previously registered provider.
         try self.auth_storage.oauth_registry.resetOAuthProviders();
         if (self.registered_providers.getPtr(provider_name)) |existing| {
+            self.api_registry.unregisterSource(existing.source_id.?);
             existing.deinit(self.allocator);
             existing.* = merged;
             merged_owned = false;
@@ -299,6 +314,7 @@ pub const ModelRegistry = struct {
     pub fn unregisterProvider(self: *ModelRegistry, provider_name: []const u8) !void {
         if (!self.registered_providers.contains(provider_name)) return;
         try self.auth_storage.oauth_registry.resetOAuthProviders();
+        self.api_registry.unregisterSource(self.registered_providers.get(provider_name).?.source_id.?);
         if (self.registered_providers.fetchRemove(provider_name)) |removed| {
             self.allocator.free(removed.key);
             var config = removed.value;
@@ -534,6 +550,14 @@ pub const ModelRegistry = struct {
         config: OwnedProviderConfig,
     ) !void {
         if (config.oauth) |oauth| try self.auth_storage.oauth_registry.registerOAuthProvider(oauth);
+        if (config.stream_simple) |stream_simple| {
+            try self.api_registry.register(.{
+                .api = config.api.?,
+                .context = stream_simple.context,
+                .stream_simple_fn = stream_simple.stream_fn,
+                .source_id = config.source_id.?,
+            });
+        }
 
         var request_config = ProviderRequestConfig{};
         errdefer request_config.deinit(self.allocator);
@@ -913,6 +937,11 @@ pub const ModelRegistry = struct {
         self.clearRequestConfigMaps();
     }
 
+    fn clearRegisteredApiProviders(self: *ModelRegistry) void {
+        var iterator = self.registered_providers.valueIterator();
+        while (iterator.next()) |config| self.api_registry.unregisterSource(config.source_id.?);
+    }
+
     fn clearRequestConfigMaps(self: *ModelRegistry) void {
         var provider_iterator = self.provider_request_configs.iterator();
         while (provider_iterator.next()) |entry| {
@@ -1122,6 +1151,7 @@ fn cloneDynamicModel(
 }
 
 fn validateDynamicProviderConfig(_: []const u8, input: ProviderConfigInput) !void {
+    if (input.stream_simple != null and input.api == null) return error.DynamicProviderStreamSimpleApiRequired;
     const models = input.models orelse return;
     if (models.len == 0) return;
     if (input.base_url == null) return error.DynamicProviderBaseUrlRequired;
@@ -2410,6 +2440,41 @@ const DynamicTestOAuth = struct {
     }
 };
 
+const DynamicTestSimpleStream = struct {
+    const Context = struct {
+        provider: []const u8,
+        fail: bool = false,
+        calls: usize = 0,
+    };
+
+    fn interface(context: *Context) ai.api_registry.SimpleStream {
+        return .{
+            .context = context,
+            .stream_fn = stream,
+        };
+    }
+
+    fn stream(
+        ptr: *anyopaque,
+        model: ai.Model,
+        _: ai.Context,
+        _: ?ai.SimpleStreamOptions,
+    ) !ai.StreamResult {
+        const context: *Context = @ptrCast(@alignCast(ptr));
+        context.calls += 1;
+        if (context.fail) return error.DynamicSimpleStreamOverride;
+        return .{
+            .allocator = std.testing.allocator,
+            .message = .{
+                .content = &.{},
+                .api = model.api,
+                .provider = context.provider,
+                .model = model.id,
+            },
+        };
+    }
+};
+
 // Ported from packages/coding-agent/test/model-registry.test.ts dynamic provider
 // lifecycle and override persistence cases.
 test "model registry replays dynamic provider models headers and base URL overrides across refresh" {
@@ -2520,6 +2585,77 @@ test "model registry preserves models when a dynamic provider replacement fails 
     try std.testing.expect(harness.registry.find("demo-provider", "demo-model") != null);
     try harness.registry.refresh();
     try std.testing.expect(harness.registry.find("demo-provider", "demo-model") != null);
+}
+
+test "model registry rejects stream simple registration without an API before persisting it" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    var runner: TestCommandRunner = .{};
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "models.json", .data = "{\"providers\":{}}" });
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, "models.json", allocator);
+    defer allocator.free(path);
+
+    var harness = try makeTestRegistry(allocator, &env, &runner, path);
+    defer harness.deinit();
+    var context = DynamicTestSimpleStream.Context{ .provider = "broken" };
+    try std.testing.expectError(
+        error.DynamicProviderStreamSimpleApiRequired,
+        harness.registry.registerProvider("broken-provider", .{
+            .stream_simple = DynamicTestSimpleStream.interface(&context),
+        }),
+    );
+    try harness.registry.refresh();
+}
+
+test "model registry unregister restores API stream handler after dynamic simple override" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    var runner: TestCommandRunner = .{};
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "models.json", .data = "{\"providers\":{}}" });
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, "models.json", allocator);
+    defer allocator.free(path);
+
+    var harness = try makeTestRegistry(allocator, &env, &runner, path);
+    defer harness.deinit();
+    var builtin = DynamicTestSimpleStream.Context{ .provider = "builtin" };
+    try harness.registry.api_registry.register(.{
+        .api = ai.types.api.openai_completions,
+        .context = &builtin,
+        .stream_simple_fn = DynamicTestSimpleStream.stream,
+    });
+    var dynamic = DynamicTestSimpleStream.Context{ .provider = "dynamic", .fail = true };
+    try harness.registry.registerProvider("stream-override-provider", .{
+        .api = ai.types.api.openai_completions,
+        .stream_simple = DynamicTestSimpleStream.interface(&dynamic),
+    });
+    const model: ai.Model = .{
+        .id = "test",
+        .name = "Test",
+        .api = ai.types.api.openai_completions,
+        .provider = "openai",
+        .base_url = "http://localhost",
+    };
+    try std.testing.expectError(
+        error.DynamicSimpleStreamOverride,
+        harness.registry.api_registry.streamSimple(model, .{ .messages = &.{} }, null),
+    );
+    try harness.registry.refresh();
+    try std.testing.expectError(
+        error.DynamicSimpleStreamOverride,
+        harness.registry.api_registry.streamSimple(model, .{ .messages = &.{} }, null),
+    );
+
+    try harness.registry.unregisterProvider("stream-override-provider");
+    var restored = try harness.registry.api_registry.streamSimple(model, .{ .messages = &.{} }, null);
+    defer restored.deinit();
+    try std.testing.expectEqualStrings("builtin", restored.message.provider);
+    try std.testing.expectEqual(@as(usize, 1), builtin.calls);
 }
 
 test "model registry resolves dynamic display names OAuth restoration and legacy uppercase config values" {

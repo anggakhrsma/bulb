@@ -54,6 +54,7 @@ pub const Model = types.Model;
 pub const ModelCompat = types.ModelCompat;
 pub const ModelCost = types.ModelCost;
 pub const StopReason = types.StopReason;
+pub const SimpleStreamOptions = simple_options.SimpleStreamOptions;
 pub const StreamEvent = types.StreamEvent;
 pub const StreamOptions = types.StreamOptions;
 pub const StreamResult = types.StreamResult;
