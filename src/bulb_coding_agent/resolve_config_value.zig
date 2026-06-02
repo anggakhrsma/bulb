@@ -10,6 +10,58 @@ pub const CommandRunner = struct {
     }
 };
 
+pub const HeaderInput = struct {
+    key: []const u8,
+    value: []const u8,
+};
+
+pub const ResolvedHeader = struct {
+    key: []u8,
+    value: []u8,
+};
+
+pub const ResolvedHeaders = struct {
+    entries: []ResolvedHeader,
+
+    pub fn deinit(self: *ResolvedHeaders, allocator: std.mem.Allocator) void {
+        deinitResolvedHeaders(allocator, self.entries);
+        self.* = .{ .entries = &.{} };
+    }
+
+    pub fn get(self: ResolvedHeaders, key: []const u8) ?[]const u8 {
+        for (self.entries) |header| {
+            if (std.mem.eql(u8, header.key, key)) return header.value;
+        }
+        return null;
+    }
+};
+
+pub const RequiredConfigValue = union(enum) {
+    value: []u8,
+    failure: []u8,
+
+    pub fn deinit(self: *RequiredConfigValue, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .value => |value| allocator.free(value),
+            .failure => |message| allocator.free(message),
+        }
+        self.* = .{ .value = &.{} };
+    }
+};
+
+pub const RequiredHeaders = union(enum) {
+    headers: ?ResolvedHeaders,
+    failure: []u8,
+
+    pub fn deinit(self: *RequiredHeaders, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .headers => |*headers| if (headers.*) |*resolved| resolved.deinit(allocator),
+            .failure => |message| allocator.free(message),
+        }
+        self.* = .{ .headers = null };
+    }
+};
+
 pub const Resolver = struct {
     allocator: std.mem.Allocator,
     env: *const std.process.Environ.Map,
@@ -58,6 +110,77 @@ pub const Resolver = struct {
     ) !?[]u8 {
         if (!isCommandConfigValue(config)) return resolveTemplateAlloc(allocator, self.env, config);
         return self.runner.run(allocator, config[1..]) catch null;
+    }
+
+    pub fn resolveConfigValueOrThrowAlloc(
+        self: *Resolver,
+        allocator: std.mem.Allocator,
+        config: []const u8,
+        description: []const u8,
+    ) !RequiredConfigValue {
+        if (try self.resolveConfigValueUncachedAlloc(allocator, config)) |value| {
+            return .{ .value = value };
+        }
+
+        return .{ .failure = try configResolutionFailureMessageAlloc(allocator, self.env, config, description) };
+    }
+
+    pub fn resolveHeadersAlloc(
+        self: *Resolver,
+        allocator: std.mem.Allocator,
+        headers: ?[]const HeaderInput,
+    ) !?ResolvedHeaders {
+        const input = headers orelse return null;
+        var resolved: std.ArrayList(ResolvedHeader) = .empty;
+        defer resolved.deinit(allocator);
+        errdefer deinitResolvedHeaderItems(allocator, resolved.items);
+
+        for (input) |header| {
+            const value = try self.resolveConfigValueAlloc(allocator, header.value);
+            if (value) |resolved_value| {
+                if (resolved_value.len == 0) {
+                    allocator.free(resolved_value);
+                    continue;
+                }
+                try appendResolvedHeader(allocator, &resolved, header.key, resolved_value);
+            }
+        }
+
+        if (resolved.items.len == 0) return null;
+        return .{ .entries = try resolved.toOwnedSlice(allocator) };
+    }
+
+    pub fn resolveHeadersOrThrowAlloc(
+        self: *Resolver,
+        allocator: std.mem.Allocator,
+        headers: ?[]const HeaderInput,
+        description: []const u8,
+    ) !RequiredHeaders {
+        const input = headers orelse return .{ .headers = null };
+        var resolved: std.ArrayList(ResolvedHeader) = .empty;
+        defer resolved.deinit(allocator);
+        errdefer deinitResolvedHeaderItems(allocator, resolved.items);
+
+        for (input) |header| {
+            const header_description = try std.fmt.allocPrint(
+                allocator,
+                "{s} header \"{s}\"",
+                .{ description, header.key },
+            );
+            defer allocator.free(header_description);
+
+            const value = try self.resolveConfigValueOrThrowAlloc(allocator, header.value, header_description);
+            switch (value) {
+                .value => |resolved_value| try appendResolvedHeader(allocator, &resolved, header.key, resolved_value),
+                .failure => |message| {
+                    deinitResolvedHeaderItems(allocator, resolved.items);
+                    return .{ .failure = message };
+                },
+            }
+        }
+
+        if (resolved.items.len == 0) return .{ .headers = null };
+        return .{ .headers = .{ .entries = try resolved.toOwnedSlice(allocator) } };
     }
 
     fn executeCommandAlloc(
@@ -191,6 +314,76 @@ fn resolveTemplateAlloc(
         index = reference.end;
     }
     return try output.toOwnedSlice(allocator);
+}
+
+fn configResolutionFailureMessageAlloc(
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    config: []const u8,
+    description: []const u8,
+) ![]u8 {
+    if (isCommandConfigValue(config)) {
+        return try std.fmt.allocPrint(
+            allocator,
+            "Failed to resolve {s} from shell command: {s}",
+            .{ description, config[1..] },
+        );
+    }
+
+    const missing = try getMissingConfigValueEnvVarNames(allocator, env, config);
+    defer allocator.free(missing);
+    if (missing.len == 1) {
+        return try std.fmt.allocPrint(
+            allocator,
+            "Failed to resolve {s} from environment variable: {s}",
+            .{ description, missing[0] },
+        );
+    }
+    if (missing.len > 1) {
+        const joined = try joinEnvVarNamesAlloc(allocator, missing);
+        defer allocator.free(joined);
+        return try std.fmt.allocPrint(
+            allocator,
+            "Failed to resolve {s} from environment variables: {s}",
+            .{ description, joined },
+        );
+    }
+
+    return try std.fmt.allocPrint(allocator, "Failed to resolve {s}", .{description});
+}
+
+fn joinEnvVarNamesAlloc(allocator: std.mem.Allocator, names: []const []const u8) ![]u8 {
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(allocator);
+    for (names, 0..) |name, index| {
+        if (index > 0) try output.appendSlice(allocator, ", ");
+        try output.appendSlice(allocator, name);
+    }
+    return try output.toOwnedSlice(allocator);
+}
+
+fn appendResolvedHeader(
+    allocator: std.mem.Allocator,
+    headers: *std.ArrayList(ResolvedHeader),
+    key: []const u8,
+    value: []u8,
+) !void {
+    errdefer allocator.free(value);
+    const key_copy = try allocator.dupe(u8, key);
+    errdefer allocator.free(key_copy);
+    try headers.append(allocator, .{ .key = key_copy, .value = value });
+}
+
+fn deinitResolvedHeaders(allocator: std.mem.Allocator, headers: []ResolvedHeader) void {
+    deinitResolvedHeaderItems(allocator, headers);
+    allocator.free(headers);
+}
+
+fn deinitResolvedHeaderItems(allocator: std.mem.Allocator, headers: []ResolvedHeader) void {
+    for (headers) |header| {
+        allocator.free(header.key);
+        allocator.free(header.value);
+    }
 }
 
 const EnvReference = struct {
@@ -356,8 +549,134 @@ test "config value helpers expose environment references and legacy names" {
     defer allocator.free(missing);
     try std.testing.expectEqual(@as(usize, 1), missing.len);
     try std.testing.expectEqualStrings("TWO", missing[0]);
+    try std.testing.expect(try isConfigValueConfigured(allocator, &env, "${ONE}"));
+    try std.testing.expect(!try isConfigValueConfigured(allocator, &env, "$TWO"));
     try std.testing.expect(isLegacyEnvVarNameConfigValue("ANTHROPIC_API_KEY"));
     try std.testing.expect(!isLegacyEnvVarNameConfigValue("anthropic_api_key"));
+}
+
+test "required config values report Pi-compatible failure messages" {
+    const allocator = std.testing.allocator;
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    var runner: FakeRunner = .{};
+    var resolver = Resolver.init(allocator, &env);
+    defer resolver.deinit();
+    resolver.runner = .{ .ptr = &runner, .run_fn = FakeRunner.run };
+
+    var literal = try resolver.resolveConfigValueOrThrowAlloc(allocator, "", "empty literal");
+    defer literal.deinit(allocator);
+    switch (literal) {
+        .value => |value| try std.testing.expectEqualStrings("", value),
+        .failure => return error.UnexpectedFailure,
+    }
+
+    var missing_one = try resolver.resolveConfigValueOrThrowAlloc(allocator, "$TOKEN", "API key");
+    defer missing_one.deinit(allocator);
+    switch (missing_one) {
+        .value => return error.UnexpectedValue,
+        .failure => |message| try std.testing.expectEqualStrings(
+            "Failed to resolve API key from environment variable: TOKEN",
+            message,
+        ),
+    }
+
+    var missing_many = try resolver.resolveConfigValueOrThrowAlloc(allocator, "${LEFT}-$RIGHT", "headers");
+    defer missing_many.deinit(allocator);
+    switch (missing_many) {
+        .value => return error.UnexpectedValue,
+        .failure => |message| try std.testing.expectEqualStrings(
+            "Failed to resolve headers from environment variables: LEFT, RIGHT",
+            message,
+        ),
+    }
+
+    var command_failure = try resolver.resolveConfigValueOrThrowAlloc(allocator, "!fail", "API key");
+    defer command_failure.deinit(allocator);
+    switch (command_failure) {
+        .value => return error.UnexpectedValue,
+        .failure => |message| try std.testing.expectEqualStrings(
+            "Failed to resolve API key from shell command: fail",
+            message,
+        ),
+    }
+}
+
+test "required config values execute commands uncached" {
+    const allocator = std.testing.allocator;
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    var runner: FakeRunner = .{};
+    var resolver = Resolver.init(allocator, &env);
+    defer resolver.deinit();
+    resolver.runner = .{ .ptr = &runner, .run_fn = FakeRunner.run };
+
+    for (0..2) |_| {
+        var value = try resolver.resolveConfigValueOrThrowAlloc(allocator, "!uncached", "API key");
+        defer value.deinit(allocator);
+        switch (value) {
+            .value => |resolved| try std.testing.expectEqualStrings("uncached", resolved),
+            .failure => return error.UnexpectedFailure,
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), runner.calls);
+}
+
+test "headers resolve optional values and required failures" {
+    const allocator = std.testing.allocator;
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put("CUSTOM_HEADER", "custom-value");
+    var runner: FakeRunner = .{};
+    var resolver = Resolver.init(allocator, &env);
+    defer resolver.deinit();
+    resolver.runner = .{ .ptr = &runner, .run_fn = FakeRunner.run };
+
+    const headers = [_]HeaderInput{
+        .{ .key = "X-Literal", .value = "literal" },
+        .{ .key = "X-Custom-Header", .value = "$CUSTOM_HEADER" },
+        .{ .key = "X-Missing", .value = "$MISSING_HEADER" },
+        .{ .key = "X-Empty", .value = "!fail" },
+    };
+    var optional = (try resolver.resolveHeadersAlloc(allocator, &headers)).?;
+    defer optional.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 2), optional.entries.len);
+    try std.testing.expectEqualStrings("literal", optional.get("X-Literal").?);
+    try std.testing.expectEqualStrings("custom-value", optional.get("X-Custom-Header").?);
+    try std.testing.expectEqual(null, optional.get("X-Missing"));
+
+    const empty_optional = try resolver.resolveHeadersAlloc(allocator, &.{});
+    try std.testing.expectEqual(null, empty_optional);
+
+    const required_headers = [_]HeaderInput{
+        .{ .key = "X-Empty", .value = "" },
+        .{ .key = "X-Custom-Header", .value = "$CUSTOM_HEADER" },
+    };
+    var required = try resolver.resolveHeadersOrThrowAlloc(allocator, &required_headers, "provider \"custom\"");
+    defer required.deinit(allocator);
+    switch (required) {
+        .headers => |maybe_headers| {
+            const resolved = maybe_headers.?;
+            try std.testing.expectEqual(@as(usize, 2), resolved.entries.len);
+            try std.testing.expectEqualStrings("", resolved.get("X-Empty").?);
+            try std.testing.expectEqualStrings("custom-value", resolved.get("X-Custom-Header").?);
+        },
+        .failure => return error.UnexpectedFailure,
+    }
+
+    const failing_headers = [_]HeaderInput{
+        .{ .key = "X-Custom-Header", .value = "$CUSTOM_HEADER" },
+        .{ .key = "X-Missing", .value = "$MISSING_HEADER" },
+    };
+    var failed = try resolver.resolveHeadersOrThrowAlloc(allocator, &failing_headers, "provider \"custom\"");
+    defer failed.deinit(allocator);
+    switch (failed) {
+        .headers => return error.UnexpectedValue,
+        .failure => |message| try std.testing.expectEqualStrings(
+            "Failed to resolve provider \"custom\" header \"X-Missing\" from environment variable: MISSING_HEADER",
+            message,
+        ),
+    }
 }
 
 test "config shell commands preserve pipes trim output and reject failures" {
