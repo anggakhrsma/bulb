@@ -1,5 +1,7 @@
 const std = @import("std");
 const ai = @import("bulb_ai");
+const auth_storage = @import("auth_storage.zig");
+const config_value = @import("resolve_config_value.zig");
 const model_registry = @import("model_registry.zig");
 
 pub const default_thinking_level: ai.ThinkingLevel = .medium;
@@ -681,21 +683,27 @@ fn globMatchesAt(pattern: []const u8, pattern_index: usize, value: []const u8, v
     while (p < pattern.len) {
         switch (pattern[p]) {
             '*' => {
-                while (p + 1 < pattern.len and pattern[p + 1] == '*') p += 1;
-                if (p + 1 == pattern.len) return true;
+                var star_count: usize = 1;
+                while (p + star_count < pattern.len and pattern[p + star_count] == '*') star_count += 1;
+                const crosses_slash = star_count >= 2;
+                p += star_count - 1;
+                if (p + 1 == pattern.len) {
+                    return crosses_slash or std.mem.indexOfScalar(u8, value[v..], '/') == null;
+                }
                 var next_value_index = v;
                 while (next_value_index <= value.len) : (next_value_index += 1) {
                     if (globMatchesAt(pattern, p + 1, value, next_value_index)) return true;
+                    if (!crosses_slash and next_value_index < value.len and value[next_value_index] == '/') break;
                 }
                 return false;
             },
             '?' => {
-                if (v >= value.len) return false;
+                if (v >= value.len or value[v] == '/') return false;
                 p += 1;
                 v += 1;
             },
             '[' => {
-                if (v >= value.len) return false;
+                if (v >= value.len or value[v] == '/') return false;
                 const result = matchGlobClass(pattern[p..], value[v]) orelse {
                     if (!asciiByteEquals(pattern[p], value[v])) return false;
                     p += 1;
@@ -813,6 +821,76 @@ const mock_models = [_]ai.Model{
         .max_tokens = 4096,
     },
 };
+
+const ResolverRegistryHarness = struct {
+    allocator: std.mem.Allocator,
+    env: *std.process.Environ.Map,
+    oauth_registry: *ai.oauth.Registry,
+    resolver: *config_value.Resolver,
+    storage: *auth_storage.AuthStorage,
+    registry: model_registry.ModelRegistry,
+
+    fn deinit(self: *ResolverRegistryHarness) void {
+        self.registry.deinit();
+        self.storage.deinit();
+        self.allocator.destroy(self.storage);
+        self.resolver.deinit();
+        self.allocator.destroy(self.resolver);
+        self.oauth_registry.deinit();
+        self.allocator.destroy(self.oauth_registry);
+        self.env.deinit();
+        self.allocator.destroy(self.env);
+    }
+};
+
+fn makeResolverRegistryHarness(allocator: std.mem.Allocator) !ResolverRegistryHarness {
+    const env = try allocator.create(std.process.Environ.Map);
+    errdefer allocator.destroy(env);
+    env.* = std.process.Environ.Map.init(allocator);
+    errdefer env.deinit();
+
+    const oauth_registry = try allocator.create(ai.oauth.Registry);
+    errdefer allocator.destroy(oauth_registry);
+    oauth_registry.* = try ai.oauth.Registry.init(allocator);
+    errdefer oauth_registry.deinit();
+
+    const resolver = try allocator.create(config_value.Resolver);
+    errdefer allocator.destroy(resolver);
+    resolver.* = config_value.Resolver.init(allocator, env);
+    errdefer resolver.deinit();
+
+    const storage = try allocator.create(auth_storage.AuthStorage);
+    errdefer allocator.destroy(storage);
+    storage.* = try auth_storage.AuthStorage.initMemory(allocator, env, oauth_registry, resolver);
+    errdefer storage.deinit();
+
+    var registry = try model_registry.ModelRegistry.inMemory(allocator, storage);
+    errdefer registry.deinit();
+
+    return .{
+        .allocator = allocator,
+        .env = env,
+        .oauth_registry = oauth_registry,
+        .resolver = resolver,
+        .storage = storage,
+        .registry = registry,
+    };
+}
+
+fn resolverDynamicModel(id: []const u8) ai.Model {
+    return .{
+        .id = id,
+        .name = id,
+        .api = ai.types.api.anthropic_messages,
+        .provider = "dynamic",
+        .base_url = "https://provider.test/v1",
+        .reasoning = true,
+        .input = &mock_text_input,
+        .cost = .{ .input = 1, .output = 2, .cache_read = 0.1, .cache_write = 1 },
+        .context_window = 128000,
+        .max_tokens = 8192,
+    };
+}
 
 fn expectParsed(pattern: []const u8, expected_id: ?[]const u8, expected_level: ?ai.ThinkingLevel, expected_warning: ?[]const u8) !void {
     const result = parseModelPattern(pattern, &mock_models, .{});
@@ -1009,4 +1087,148 @@ test "model resolver initial selection accepts custom provider model ids and ava
     const selected = findDefaultAvailableModel(&available) orelse available[0];
     try std.testing.expectEqualStrings("vercel-ai-gateway", selected.provider);
     try std.testing.expectEqualStrings("anthropic/claude-opus-4-6", selected.id);
+}
+
+// Ported from packages/coding-agent/test/model-resolver.test.ts findInitialModel
+// cases, using Bulb's native registry/auth storage instead of JS mocks.
+test "model resolver initial selection runs through the model registry" {
+    const allocator = std.testing.allocator;
+
+    {
+        var harness = try makeResolverRegistryHarness(allocator);
+        defer harness.deinit();
+        const openrouter_models = [_]ai.Model{resolverDynamicModel("qwen/qwen3-coder:exacto")};
+        try harness.registry.registerProvider("openrouter", .{
+            .base_url = "https://openrouter.ai/api/v1",
+            .api_key = "test-key",
+            .api = ai.types.api.anthropic_messages,
+            .models = &openrouter_models,
+        });
+
+        var result = try findInitialModelAlloc(allocator, .{
+            .cli_provider = "openrouter",
+            .cli_model = "openrouter/openai/ghost-model",
+            .scoped_models = &.{},
+            .is_continuing = false,
+            .model_registry = &harness.registry,
+        });
+        defer result.deinit(allocator);
+        try std.testing.expect(result.error_message == null);
+        try std.testing.expectEqualStrings("openrouter", result.model.?.provider);
+        try std.testing.expectEqualStrings("openai/ghost-model", result.model.?.id);
+        try std.testing.expectEqual(default_thinking_level, result.thinking_level);
+    }
+
+    {
+        var harness = try makeResolverRegistryHarness(allocator);
+        defer harness.deinit();
+        const gateway_models = [_]ai.Model{resolverDynamicModel("anthropic/claude-opus-4-6")};
+        try harness.registry.registerProvider("vercel-ai-gateway", .{
+            .base_url = "https://ai-gateway.vercel.sh",
+            .api_key = "test-key",
+            .api = ai.types.api.anthropic_messages,
+            .models = &gateway_models,
+        });
+
+        var result = try findInitialModelAlloc(allocator, .{
+            .scoped_models = &.{},
+            .is_continuing = false,
+            .model_registry = &harness.registry,
+        });
+        defer result.deinit(allocator);
+        try std.testing.expect(result.error_message == null);
+        try std.testing.expectEqualStrings("vercel-ai-gateway", result.model.?.provider);
+        try std.testing.expectEqualStrings("anthropic/claude-opus-4-6", result.model.?.id);
+    }
+}
+
+// Ported from packages/coding-agent/src/core/model-resolver.ts resolveModelScope
+// behavior: glob patterns match provider/model references and model IDs with
+// minimatch-style slash handling.
+test "model resolver resolves scoped models from registry with glob thinking suffixes" {
+    const allocator = std.testing.allocator;
+    var harness = try makeResolverRegistryHarness(allocator);
+    defer harness.deinit();
+    const openrouter_models = [_]ai.Model{resolverDynamicModel("qwen/qwen3-coder:exacto")};
+    try harness.registry.registerProvider("openrouter", .{
+        .base_url = "https://openrouter.ai/api/v1",
+        .api_key = "test-key",
+        .api = ai.types.api.anthropic_messages,
+        .models = &openrouter_models,
+    });
+
+    {
+        const patterns = [_][]const u8{"openrouter/*"};
+        var result = try resolveModelScopeAlloc(allocator, &patterns, &harness.registry);
+        defer result.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 0), result.scoped_models.len);
+        try std.testing.expectEqual(@as(usize, 1), result.warnings.len);
+        try std.testing.expect(std.mem.indexOf(u8, result.warnings[0], "No models match pattern") != null);
+    }
+
+    {
+        const patterns = [_][]const u8{"openrouter/**:high"};
+        var result = try resolveModelScopeAlloc(allocator, &patterns, &harness.registry);
+        defer result.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 1), result.scoped_models.len);
+        try std.testing.expectEqualStrings("openrouter", result.scoped_models[0].model.provider);
+        try std.testing.expectEqualStrings("qwen/qwen3-coder:exacto", result.scoped_models[0].model.id);
+        try std.testing.expectEqual(@as(?ai.ThinkingLevel, .high), result.scoped_models[0].thinking_level);
+        try std.testing.expectEqual(@as(usize, 0), result.warnings.len);
+    }
+}
+
+// Ported from packages/coding-agent/src/core/model-resolver.ts
+// restoreModelFromSession behavior, translated to structured fallback messages.
+test "model resolver restores session models or falls back to available models" {
+    const allocator = std.testing.allocator;
+    var harness = try makeResolverRegistryHarness(allocator);
+    defer harness.deinit();
+    const session_models = [_]ai.Model{resolverDynamicModel("session-model")};
+    try harness.registry.registerProvider("session-provider", .{
+        .base_url = "https://session-provider.test/v1",
+        .api_key = "test-key",
+        .api = ai.types.api.anthropic_messages,
+        .models = &session_models,
+    });
+
+    var restored = try restoreModelFromSessionAlloc(
+        allocator,
+        "session-provider",
+        "session-model",
+        null,
+        &harness.registry,
+    );
+    defer restored.deinit(allocator);
+    try std.testing.expect(restored.fallback_message == null);
+    try std.testing.expectEqualStrings("session-provider", restored.model.?.provider);
+    try std.testing.expectEqualStrings("session-model", restored.model.?.id);
+
+    const current_model = resolverDynamicModel("current-model");
+    restored.deinit(allocator);
+    restored = try restoreModelFromSessionAlloc(
+        allocator,
+        "missing-provider",
+        "missing-model",
+        current_model,
+        &harness.registry,
+    );
+    try std.testing.expectEqualStrings("current-model", restored.model.?.id);
+    try std.testing.expect(restored.fallback_message != null);
+    try std.testing.expect(std.mem.indexOf(u8, restored.fallback_message.?, "model no longer exists") != null);
+    try std.testing.expect(std.mem.indexOf(u8, restored.fallback_message.?, "dynamic/current-model") != null);
+
+    restored.deinit(allocator);
+    try std.testing.expect(harness.registry.find("openai", "gpt-5.4") != null);
+    restored = try restoreModelFromSessionAlloc(
+        allocator,
+        "openai",
+        "gpt-5.4",
+        null,
+        &harness.registry,
+    );
+    try std.testing.expectEqualStrings("session-provider", restored.model.?.provider);
+    try std.testing.expectEqualStrings("session-model", restored.model.?.id);
+    try std.testing.expect(restored.fallback_message != null);
+    try std.testing.expect(std.mem.indexOf(u8, restored.fallback_message.?, "no auth configured") != null);
 }
