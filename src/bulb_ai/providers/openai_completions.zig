@@ -76,14 +76,15 @@ pub const OpenAICompletionsTransport = struct {
 };
 
 pub const ClientHeaderMap = struct {
-    map: std.StringHashMap(?[]const u8),
+    map: std.StringHashMapUnmanaged(?[]const u8) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) ClientHeaderMap {
-        return .{ .map = std.StringHashMap(?[]const u8).init(allocator) };
+        _ = allocator;
+        return .{};
     }
 
-    pub fn deinit(self: *ClientHeaderMap) void {
-        self.map.deinit();
+    pub fn deinit(self: *ClientHeaderMap, allocator: std.mem.Allocator) void {
+        self.map.deinit(allocator);
     }
 
     pub fn get(self: *const ClientHeaderMap, key: []const u8) ??[]const u8 {
@@ -110,7 +111,7 @@ pub const OpenAICompletionsClientConfig = struct {
     request_options: OpenAICompletionsRequestOptions,
 
     pub fn deinit(self: *OpenAICompletionsClientConfig) void {
-        self.headers.deinit();
+        self.headers.deinit(self.arena.allocator());
         self.arena.deinit();
     }
 };
@@ -1200,7 +1201,7 @@ pub fn buildClientConfig(
     const headers = try buildClientHeaderMap(a, model, context, api_key, options, compat);
     errdefer {
         var mutable_headers = headers;
-        mutable_headers.deinit();
+        mutable_headers.deinit(a);
     }
 
     const owned_api_key = try a.dupe(u8, api_key);
@@ -1256,7 +1257,7 @@ fn buildClientHeaderMap(
     compat: ResolvedOpenAICompletionsCompat,
 ) !ClientHeaderMap {
     var headers = ClientHeaderMap.init(allocator);
-    errdefer headers.deinit();
+    errdefer headers.deinit(allocator);
 
     for (model.headers) |header| try putClientHeader(allocator, &headers, header.name, header.value);
 
@@ -1296,7 +1297,7 @@ fn putClientHeader(
     key: []const u8,
     value: []const u8,
 ) !void {
-    try headers.map.put(try allocator.dupe(u8, key), try allocator.dupe(u8, value));
+    try headers.map.put(allocator, try allocator.dupe(u8, key), try allocator.dupe(u8, value));
 }
 
 fn putClientNullHeader(
@@ -1304,7 +1305,7 @@ fn putClientNullHeader(
     headers: *ClientHeaderMap,
     key: []const u8,
 ) !void {
-    try headers.map.put(try allocator.dupe(u8, key), null);
+    try headers.map.put(allocator, try allocator.dupe(u8, key), null);
 }
 
 fn isCloudflareProvider(provider: []const u8) bool {
@@ -2010,10 +2011,22 @@ const RecordedOpenAICompletionsRequest = struct {
     attempt: u32,
     max_retries: u32,
     timeout_ms: ?u64,
+    url: []u8,
+    payload_json: []u8,
     authorization: ?[]u8 = null,
+    cf_aig_authorization: ?[]u8 = null,
+    session_id: ?[]u8 = null,
+    x_client_request_id: ?[]u8 = null,
+    x_session_affinity: ?[]u8 = null,
 
     fn deinit(self: *RecordedOpenAICompletionsRequest, allocator: std.mem.Allocator) void {
+        allocator.free(self.url);
+        allocator.free(self.payload_json);
         if (self.authorization) |value| allocator.free(value);
+        if (self.cf_aig_authorization) |value| allocator.free(value);
+        if (self.session_id) |value| allocator.free(value);
+        if (self.x_client_request_id) |value| allocator.free(value);
+        if (self.x_session_affinity) |value| allocator.free(value);
     }
 };
 
@@ -2056,9 +2069,23 @@ fn fakeOpenAICompletionsTransportRequest(
         .attempt = request.attempt,
         .max_retries = request.max_retries,
         .timeout_ms = request.timeout_ms,
+        .url = try state.allocator.dupe(u8, request.url),
+        .payload_json = try state.allocator.dupe(u8, request.payload_json),
     };
     if (findHeader(request.headers, "Authorization")) |authorization| {
         record.authorization = try state.allocator.dupe(u8, authorization);
+    }
+    if (findHeader(request.headers, "cf-aig-authorization")) |value| {
+        record.cf_aig_authorization = try state.allocator.dupe(u8, value);
+    }
+    if (findHeader(request.headers, "session_id")) |value| {
+        record.session_id = try state.allocator.dupe(u8, value);
+    }
+    if (findHeader(request.headers, "x-client-request-id")) |value| {
+        record.x_client_request_id = try state.allocator.dupe(u8, value);
+    }
+    if (findHeader(request.headers, "x-session-affinity")) |value| {
+        record.x_session_affinity = try state.allocator.dupe(u8, value);
     }
     errdefer record.deinit(state.allocator);
     try state.records.append(state.allocator, record);
@@ -2078,6 +2105,26 @@ fn findHeader(headers: []const types.Header, name: []const u8) ?[]const u8 {
         if (std.mem.eql(u8, header.name, name)) return header.value;
     }
     return null;
+}
+
+fn runFakeOpenAICompletionsStream(
+    transport: *FakeOpenAICompletionsTransport,
+    model: types.Model,
+    context: types.Context,
+    options: OpenAICompletionsOptions,
+    env: ?*const std.process.Environ.Map,
+) !void {
+    var stream_options = options;
+    stream_options.transport = transport.transport();
+    var parsed = try streamOpenAICompletions(
+        std.testing.allocator,
+        model,
+        context,
+        stream_options,
+        env,
+    );
+    defer parsed.deinit();
+    try std.testing.expectEqual(types.StopReason.stop, parsed.result.message.stop_reason);
 }
 
 fn openAICompletionsRetryTestModel() types.Model {
@@ -2564,6 +2611,166 @@ test "OpenAI completions prompt cache fields and session affinity headers" {
     try std.testing.expectEqualStrings("override-session", headers.get("session_id").?);
     try std.testing.expectEqualStrings("override-request", headers.get("x-client-request-id").?);
     try std.testing.expectEqualStrings("override-affinity", headers.get("x-session-affinity").?);
+}
+
+// Ported from packages/ai/test/openai-completions-prompt-cache.test.ts.
+test "OpenAI completions native stream sends prompt cache request fields" {
+    const allocator = std.testing.allocator;
+    var model = (models.getModel("openai", "gpt-4o-mini") orelse return error.ModelMissing).*;
+    model.api = types.api.openai_completions;
+    const user_content = [_]types.UserContent{.{ .text = .{ .text = "hi" } }};
+    const messages = [_]types.Message{.{ .user = .{ .content = &user_content } }};
+    const context: types.Context = .{ .system_prompt = "sys", .messages = &messages };
+
+    var direct_transport = FakeOpenAICompletionsTransport.init(allocator);
+    defer direct_transport.deinit();
+    try runFakeOpenAICompletionsStream(
+        &direct_transport,
+        model,
+        context,
+        .{ .base = .{ .api_key = "test-key", .session_id = "session-123" } },
+        null,
+    );
+    var direct_payload = try std.json.parseFromSlice(std.json.Value, allocator, direct_transport.records.items[0].payload_json, .{});
+    defer direct_payload.deinit();
+    try std.testing.expectEqualStrings("session-123", direct_payload.value.object.get("prompt_cache_key").?.string);
+    try std.testing.expect(direct_payload.value.object.get("prompt_cache_retention") == null);
+
+    var long_transport = FakeOpenAICompletionsTransport.init(allocator);
+    defer long_transport.deinit();
+    try runFakeOpenAICompletionsStream(
+        &long_transport,
+        model,
+        context,
+        .{ .base = .{ .api_key = "test-key", .cache_retention = .long, .session_id = "session-456" } },
+        null,
+    );
+    var long_payload = try std.json.parseFromSlice(std.json.Value, allocator, long_transport.records.items[0].payload_json, .{});
+    defer long_payload.deinit();
+    try std.testing.expectEqualStrings("session-456", long_payload.value.object.get("prompt_cache_key").?.string);
+    try std.testing.expectEqualStrings("24h", long_payload.value.object.get("prompt_cache_retention").?.string);
+
+    var clamp_transport = FakeOpenAICompletionsTransport.init(allocator);
+    defer clamp_transport.deinit();
+    try runFakeOpenAICompletionsStream(
+        &clamp_transport,
+        model,
+        context,
+        .{ .base = .{ .api_key = "test-key", .session_id = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" } },
+        null,
+    );
+    var clamp_payload = try std.json.parseFromSlice(std.json.Value, allocator, clamp_transport.records.items[0].payload_json, .{});
+    defer clamp_payload.deinit();
+    try std.testing.expectEqual(@as(usize, 64), clamp_payload.value.object.get("prompt_cache_key").?.string.len);
+
+    var none_transport = FakeOpenAICompletionsTransport.init(allocator);
+    defer none_transport.deinit();
+    try runFakeOpenAICompletionsStream(
+        &none_transport,
+        model,
+        context,
+        .{ .base = .{ .api_key = "test-key", .cache_retention = .none, .session_id = "session-789" } },
+        null,
+    );
+    var none_payload = try std.json.parseFromSlice(std.json.Value, allocator, none_transport.records.items[0].payload_json, .{});
+    defer none_payload.deinit();
+    try std.testing.expect(none_payload.value.object.get("prompt_cache_key") == null);
+    try std.testing.expect(none_payload.value.object.get("prompt_cache_retention") == null);
+
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put("BULB_CACHE_RETENTION", "long");
+    var env_transport = FakeOpenAICompletionsTransport.init(allocator);
+    defer env_transport.deinit();
+    try runFakeOpenAICompletionsStream(
+        &env_transport,
+        model,
+        context,
+        .{ .base = .{ .api_key = "test-key", .session_id = "session-env" } },
+        &env,
+    );
+    var env_payload = try std.json.parseFromSlice(std.json.Value, allocator, env_transport.records.items[0].payload_json, .{});
+    defer env_payload.deinit();
+    try std.testing.expectEqualStrings("session-env", env_payload.value.object.get("prompt_cache_key").?.string);
+    try std.testing.expectEqualStrings("24h", env_payload.value.object.get("prompt_cache_retention").?.string);
+}
+
+// Ported from packages/ai/test/openai-completions-prompt-cache.test.ts.
+test "OpenAI completions native stream sends session affinity headers" {
+    const allocator = std.testing.allocator;
+    const user_content = [_]types.UserContent{.{ .text = .{ .text = "hi" } }};
+    const messages = [_]types.Message{.{ .user = .{ .content = &user_content } }};
+    const context: types.Context = .{ .system_prompt = "sys", .messages = &messages };
+
+    var affinity_model = (models.getModel("openai", "gpt-4o-mini") orelse return error.ModelMissing).*;
+    affinity_model.api = types.api.openai_completions;
+    affinity_model.base_url = "https://proxy.example.com/v1";
+    affinity_model.compat.send_session_affinity_headers = true;
+    affinity_model.compat.supports_long_cache_retention = true;
+
+    var generated_transport = FakeOpenAICompletionsTransport.init(allocator);
+    defer generated_transport.deinit();
+    try runFakeOpenAICompletionsStream(
+        &generated_transport,
+        affinity_model,
+        context,
+        .{ .base = .{ .api_key = "test-key", .session_id = "session-affinity" } },
+        null,
+    );
+    try std.testing.expectEqualStrings("session-affinity", generated_transport.records.items[0].session_id.?);
+    try std.testing.expectEqualStrings("session-affinity", generated_transport.records.items[0].x_client_request_id.?);
+    try std.testing.expectEqualStrings("session-affinity", generated_transport.records.items[0].x_session_affinity.?);
+
+    var none_transport = FakeOpenAICompletionsTransport.init(allocator);
+    defer none_transport.deinit();
+    try runFakeOpenAICompletionsStream(
+        &none_transport,
+        affinity_model,
+        context,
+        .{ .base = .{ .api_key = "test-key", .cache_retention = .none, .session_id = "session-affinity" } },
+        null,
+    );
+    try std.testing.expect(none_transport.records.items[0].session_id == null);
+    try std.testing.expect(none_transport.records.items[0].x_client_request_id == null);
+    try std.testing.expect(none_transport.records.items[0].x_session_affinity == null);
+
+    const override_headers = [_]types.Header{
+        .{ .name = "session_id", .value = "override-session" },
+        .{ .name = "x-client-request-id", .value = "override-request" },
+        .{ .name = "x-session-affinity", .value = "override-affinity" },
+    };
+    var override_transport = FakeOpenAICompletionsTransport.init(allocator);
+    defer override_transport.deinit();
+    try runFakeOpenAICompletionsStream(
+        &override_transport,
+        affinity_model,
+        context,
+        .{ .base = .{
+            .api_key = "test-key",
+            .session_id = "session-affinity",
+            .headers = &override_headers,
+        } },
+        null,
+    );
+    try std.testing.expectEqualStrings("override-session", override_transport.records.items[0].session_id.?);
+    try std.testing.expectEqualStrings("override-request", override_transport.records.items[0].x_client_request_id.?);
+    try std.testing.expectEqualStrings("override-affinity", override_transport.records.items[0].x_session_affinity.?);
+
+    var proxy_without_long = affinity_model;
+    proxy_without_long.compat.supports_long_cache_retention = false;
+    var proxy_transport = FakeOpenAICompletionsTransport.init(allocator);
+    defer proxy_transport.deinit();
+    try runFakeOpenAICompletionsStream(
+        &proxy_transport,
+        proxy_without_long,
+        context,
+        .{ .base = .{ .api_key = "test-key", .cache_retention = .long, .session_id = "session-proxy" } },
+        null,
+    );
+    var proxy_payload = try std.json.parseFromSlice(std.json.Value, allocator, proxy_transport.records.items[0].payload_json, .{});
+    defer proxy_payload.deinit();
+    try std.testing.expect(proxy_payload.value.object.get("prompt_cache_key") == null);
+    try std.testing.expect(proxy_payload.value.object.get("prompt_cache_retention") == null);
 }
 
 // Ported from packages/ai/test/openai-completions-thinking-as-text.test.ts.
