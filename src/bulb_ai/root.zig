@@ -7,6 +7,7 @@ pub const models = @import("models.zig");
 pub const stream = @import("stream.zig");
 pub const anthropic_sse = @import("providers/anthropic_sse.zig");
 pub const cache_retention = @import("providers/cache_retention.zig");
+pub const openai_completions = @import("providers/openai_completions.zig");
 pub const openai_prompt_cache = @import("providers/openai_prompt_cache.zig");
 pub const simple_options = @import("providers/simple_options.zig");
 pub const transform_messages = @import("providers/transform_messages.zig");
@@ -68,6 +69,7 @@ test {
     _ = @import("stream.zig");
     _ = @import("providers/anthropic_sse.zig");
     _ = @import("providers/cache_retention.zig");
+    _ = @import("providers/openai_completions.zig");
     _ = @import("providers/openai_prompt_cache.zig");
     _ = @import("providers/simple_options.zig");
     _ = @import("providers/transform_messages.zig");

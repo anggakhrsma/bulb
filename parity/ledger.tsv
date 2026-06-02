@@ -120,7 +120,7 @@ packages/ai/src/providers/images/openrouter.ts	bulb_ai	source	pending
 packages/ai/src/providers/images/register-builtins.ts	bulb_ai	source	pending		
 packages/ai/src/providers/mistral.ts	bulb_ai	source	pending		
 packages/ai/src/providers/openai-codex-responses.ts	bulb_ai	source	pending		
-packages/ai/src/providers/openai-completions.ts	bulb_ai	source	pending		
+packages/ai/src/providers/openai-completions.ts	bulb_ai	source	in_progress	src/bulb_ai/providers/openai_completions.zig	OpenAI-compatible compat detection, message/tool conversion, prompt cache fields, Anthropic cache markers, reasoning option mapping, tool_choice, and session-affinity header helpers ported; native HTTP streaming remains
 packages/ai/src/providers/openai-prompt-cache.ts	bulb_ai	source	implemented	src/bulb_ai/providers/openai_prompt_cache.zig	OpenAI prompt-cache key clamping and prompt-cache retention helpers ported with Unicode-aware truncation
 packages/ai/src/providers/openai-responses-shared.ts	bulb_ai	source	pending		
 packages/ai/src/providers/openai-responses.ts	bulb_ai	source	pending		
@@ -200,14 +200,14 @@ packages/ai/test/oauth.ts	bulb_ai	test	pending
 packages/ai/test/openai-codex-cache-affinity-e2e.test.ts	bulb_ai	test	pending		
 packages/ai/test/openai-codex-oauth.test.ts	bulb_ai	test	pending		
 packages/ai/test/openai-codex-stream.test.ts	bulb_ai	test	pending		
-packages/ai/test/openai-completions-cache-control-format.test.ts	bulb_ai	test	pending		
-packages/ai/test/openai-completions-empty-tools.test.ts	bulb_ai	test	pending		
-packages/ai/test/openai-completions-prompt-cache.test.ts	bulb_ai	test	pending		
+packages/ai/test/openai-completions-cache-control-format.test.ts	bulb_ai	test	implemented	src/bulb_ai/providers/openai_completions.zig	Anthropic-style cache_control markers on instruction messages, last tools, and last conversation content ported with cacheRetention none coverage
+packages/ai/test/openai-completions-empty-tools.test.ts	bulb_ai	test	in_progress	src/bulb_ai/providers/openai_completions.zig	Empty tool omission, explicit max token field selection, and tool-history tools: [] regression ported; Cloudflare client construction remains
+packages/ai/test/openai-completions-prompt-cache.test.ts	bulb_ai	test	in_progress	src/bulb_ai/providers/openai_completions.zig	Prompt cache key/retention fields, proxy compatibility, and session-affinity header override coverage ported using Bulb cache variable semantics; SDK client capture remains
 packages/ai/test/openai-completions-response-model.test.ts	bulb_ai	test	pending		
 packages/ai/test/openai-completions-retry.test.ts	bulb_ai	test	pending		
-packages/ai/test/openai-completions-thinking-as-text.test.ts	bulb_ai	test	pending		
-packages/ai/test/openai-completions-tool-choice.test.ts	bulb_ai	test	pending		
-packages/ai/test/openai-completions-tool-result-images.test.ts	bulb_ai	test	pending		
+packages/ai/test/openai-completions-thinking-as-text.test.ts	bulb_ai	test	in_progress	src/bulb_ai/providers/openai_completions.zig	Thinking replay to assistant text parts ported; endpoint/SSE transport regression remains
+packages/ai/test/openai-completions-tool-choice.test.ts	bulb_ai	test	in_progress	src/bulb_ai/providers/openai_completions.zig	toolChoice forwarding, strict-tool omission, reasoning effort mapping, and z.ai tool_stream payload coverage ported; streaming finish_reason/tool-call delta cases remain
+packages/ai/test/openai-completions-tool-result-images.test.ts	bulb_ai	test	implemented	src/bulb_ai/providers/openai_completions.zig	Consecutive tool-result images are batched into a follow-up user image message for vision-capable OpenAI-compatible models
 packages/ai/test/openai-responses-cache-affinity-e2e.test.ts	bulb_ai	test	pending		
 packages/ai/test/openai-responses-copilot-provider.test.ts	bulb_ai	test	pending		
 packages/ai/test/openai-responses-foreign-toolcall-id.test.ts	bulb_ai	test	pending		
