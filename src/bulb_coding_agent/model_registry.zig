@@ -528,7 +528,7 @@ pub const ModelRegistry = struct {
                 deinitModelItems(self.allocator, custom_models.items);
                 custom_models.clearRetainingCapacity();
                 self.clearRequestConfigMaps();
-                try self.setLoadError(@errorName(err));
+                if (self.load_error == null) try self.setLoadError(@errorName(err));
             };
         }
 
@@ -673,24 +673,32 @@ pub const ModelRegistry = struct {
         const io = std.Io.Threaded.global_single_threaded.io();
         const content = std.Io.Dir.cwd().readFileAlloc(io, path, self.allocator, .limited(max_models_json_bytes)) catch |err| switch (err) {
             error.FileNotFound => return,
-            else => |read_error| return read_error,
+            else => |read_error| return self.failModelsJsonLoad(path, @errorName(read_error)),
         };
         defer self.allocator.free(content);
 
         const stripped = try stripJsonCommentsAlloc(self.allocator, content);
         defer self.allocator.free(stripped);
-        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, stripped, .{});
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, stripped, .{}) catch |err| {
+            const message = try std.fmt.allocPrint(
+                self.allocator,
+                "Failed to parse models.json: {s}\n\nFile: {s}",
+                .{ @errorName(err), path },
+            );
+            defer self.allocator.free(message);
+            try self.setLoadError(message);
+            return error.ModelsJsonLoadReported;
+        };
         defer parsed.deinit();
 
-        if (parsed.value != .object) return error.InvalidModelsJson;
+        try self.validateModelsJsonSchema(path, parsed.value);
         const root = parsed.value.object;
-        const providers_value = root.get("providers") orelse return error.InvalidModelsJson;
-        if (providers_value != .object) return error.InvalidModelsJson;
+        const providers_value = root.get("providers").?;
 
         var providers = providers_value.object.iterator();
         while (providers.next()) |entry| {
-            if (entry.value_ptr.* != .object) return error.InvalidModelsJson;
             try self.loadProviderConfig(
+                path,
                 entry.key_ptr.*,
                 entry.value_ptr.object,
                 provider_overrides,
@@ -702,6 +710,7 @@ pub const ModelRegistry = struct {
 
     fn loadProviderConfig(
         self: *ModelRegistry,
+        models_json_path: []const u8,
         provider_name: []const u8,
         object: std.json.ObjectMap,
         provider_overrides: *std.StringHashMap(ProviderOverride),
@@ -755,14 +764,61 @@ pub const ModelRegistry = struct {
             try self.loadModelOverrides(provider_name, model_overrides_value, model_overrides);
         }
 
-        const models_value = object.get("models") orelse return;
-        if (models_value != .array) return error.InvalidModelsJson;
-        if (!isBuiltInProvider(provider_name) and base_url == null) return error.InvalidModelsJson;
-        if (!isBuiltInProvider(provider_name) and api_key == null) return error.InvalidModelsJson;
+        const has_model_overrides = if (object.get("modelOverrides")) |overrides|
+            overrides.object.count() > 0
+        else
+            false;
+        const models_value = object.get("models") orelse {
+            if (base_url == null and
+                object.get("headers") == null and
+                object.get("compat") == null and
+                !has_model_overrides)
+            {
+                const detail = try std.fmt.allocPrint(
+                    self.allocator,
+                    "Provider {s}: must specify \"baseUrl\", \"headers\", \"compat\", \"modelOverrides\", or \"models\".",
+                    .{provider_name},
+                );
+                defer self.allocator.free(detail);
+                return self.failModelsJsonLoad(models_json_path, detail);
+            }
+            return;
+        };
+        if (models_value.array.items.len == 0) {
+            if (base_url == null and object.get("headers") == null and object.get("compat") == null and !has_model_overrides) {
+                const detail = try std.fmt.allocPrint(
+                    self.allocator,
+                    "Provider {s}: must specify \"baseUrl\", \"headers\", \"compat\", \"modelOverrides\", or \"models\".",
+                    .{provider_name},
+                );
+                defer self.allocator.free(detail);
+                return self.failModelsJsonLoad(models_json_path, detail);
+            }
+            return;
+        }
+        if (!isBuiltInProvider(provider_name) and base_url == null) {
+            const detail = try std.fmt.allocPrint(
+                self.allocator,
+                "Provider {s}: \"baseUrl\" is required when defining custom models.",
+                .{provider_name},
+            );
+            defer self.allocator.free(detail);
+            try self.failModelsJsonLoad(models_json_path, detail);
+            unreachable;
+        }
+        if (!isBuiltInProvider(provider_name) and api_key == null) {
+            const detail = try std.fmt.allocPrint(
+                self.allocator,
+                "Provider {s}: \"apiKey\" is required when defining custom models.",
+                .{provider_name},
+            );
+            defer self.allocator.free(detail);
+            try self.failModelsJsonLoad(models_json_path, detail);
+            unreachable;
+        }
 
         for (models_value.array.items) |model_value| {
-            if (model_value != .object) return error.InvalidModelsJson;
-            var model = try self.parseModelDefinition(provider_name, object, model_value.object, api_name, base_url);
+            var model = try self.parseModelDefinition(models_json_path, provider_name, object, model_value.object, api_name, base_url);
             errdefer deinitModel(self.allocator, &model);
             try custom_models.append(self.allocator, model);
         }
@@ -770,6 +826,7 @@ pub const ModelRegistry = struct {
 
     fn parseModelDefinition(
         self: *ModelRegistry,
+        models_json_path: []const u8,
         provider_name: []const u8,
         provider_object: std.json.ObjectMap,
         object: std.json.ObjectMap,
@@ -778,7 +835,16 @@ pub const ModelRegistry = struct {
     ) !ai.Model {
         const id = try requiredString(object, "id");
         const name = try optionalString(object, "name") orelse id;
-        const api_name = (try optionalString(object, "api")) orelse provider_api orelse builtInDefaultApi(provider_name) orelse return error.InvalidModelsJson;
+        const api_name = (try optionalString(object, "api")) orelse provider_api orelse builtInDefaultApi(provider_name) orelse {
+            const detail = try std.fmt.allocPrint(
+                self.allocator,
+                "Provider {s}, model {s}: no \"api\" specified. Set at provider or model level.",
+                .{ provider_name, id },
+            );
+            defer self.allocator.free(detail);
+            try self.failModelsJsonLoad(models_json_path, detail);
+            unreachable;
+        };
         const base_url = (try optionalString(object, "baseUrl")) orelse provider_base_url orelse builtInDefaultBaseUrl(provider_name) orelse return error.InvalidModelsJson;
         const model_headers = try parseHeadersObjectAlloc(self.allocator, object.get("headers"));
         var model_headers_owned = true;
@@ -791,6 +857,27 @@ pub const ModelRegistry = struct {
         defer deinitModelCompat(self.allocator, &model_compat);
         try mergeModelCompat(self.allocator, &compat, model_compat);
 
+        const context_window = optionalPositiveU64(object, "contextWindow") catch {
+            const detail = try std.fmt.allocPrint(
+                self.allocator,
+                "Provider {s}, model {s}: invalid contextWindow",
+                .{ provider_name, id },
+            );
+            defer self.allocator.free(detail);
+            try self.failModelsJsonLoad(models_json_path, detail);
+            unreachable;
+        };
+        const max_tokens = optionalPositiveU64(object, "maxTokens") catch {
+            const detail = try std.fmt.allocPrint(
+                self.allocator,
+                "Provider {s}, model {s}: invalid maxTokens",
+                .{ provider_name, id },
+            );
+            defer self.allocator.free(detail);
+            try self.failModelsJsonLoad(models_json_path, detail);
+            unreachable;
+        };
+
         var model = ai.Model{
             .id = try self.allocator.dupe(u8, id),
             .name = try self.allocator.dupe(u8, name),
@@ -801,8 +888,8 @@ pub const ModelRegistry = struct {
             .thinking_level_map = try parseThinkingLevelMapAlloc(self.allocator, object.get("thinkingLevelMap")),
             .input = try parseInputAlloc(self.allocator, object.get("input")),
             .cost = try parseCost(object.get("cost")),
-            .context_window = try optionalU64(object, "contextWindow") orelse 128_000,
-            .max_tokens = try optionalU64(object, "maxTokens") orelse 16_384,
+            .context_window = context_window orelse 128_000,
+            .max_tokens = max_tokens orelse 16_384,
             .headers = &.{},
             .compat = compat,
         };
@@ -958,9 +1045,282 @@ pub const ModelRegistry = struct {
         self.model_request_headers.clearRetainingCapacity();
     }
 
+    fn validateModelsJsonSchema(self: *ModelRegistry, path: []const u8, value: std.json.Value) !void {
+        if (value != .object) return self.failModelsJsonSchema(path, "root", "Expected object");
+        const providers = value.object.get("providers") orelse
+            return self.failModelsJsonSchema(path, "providers", "Expected required property");
+        if (providers != .object) return self.failModelsJsonSchema(path, "providers", "Expected object");
+
+        var iterator = providers.object.iterator();
+        while (iterator.next()) |entry| {
+            const provider_path = try std.fmt.allocPrint(self.allocator, "providers.{s}", .{entry.key_ptr.*});
+            defer self.allocator.free(provider_path);
+            if (entry.value_ptr.* != .object) {
+                return self.failModelsJsonSchema(path, provider_path, "Expected object");
+            }
+            try self.validateProviderConfigSchema(path, provider_path, entry.value_ptr.object);
+        }
+    }
+
+    fn validateProviderConfigSchema(
+        self: *ModelRegistry,
+        path: []const u8,
+        provider_path: []const u8,
+        object: std.json.ObjectMap,
+    ) !void {
+        const string_fields = [_][]const u8{ "name", "baseUrl", "apiKey", "api" };
+        for (string_fields) |field| try self.validateOptionalNonEmptyStringSchema(path, provider_path, object, field);
+        try self.validateOptionalBoolSchema(path, provider_path, object, "authHeader");
+        try self.validateHeadersSchema(path, provider_path, object.get("headers"), "headers");
+        try self.validateCompatSchema(path, provider_path, object.get("compat"));
+
+        if (object.get("models")) |models| {
+            const models_path = try schemaPathAlloc(self.allocator, provider_path, "models");
+            defer self.allocator.free(models_path);
+            if (models != .array) return self.failModelsJsonSchema(path, models_path, "Expected array");
+            for (models.array.items, 0..) |model, index| {
+                const model_path = try std.fmt.allocPrint(self.allocator, "{s}.{d}", .{ models_path, index });
+                defer self.allocator.free(model_path);
+                if (model != .object) return self.failModelsJsonSchema(path, model_path, "Expected object");
+                try self.validateModelDefinitionSchema(path, model_path, model.object);
+            }
+        }
+
+        if (object.get("modelOverrides")) |overrides| {
+            const overrides_path = try schemaPathAlloc(self.allocator, provider_path, "modelOverrides");
+            defer self.allocator.free(overrides_path);
+            if (overrides != .object) return self.failModelsJsonSchema(path, overrides_path, "Expected object");
+            var iterator = overrides.object.iterator();
+            while (iterator.next()) |entry| {
+                const override_path = try schemaPathAlloc(self.allocator, overrides_path, entry.key_ptr.*);
+                defer self.allocator.free(override_path);
+                if (entry.value_ptr.* != .object) {
+                    return self.failModelsJsonSchema(path, override_path, "Expected object");
+                }
+                try self.validateModelOverrideSchema(path, override_path, entry.value_ptr.object);
+            }
+        }
+    }
+
+    fn validateModelDefinitionSchema(
+        self: *ModelRegistry,
+        path: []const u8,
+        model_path: []const u8,
+        object: std.json.ObjectMap,
+    ) !void {
+        const id = object.get("id") orelse {
+            const field_path = try schemaPathAlloc(self.allocator, model_path, "id");
+            defer self.allocator.free(field_path);
+            return self.failModelsJsonSchema(path, field_path, "Expected required property");
+        };
+        const id_path = try schemaPathAlloc(self.allocator, model_path, "id");
+        defer self.allocator.free(id_path);
+        if (id != .string) return self.failModelsJsonSchema(path, id_path, "Expected string");
+        if (id.string.len == 0) return self.failModelsJsonSchema(path, id_path, "Expected string length greater than or equal to 1");
+
+        const string_fields = [_][]const u8{ "name", "api", "baseUrl" };
+        for (string_fields) |field| try self.validateOptionalNonEmptyStringSchema(path, model_path, object, field);
+        try self.validateOptionalBoolSchema(path, model_path, object, "reasoning");
+        try self.validateInputSchema(path, model_path, object.get("input"));
+        try self.validateCostSchema(path, model_path, object.get("cost"), true);
+        try self.validateOptionalNumberSchema(path, model_path, object, "contextWindow");
+        try self.validateOptionalNumberSchema(path, model_path, object, "maxTokens");
+        try self.validateHeadersSchema(path, model_path, object.get("headers"), "headers");
+        try self.validateThinkingLevelMapSchema(path, model_path, object.get("thinkingLevelMap"));
+        try self.validateCompatSchema(path, model_path, object.get("compat"));
+    }
+
+    fn validateModelOverrideSchema(
+        self: *ModelRegistry,
+        path: []const u8,
+        model_path: []const u8,
+        object: std.json.ObjectMap,
+    ) !void {
+        try self.validateOptionalNonEmptyStringSchema(path, model_path, object, "name");
+        try self.validateOptionalBoolSchema(path, model_path, object, "reasoning");
+        try self.validateInputSchema(path, model_path, object.get("input"));
+        try self.validateCostSchema(path, model_path, object.get("cost"), false);
+        try self.validateOptionalNumberSchema(path, model_path, object, "contextWindow");
+        try self.validateOptionalNumberSchema(path, model_path, object, "maxTokens");
+        try self.validateHeadersSchema(path, model_path, object.get("headers"), "headers");
+        try self.validateThinkingLevelMapSchema(path, model_path, object.get("thinkingLevelMap"));
+        try self.validateCompatSchema(path, model_path, object.get("compat"));
+    }
+
+    fn validateOptionalNonEmptyStringSchema(
+        self: *ModelRegistry,
+        path: []const u8,
+        base_path: []const u8,
+        object: std.json.ObjectMap,
+        field: []const u8,
+    ) !void {
+        const value = object.get(field) orelse return;
+        const field_path = try schemaPathAlloc(self.allocator, base_path, field);
+        defer self.allocator.free(field_path);
+        if (value != .string) return self.failModelsJsonSchema(path, field_path, "Expected string");
+        if (value.string.len == 0) {
+            return self.failModelsJsonSchema(path, field_path, "Expected string length greater than or equal to 1");
+        }
+    }
+
+    fn validateOptionalBoolSchema(
+        self: *ModelRegistry,
+        path: []const u8,
+        base_path: []const u8,
+        object: std.json.ObjectMap,
+        field: []const u8,
+    ) !void {
+        const value = object.get(field) orelse return;
+        if (value == .bool) return;
+        const field_path = try schemaPathAlloc(self.allocator, base_path, field);
+        defer self.allocator.free(field_path);
+        return self.failModelsJsonSchema(path, field_path, "Expected boolean");
+    }
+
+    fn validateOptionalNumberSchema(
+        self: *ModelRegistry,
+        path: []const u8,
+        base_path: []const u8,
+        object: std.json.ObjectMap,
+        field: []const u8,
+    ) !void {
+        const value = object.get(field) orelse return;
+        if (isJsonNumber(value)) return;
+        const field_path = try schemaPathAlloc(self.allocator, base_path, field);
+        defer self.allocator.free(field_path);
+        return self.failModelsJsonSchema(path, field_path, "Expected number");
+    }
+
+    fn validateHeadersSchema(
+        self: *ModelRegistry,
+        path: []const u8,
+        base_path: []const u8,
+        maybe_value: ?std.json.Value,
+        field: []const u8,
+    ) !void {
+        const value = maybe_value orelse return;
+        const field_path = try schemaPathAlloc(self.allocator, base_path, field);
+        defer self.allocator.free(field_path);
+        if (value != .object) return self.failModelsJsonSchema(path, field_path, "Expected object");
+        var iterator = value.object.iterator();
+        while (iterator.next()) |entry| {
+            if (entry.value_ptr.* == .string) continue;
+            const header_path = try schemaPathAlloc(self.allocator, field_path, entry.key_ptr.*);
+            defer self.allocator.free(header_path);
+            return self.failModelsJsonSchema(path, header_path, "Expected string");
+        }
+    }
+
+    fn validateInputSchema(
+        self: *ModelRegistry,
+        path: []const u8,
+        base_path: []const u8,
+        maybe_value: ?std.json.Value,
+    ) !void {
+        const value = maybe_value orelse return;
+        const input_path = try schemaPathAlloc(self.allocator, base_path, "input");
+        defer self.allocator.free(input_path);
+        if (value != .array) return self.failModelsJsonSchema(path, input_path, "Expected array");
+        for (value.array.items, 0..) |entry, index| {
+            const item_path = try std.fmt.allocPrint(self.allocator, "{s}.{d}", .{ input_path, index });
+            defer self.allocator.free(item_path);
+            if (entry != .string or
+                (!std.mem.eql(u8, entry.string, "text") and !std.mem.eql(u8, entry.string, "image")))
+            {
+                return self.failModelsJsonSchema(path, item_path, "Expected 'text' or 'image'");
+            }
+        }
+    }
+
+    fn validateCostSchema(
+        self: *ModelRegistry,
+        path: []const u8,
+        base_path: []const u8,
+        maybe_value: ?std.json.Value,
+        require_all_fields: bool,
+    ) !void {
+        const value = maybe_value orelse return;
+        const cost_path = try schemaPathAlloc(self.allocator, base_path, "cost");
+        defer self.allocator.free(cost_path);
+        if (value != .object) return self.failModelsJsonSchema(path, cost_path, "Expected object");
+
+        const fields = [_][]const u8{ "input", "output", "cacheRead", "cacheWrite" };
+        for (fields) |field| {
+            const maybe_cost = value.object.get(field);
+            if (maybe_cost == null and !require_all_fields) continue;
+            const field_path = try schemaPathAlloc(self.allocator, cost_path, field);
+            defer self.allocator.free(field_path);
+            const cost = maybe_cost orelse return self.failModelsJsonSchema(path, field_path, "Expected required property");
+            if (!isJsonNumber(cost)) return self.failModelsJsonSchema(path, field_path, "Expected number");
+        }
+    }
+
+    fn validateThinkingLevelMapSchema(
+        self: *ModelRegistry,
+        path: []const u8,
+        base_path: []const u8,
+        maybe_value: ?std.json.Value,
+    ) !void {
+        const value = maybe_value orelse return;
+        const map_path = try schemaPathAlloc(self.allocator, base_path, "thinkingLevelMap");
+        defer self.allocator.free(map_path);
+        if (value != .object) return self.failModelsJsonSchema(path, map_path, "Expected object");
+        const fields = [_][]const u8{ "off", "minimal", "low", "medium", "high", "xhigh" };
+        for (fields) |field| {
+            const override = value.object.get(field) orelse continue;
+            if (override == .string or override == .null) continue;
+            const field_path = try schemaPathAlloc(self.allocator, map_path, field);
+            defer self.allocator.free(field_path);
+            return self.failModelsJsonSchema(path, field_path, "Expected string or null");
+        }
+    }
+
+    fn validateCompatSchema(
+        self: *ModelRegistry,
+        path: []const u8,
+        base_path: []const u8,
+        maybe_value: ?std.json.Value,
+    ) !void {
+        const value = maybe_value orelse return;
+        const compat_path = try schemaPathAlloc(self.allocator, base_path, "compat");
+        defer self.allocator.free(compat_path);
+        var compat = parseCompatObjectAlloc(self.allocator, value) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return self.failModelsJsonSchema(path, compat_path, "Expected valid compatibility object"),
+        };
+        deinitModelCompat(self.allocator, &compat);
+    }
+
     fn setLoadError(self: *ModelRegistry, message: []const u8) !void {
         if (self.load_error) |previous| self.allocator.free(previous);
         self.load_error = try self.allocator.dupe(u8, message);
+    }
+
+    fn failModelsJsonLoad(self: *ModelRegistry, path: []const u8, detail: []const u8) !void {
+        const message = try std.fmt.allocPrint(
+            self.allocator,
+            "Failed to load models.json: {s}\n\nFile: {s}",
+            .{ detail, path },
+        );
+        defer self.allocator.free(message);
+        try self.setLoadError(message);
+        return error.ModelsJsonLoadReported;
+    }
+
+    fn failModelsJsonSchema(
+        self: *ModelRegistry,
+        path: []const u8,
+        schema_path: []const u8,
+        detail: []const u8,
+    ) !void {
+        const message = try std.fmt.allocPrint(
+            self.allocator,
+            "Invalid models.json schema:\n  - {s}: {s}\n\nFile: {s}",
+            .{ schema_path, detail, path },
+        );
+        defer self.allocator.free(message);
+        try self.setLoadError(message);
+        return error.ModelsJsonLoadReported;
     }
 };
 
@@ -1500,13 +1860,15 @@ fn cloneDynamicHeaderInputs(
 fn parseInputAlloc(allocator: std.mem.Allocator, maybe_value: ?std.json.Value) ![]const []const u8 {
     const value = maybe_value orelse return cloneStringSlice(allocator, &.{"text"});
     if (value != .array) return error.InvalidModelsJson;
-    if (value.array.items.len == 0) return error.InvalidModelsJson;
 
     var result: std.ArrayList([]const u8) = .empty;
     defer result.deinit(allocator);
     errdefer deinitStringSlice(allocator, result.items);
     for (value.array.items) |entry| {
         if (entry != .string) return error.InvalidModelsJson;
+        if (!std.mem.eql(u8, entry.string, "text") and !std.mem.eql(u8, entry.string, "image")) {
+            return error.InvalidModelsJson;
+        }
         try result.append(allocator, try allocator.dupe(u8, entry.string));
     }
     return try result.toOwnedSlice(allocator);
@@ -1516,10 +1878,10 @@ fn parseCost(maybe_value: ?std.json.Value) !ai.ModelCost {
     const value = maybe_value orelse return .{};
     if (value != .object) return error.InvalidModelsJson;
     return .{
-        .input = try optionalF64(value.object, "input") orelse 0,
-        .output = try optionalF64(value.object, "output") orelse 0,
-        .cache_read = try optionalF64(value.object, "cacheRead") orelse 0,
-        .cache_write = try optionalF64(value.object, "cacheWrite") orelse 0,
+        .input = try requiredF64(value.object, "input"),
+        .output = try requiredF64(value.object, "output"),
+        .cache_read = try requiredF64(value.object, "cacheRead"),
+        .cache_write = try requiredF64(value.object, "cacheWrite"),
     };
 }
 
@@ -1746,8 +2108,14 @@ fn optionalU64(object: std.json.ObjectMap, key: []const u8) !?u64 {
     return switch (value) {
         .integer => |integer| if (integer >= 0) @intCast(integer) else error.InvalidModelsJson,
         .float => |float| if (float >= 0 and @floor(float) == float) @intFromFloat(float) else error.InvalidModelsJson,
+        .number_string => |number| std.fmt.parseInt(u64, number, 10) catch error.InvalidModelsJson,
         else => error.InvalidModelsJson,
     };
+}
+
+fn optionalPositiveU64(object: std.json.ObjectMap, key: []const u8) !?u64 {
+    const value = try optionalU64(object, key) orelse return null;
+    return if (value > 0) value else error.InvalidModelsJson;
 }
 
 fn optionalF64(object: std.json.ObjectMap, key: []const u8) !?f64 {
@@ -1755,8 +2123,17 @@ fn optionalF64(object: std.json.ObjectMap, key: []const u8) !?f64 {
     return switch (value) {
         .integer => |integer| @floatFromInt(integer),
         .float => |float| float,
+        .number_string => |number| std.fmt.parseFloat(f64, number) catch error.InvalidModelsJson,
         else => error.InvalidModelsJson,
     };
+}
+
+fn requiredF64(object: std.json.ObjectMap, key: []const u8) !f64 {
+    return (try optionalF64(object, key)) orelse return error.InvalidModelsJson;
+}
+
+fn schemaPathAlloc(allocator: std.mem.Allocator, base: []const u8, field: []const u8) ![]u8 {
+    return try std.fmt.allocPrint(allocator, "{s}.{s}", .{ base, field });
 }
 
 fn stripJsonCommentsAlloc(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
@@ -2068,6 +2445,102 @@ fn expectJsonBool(json: []const u8, field: []const u8, expected: bool) !void {
     const value = parsed.value.object.get(field) orelse return error.MissingJsonField;
     if (value != .bool) return error.ExpectedJsonBool;
     try std.testing.expectEqual(expected, value.bool);
+}
+
+// Ported from packages/coding-agent/src/core/model-registry.ts models.json
+// schema and additional validation behavior.
+test "model registry reports models.json validation failures and preserves built-ins" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "models.json", .data = "{}" });
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, "models.json", allocator);
+    defer allocator.free(path);
+
+    const Case = struct {
+        content: []const u8,
+        expected: []const u8,
+    };
+    const cases = [_]Case{
+        .{
+            .content = "{\"providers\":",
+            .expected = "Failed to parse models.json:",
+        },
+        .{
+            .content = "{}",
+            .expected = "Invalid models.json schema:\n  - providers: Expected required property",
+        },
+        .{
+            .content = "{\"providers\":{\"demo\":{\"apiKey\":\"\"}}}",
+            .expected = "providers.demo.apiKey: Expected string length greater than or equal to 1",
+        },
+        .{
+            .content = "{\"providers\":{\"demo\":{\"baseUrl\":\"https://example.com\",\"apiKey\":\"key\",\"api\":\"openai-completions\",\"models\":[{\"id\":\"model\",\"input\":[\"audio\"]}]}}}",
+            .expected = "providers.demo.models.0.input.0: Expected 'text' or 'image'",
+        },
+        .{
+            .content = "{\"providers\":{\"demo\":{\"baseUrl\":\"https://example.com\",\"apiKey\":\"key\",\"api\":\"openai-completions\",\"models\":[{\"id\":\"model\",\"cost\":{\"input\":0}}]}}}",
+            .expected = "providers.demo.models.0.cost.output: Expected required property",
+        },
+        .{
+            .content = "{\"providers\":{\"demo\":{}}}",
+            .expected = "Provider demo: must specify \"baseUrl\", \"headers\", \"compat\", \"modelOverrides\", or \"models\".",
+        },
+        .{
+            .content = "{\"providers\":{\"demo\":{\"modelOverrides\":{}}}}",
+            .expected = "Provider demo: must specify \"baseUrl\", \"headers\", \"compat\", \"modelOverrides\", or \"models\".",
+        },
+        .{
+            .content = "{\"providers\":{\"demo\":{\"models\":[{\"id\":\"model\",\"api\":\"openai-completions\"}]}}}",
+            .expected = "Provider demo: \"baseUrl\" is required when defining custom models.",
+        },
+        .{
+            .content = "{\"providers\":{\"demo\":{\"baseUrl\":\"https://example.com\",\"models\":[{\"id\":\"model\",\"api\":\"openai-completions\"}]}}}",
+            .expected = "Provider demo: \"apiKey\" is required when defining custom models.",
+        },
+        .{
+            .content = "{\"providers\":{\"demo\":{\"baseUrl\":\"https://example.com\",\"apiKey\":\"key\",\"models\":[{\"id\":\"model\"}]}}}",
+            .expected = "Provider demo, model model: no \"api\" specified. Set at provider or model level.",
+        },
+        .{
+            .content = "{\"providers\":{\"demo\":{\"baseUrl\":\"https://example.com\",\"apiKey\":\"key\",\"api\":\"openai-completions\",\"models\":[{\"id\":\"model\",\"maxTokens\":0}]}}}",
+            .expected = "Provider demo, model model: invalid maxTokens",
+        },
+    };
+
+    for (cases) |case| {
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "models.json", .data = case.content });
+        var env = std.process.Environ.Map.init(allocator);
+        defer env.deinit();
+        var runner: TestCommandRunner = .{};
+        var harness = try makeTestRegistry(allocator, &env, &runner, path);
+        defer harness.deinit();
+
+        const load_error = harness.registry.getError() orelse return error.ExpectedModelsJsonLoadError;
+        try std.testing.expect(std.mem.indexOf(u8, load_error, case.expected) != null);
+        try std.testing.expect(harness.registry.find("openrouter", "anthropic/claude-sonnet-4") != null);
+    }
+}
+
+test "model registry accepts schema-valid empty custom model input arrays" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    var runner: TestCommandRunner = .{};
+    const content =
+        \\{"providers":{"demo":{"baseUrl":"https://example.com","apiKey":"key","api":"openai-completions","models":[{"id":"model","input":[]}]}}}
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "models.json", .data = content });
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, "models.json", allocator);
+    defer allocator.free(path);
+
+    var harness = try makeTestRegistry(allocator, &env, &runner, path);
+    defer harness.deinit();
+    try std.testing.expectEqual(@as(?[]const u8, null), harness.registry.getError());
+    const model = harness.registry.find("demo", "model") orelse return error.ModelMissing;
+    try std.testing.expectEqual(@as(usize, 0), model.input.len);
 }
 
 // Ported from packages/coding-agent/test/model-registry.test.ts API key resolution cases.
