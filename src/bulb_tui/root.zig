@@ -915,6 +915,729 @@ pub fn applyBackgroundToLine(allocator: std.mem.Allocator, line: []const u8, wid
     return bg_fn(allocator, padded);
 }
 
+pub fn freeRenderedLines(allocator: std.mem.Allocator, lines: [][]u8) void {
+    freeOwnedLines(allocator, lines);
+}
+
+pub const TextStyle = struct {
+    ptr: ?*anyopaque = null,
+    apply_fn: *const fn (?*anyopaque, std.mem.Allocator, []const u8) anyerror![]u8 = identityTextStyle,
+
+    pub fn apply(self: TextStyle, allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+        return self.apply_fn(self.ptr, allocator, text);
+    }
+};
+
+pub const BackgroundStyle = TextStyle;
+
+pub const Component = struct {
+    ptr: *anyopaque,
+    render_fn: *const fn (*anyopaque, std.mem.Allocator, usize) anyerror![][]u8,
+    invalidate_fn: ?*const fn (*anyopaque) void = null,
+
+    pub fn from(comptime T: type, ptr: *T) Component {
+        const Adapter = struct {
+            fn render(raw: *anyopaque, allocator: std.mem.Allocator, width: usize) anyerror![][]u8 {
+                const self: *T = @ptrCast(@alignCast(raw));
+                return self.render(allocator, width);
+            }
+
+            fn invalidate(raw: *anyopaque) void {
+                if (@hasDecl(T, "invalidate")) {
+                    const self: *T = @ptrCast(@alignCast(raw));
+                    self.invalidate();
+                }
+            }
+        };
+
+        return .{
+            .ptr = ptr,
+            .render_fn = Adapter.render,
+            .invalidate_fn = if (@hasDecl(T, "invalidate")) Adapter.invalidate else null,
+        };
+    }
+
+    pub fn render(self: Component, allocator: std.mem.Allocator, width: usize) ![][]u8 {
+        return self.render_fn(self.ptr, allocator, width);
+    }
+
+    pub fn invalidate(self: Component) void {
+        if (self.invalidate_fn) |invalidate_fn| invalidate_fn(self.ptr);
+    }
+};
+
+pub const TruncatedText = struct {
+    allocator: std.mem.Allocator,
+    text: []u8,
+    padding_x: usize = 0,
+    padding_y: usize = 0,
+
+    pub fn init(allocator: std.mem.Allocator, text: []const u8, padding_x: usize, padding_y: usize) !TruncatedText {
+        return .{
+            .allocator = allocator,
+            .text = try allocator.dupe(u8, text),
+            .padding_x = padding_x,
+            .padding_y = padding_y,
+        };
+    }
+
+    pub fn deinit(self: *TruncatedText) void {
+        self.allocator.free(self.text);
+    }
+
+    pub fn invalidate(_: *TruncatedText) void {}
+
+    pub fn render(self: *const TruncatedText, allocator: std.mem.Allocator, width: usize) ![][]u8 {
+        var result: std.ArrayList([]u8) = .empty;
+        errdefer {
+            for (result.items) |line| allocator.free(line);
+            result.deinit(allocator);
+        }
+
+        var top_padding: usize = 0;
+        while (top_padding < self.padding_y) : (top_padding += 1) {
+            try result.append(allocator, try repeatedSpaces(allocator, width));
+        }
+
+        const available_width = contentWidth(width, self.padding_x);
+        const newline_index = std.mem.indexOfScalar(u8, self.text, '\n') orelse self.text.len;
+        const display_text = try truncateToWidth(allocator, self.text[0..newline_index], available_width, "...", false);
+        defer allocator.free(display_text);
+
+        var line: std.ArrayList(u8) = .empty;
+        defer line.deinit(allocator);
+        try appendSpaces(allocator, &line, self.padding_x);
+        try line.appendSlice(allocator, display_text);
+        try appendSpaces(allocator, &line, self.padding_x);
+        const line_visible_width = visibleWidth(line.items);
+        if (line_visible_width < width) try appendSpaces(allocator, &line, width - line_visible_width);
+        try result.append(allocator, try line.toOwnedSlice(allocator));
+
+        var bottom_padding: usize = 0;
+        while (bottom_padding < self.padding_y) : (bottom_padding += 1) {
+            try result.append(allocator, try repeatedSpaces(allocator, width));
+        }
+
+        return result.toOwnedSlice(allocator);
+    }
+};
+
+pub const Text = struct {
+    allocator: std.mem.Allocator,
+    text: []u8,
+    padding_x: usize = 1,
+    padding_y: usize = 1,
+    custom_bg_fn: ?BackgroundStyle = null,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        text: []const u8,
+        padding_x: usize,
+        padding_y: usize,
+        custom_bg_fn: ?BackgroundStyle,
+    ) !Text {
+        return .{
+            .allocator = allocator,
+            .text = try allocator.dupe(u8, text),
+            .padding_x = padding_x,
+            .padding_y = padding_y,
+            .custom_bg_fn = custom_bg_fn,
+        };
+    }
+
+    pub fn deinit(self: *Text) void {
+        self.allocator.free(self.text);
+    }
+
+    pub fn setText(self: *Text, text: []const u8) !void {
+        const next = try self.allocator.dupe(u8, text);
+        self.allocator.free(self.text);
+        self.text = next;
+    }
+
+    pub fn setCustomBgFn(self: *Text, custom_bg_fn: ?BackgroundStyle) void {
+        self.custom_bg_fn = custom_bg_fn;
+    }
+
+    pub fn invalidate(_: *Text) void {}
+
+    pub fn render(self: *const Text, allocator: std.mem.Allocator, width: usize) ![][]u8 {
+        if (self.text.len == 0 or std.mem.trim(u8, self.text, " \t\r\n").len == 0) {
+            return allocator.alloc([]u8, 0);
+        }
+
+        const normalized_text = try replaceTabsWithSpaces(allocator, self.text);
+        defer allocator.free(normalized_text);
+
+        const wrapped_lines = try wrapTextWithAnsi(allocator, normalized_text, contentWidth(width, self.padding_x));
+        defer freeOwnedLines(allocator, wrapped_lines);
+
+        var result: std.ArrayList([]u8) = .empty;
+        errdefer {
+            for (result.items) |line| allocator.free(line);
+            result.deinit(allocator);
+        }
+
+        var top_padding: usize = 0;
+        while (top_padding < self.padding_y) : (top_padding += 1) {
+            try result.append(allocator, try self.applyBg(allocator, "", width));
+        }
+
+        for (wrapped_lines) |wrapped_line| {
+            var line_with_margins: std.ArrayList(u8) = .empty;
+            defer line_with_margins.deinit(allocator);
+            try appendSpaces(allocator, &line_with_margins, self.padding_x);
+            try line_with_margins.appendSlice(allocator, wrapped_line);
+            try appendSpaces(allocator, &line_with_margins, self.padding_x);
+            try result.append(allocator, try self.applyBg(allocator, line_with_margins.items, width));
+        }
+
+        var bottom_padding: usize = 0;
+        while (bottom_padding < self.padding_y) : (bottom_padding += 1) {
+            try result.append(allocator, try self.applyBg(allocator, "", width));
+        }
+
+        if (result.items.len == 0) {
+            try result.append(allocator, try allocator.dupe(u8, ""));
+        }
+
+        return result.toOwnedSlice(allocator);
+    }
+
+    fn applyBg(self: *const Text, allocator: std.mem.Allocator, line: []const u8, width: usize) ![]u8 {
+        if (self.custom_bg_fn) |bg_fn| {
+            return applyBackgroundStyleToLine(allocator, line, width, bg_fn);
+        }
+        return padToWidth(allocator, line, width);
+    }
+};
+
+pub const Box = struct {
+    allocator: std.mem.Allocator,
+    children: std.ArrayList(Component) = .empty,
+    padding_x: usize = 1,
+    padding_y: usize = 1,
+    bg_fn: ?BackgroundStyle = null,
+
+    pub fn init(allocator: std.mem.Allocator, padding_x: usize, padding_y: usize, bg_fn: ?BackgroundStyle) Box {
+        return .{
+            .allocator = allocator,
+            .padding_x = padding_x,
+            .padding_y = padding_y,
+            .bg_fn = bg_fn,
+        };
+    }
+
+    pub fn deinit(self: *Box) void {
+        self.children.deinit(self.allocator);
+    }
+
+    pub fn addChild(self: *Box, component: Component) !void {
+        try self.children.append(self.allocator, component);
+    }
+
+    pub fn removeChild(self: *Box, component: Component) void {
+        for (self.children.items, 0..) |child, index| {
+            if (child.ptr == component.ptr) {
+                _ = self.children.orderedRemove(index);
+                return;
+            }
+        }
+    }
+
+    pub fn clear(self: *Box) void {
+        self.children.clearRetainingCapacity();
+    }
+
+    pub fn setBgFn(self: *Box, bg_fn: ?BackgroundStyle) void {
+        self.bg_fn = bg_fn;
+    }
+
+    pub fn invalidate(self: *Box) void {
+        for (self.children.items) |child| child.invalidate();
+    }
+
+    pub fn render(self: *Box, allocator: std.mem.Allocator, width: usize) ![][]u8 {
+        if (self.children.items.len == 0) return allocator.alloc([]u8, 0);
+
+        const child_width = contentWidth(width, self.padding_x);
+        var child_lines: std.ArrayList([]u8) = .empty;
+        defer {
+            for (child_lines.items) |line| allocator.free(line);
+            child_lines.deinit(allocator);
+        }
+
+        for (self.children.items) |child| {
+            const rendered = try child.render(allocator, child_width);
+            defer freeOwnedLines(allocator, rendered);
+            for (rendered) |line| {
+                var padded_child: std.ArrayList(u8) = .empty;
+                defer padded_child.deinit(allocator);
+                try appendSpaces(allocator, &padded_child, self.padding_x);
+                try padded_child.appendSlice(allocator, line);
+                try child_lines.append(allocator, try padded_child.toOwnedSlice(allocator));
+            }
+        }
+
+        if (child_lines.items.len == 0) return allocator.alloc([]u8, 0);
+
+        var result: std.ArrayList([]u8) = .empty;
+        errdefer {
+            for (result.items) |line| allocator.free(line);
+            result.deinit(allocator);
+        }
+
+        var top_padding: usize = 0;
+        while (top_padding < self.padding_y) : (top_padding += 1) {
+            try result.append(allocator, try self.applyBg(allocator, "", width));
+        }
+
+        for (child_lines.items) |line| {
+            try result.append(allocator, try self.applyBg(allocator, line, width));
+        }
+
+        var bottom_padding: usize = 0;
+        while (bottom_padding < self.padding_y) : (bottom_padding += 1) {
+            try result.append(allocator, try self.applyBg(allocator, "", width));
+        }
+
+        return result.toOwnedSlice(allocator);
+    }
+
+    fn applyBg(self: *const Box, allocator: std.mem.Allocator, line: []const u8, width: usize) ![]u8 {
+        if (self.bg_fn) |bg_fn| {
+            return applyBackgroundStyleToLine(allocator, line, width, bg_fn);
+        }
+        return padToWidth(allocator, line, width);
+    }
+};
+
+pub const SelectItem = struct {
+    value: []const u8,
+    label: []const u8,
+    description: ?[]const u8 = null,
+};
+
+pub const SelectListTheme = struct {
+    selected_prefix: TextStyle = .{},
+    selected_text: TextStyle = .{},
+    description: TextStyle = .{},
+    scroll_info: TextStyle = .{},
+    no_match: TextStyle = .{},
+};
+
+pub const SelectListTruncatePrimaryContext = struct {
+    text: []const u8,
+    max_width: usize,
+    column_width: usize,
+    item: SelectItem,
+    is_selected: bool,
+};
+
+pub const TruncatePrimaryFn = struct {
+    ptr: ?*anyopaque = null,
+    call_fn: *const fn (?*anyopaque, std.mem.Allocator, SelectListTruncatePrimaryContext) anyerror![]u8,
+
+    pub fn call(self: TruncatePrimaryFn, allocator: std.mem.Allocator, context: SelectListTruncatePrimaryContext) ![]u8 {
+        return self.call_fn(self.ptr, allocator, context);
+    }
+};
+
+pub const SelectListLayoutOptions = struct {
+    min_primary_column_width: ?usize = null,
+    max_primary_column_width: ?usize = null,
+    truncate_primary: ?TruncatePrimaryFn = null,
+};
+
+pub const SelectItemCallback = struct {
+    ptr: ?*anyopaque = null,
+    call_fn: *const fn (?*anyopaque, SelectItem) void,
+
+    pub fn call(self: SelectItemCallback, item: SelectItem) void {
+        self.call_fn(self.ptr, item);
+    }
+};
+
+pub const VoidCallback = struct {
+    ptr: ?*anyopaque = null,
+    call_fn: *const fn (?*anyopaque) void,
+
+    pub fn call(self: VoidCallback) void {
+        self.call_fn(self.ptr);
+    }
+};
+
+pub const SelectList = struct {
+    allocator: std.mem.Allocator,
+    items: []OwnedSelectItem,
+    filtered_indices: std.ArrayList(usize),
+    selected_index: usize = 0,
+    max_visible: usize = 5,
+    theme: SelectListTheme,
+    layout: SelectListLayoutOptions,
+    on_select: ?SelectItemCallback = null,
+    on_cancel: ?VoidCallback = null,
+    on_selection_change: ?SelectItemCallback = null,
+
+    const DEFAULT_PRIMARY_COLUMN_WIDTH: usize = 32;
+    const PRIMARY_COLUMN_GAP: usize = 2;
+    const MIN_DESCRIPTION_WIDTH: usize = 10;
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        items: []const SelectItem,
+        max_visible: usize,
+        theme: SelectListTheme,
+        layout: SelectListLayoutOptions,
+    ) !SelectList {
+        var owned_items: std.ArrayList(OwnedSelectItem) = .empty;
+        errdefer {
+            for (owned_items.items) |*item| item.deinit(allocator);
+            owned_items.deinit(allocator);
+        }
+        for (items) |item| {
+            try owned_items.append(allocator, try OwnedSelectItem.clone(allocator, item));
+        }
+
+        var filtered_indices: std.ArrayList(usize) = .empty;
+        errdefer filtered_indices.deinit(allocator);
+        for (items, 0..) |_, index| try filtered_indices.append(allocator, index);
+
+        return .{
+            .allocator = allocator,
+            .items = try owned_items.toOwnedSlice(allocator),
+            .filtered_indices = filtered_indices,
+            .max_visible = max_visible,
+            .theme = theme,
+            .layout = layout,
+        };
+    }
+
+    pub fn deinit(self: *SelectList) void {
+        for (self.items) |*item| item.deinit(self.allocator);
+        self.allocator.free(self.items);
+        self.filtered_indices.deinit(self.allocator);
+    }
+
+    pub fn setFilter(self: *SelectList, filter: []const u8) !void {
+        self.filtered_indices.clearRetainingCapacity();
+        for (self.items, 0..) |item, index| {
+            if (startsWithIgnoreCaseAscii(item.value, filter)) {
+                try self.filtered_indices.append(self.allocator, index);
+            }
+        }
+        self.selected_index = 0;
+    }
+
+    pub fn setSelectedIndex(self: *SelectList, index: usize) void {
+        if (self.filtered_indices.items.len == 0) {
+            self.selected_index = 0;
+            return;
+        }
+        self.selected_index = @min(index, self.filtered_indices.items.len - 1);
+    }
+
+    pub fn invalidate(_: *SelectList) void {}
+
+    pub fn render(self: *SelectList, allocator: std.mem.Allocator, width: usize) ![][]u8 {
+        var lines: std.ArrayList([]u8) = .empty;
+        errdefer {
+            for (lines.items) |line| allocator.free(line);
+            lines.deinit(allocator);
+        }
+
+        if (self.filtered_indices.items.len == 0) {
+            const no_match = try self.theme.no_match.apply(allocator, "  No matching commands");
+            try lines.append(allocator, no_match);
+            return lines.toOwnedSlice(allocator);
+        }
+
+        const primary_column_width = self.getPrimaryColumnWidth();
+        const half_visible = self.max_visible / 2;
+        const max_start = if (self.filtered_indices.items.len > self.max_visible) self.filtered_indices.items.len - self.max_visible else 0;
+        const centered_start = if (self.selected_index > half_visible) self.selected_index - half_visible else 0;
+        const start_index = @min(centered_start, max_start);
+        const end_index = @min(start_index + self.max_visible, self.filtered_indices.items.len);
+
+        var index = start_index;
+        while (index < end_index) : (index += 1) {
+            const item_index = self.filtered_indices.items[index];
+            const item = self.items[item_index].view();
+            const description_single_line = if (item.description) |description|
+                try normalizeToSingleLine(allocator, description)
+            else
+                null;
+            defer if (description_single_line) |description| allocator.free(description);
+
+            try lines.append(allocator, try self.renderItem(
+                allocator,
+                item,
+                index == self.selected_index,
+                width,
+                description_single_line,
+                primary_column_width,
+            ));
+        }
+
+        if (start_index > 0 or end_index < self.filtered_indices.items.len) {
+            const scroll_text = try std.fmt.allocPrint(allocator, "  ({d}/{d})", .{ self.selected_index + 1, self.filtered_indices.items.len });
+            defer allocator.free(scroll_text);
+            const scroll_width = if (width >= PRIMARY_COLUMN_GAP) width - PRIMARY_COLUMN_GAP else 0;
+            const truncated = try truncateToWidth(allocator, scroll_text, scroll_width, "", false);
+            defer allocator.free(truncated);
+            try lines.append(allocator, try self.theme.scroll_info.apply(allocator, truncated));
+        }
+
+        return lines.toOwnedSlice(allocator);
+    }
+
+    pub fn handleInput(self: *SelectList, allocator: std.mem.Allocator, key_data: []const u8) !void {
+        if (self.filtered_indices.items.len == 0) return;
+
+        const manager = try keybindings.getKeybindings(allocator);
+        if (manager.matches(key_data, "tui.select.up")) {
+            self.selected_index = if (self.selected_index == 0) self.filtered_indices.items.len - 1 else self.selected_index - 1;
+            self.notifySelectionChange();
+        } else if (manager.matches(key_data, "tui.select.down")) {
+            self.selected_index = if (self.selected_index == self.filtered_indices.items.len - 1) 0 else self.selected_index + 1;
+            self.notifySelectionChange();
+        } else if (manager.matches(key_data, "tui.select.confirm")) {
+            if (self.on_select) |callback| callback.call(self.items[self.filtered_indices.items[self.selected_index]].view());
+        } else if (manager.matches(key_data, "tui.select.cancel")) {
+            if (self.on_cancel) |callback| callback.call();
+        }
+    }
+
+    pub fn getSelectedItem(self: *const SelectList) ?SelectItem {
+        if (self.filtered_indices.items.len == 0) return null;
+        return self.items[self.filtered_indices.items[self.selected_index]].view();
+    }
+
+    fn renderItem(
+        self: *const SelectList,
+        allocator: std.mem.Allocator,
+        item: SelectItem,
+        is_selected: bool,
+        width: usize,
+        description_single_line: ?[]const u8,
+        primary_column_width: usize,
+    ) ![]u8 {
+        const prefix = if (is_selected) "\u{2192} " else "  ";
+        const prefix_width = visibleWidth(prefix);
+
+        if (description_single_line) |description_text| {
+            if (width > 40) {
+                const available_primary = if (width > prefix_width + 4) width - prefix_width - 4 else 0;
+                const effective_primary_column_width = @max(@as(usize, 1), @min(primary_column_width, available_primary));
+                const max_primary_width = if (effective_primary_column_width > PRIMARY_COLUMN_GAP)
+                    effective_primary_column_width - PRIMARY_COLUMN_GAP
+                else
+                    1;
+                const truncated_value = try self.truncatePrimary(allocator, item, is_selected, max_primary_width, effective_primary_column_width);
+                defer allocator.free(truncated_value);
+
+                const truncated_value_width = visibleWidth(truncated_value);
+                const spacing_width = @max(@as(usize, 1), effective_primary_column_width -| truncated_value_width);
+                const description_start = prefix_width + truncated_value_width + spacing_width;
+                const remaining_width = if (width > description_start + PRIMARY_COLUMN_GAP) width - description_start - PRIMARY_COLUMN_GAP else 0;
+
+                if (remaining_width > MIN_DESCRIPTION_WIDTH) {
+                    const truncated_description = try truncateToWidth(allocator, description_text, remaining_width, "", false);
+                    defer allocator.free(truncated_description);
+
+                    var line: std.ArrayList(u8) = .empty;
+                    defer line.deinit(allocator);
+                    try line.appendSlice(allocator, prefix);
+                    try line.appendSlice(allocator, truncated_value);
+                    try appendSpaces(allocator, &line, spacing_width);
+                    if (is_selected) {
+                        try line.appendSlice(allocator, truncated_description);
+                        return self.theme.selected_text.apply(allocator, line.items);
+                    }
+
+                    const desc_text = try std.mem.concat(allocator, u8, &.{ line.items[prefix.len + truncated_value.len ..], truncated_description });
+                    defer allocator.free(desc_text);
+                    const styled_description = try self.theme.description.apply(allocator, desc_text);
+                    defer allocator.free(styled_description);
+
+                    var unselected: std.ArrayList(u8) = .empty;
+                    errdefer unselected.deinit(allocator);
+                    try unselected.appendSlice(allocator, prefix);
+                    try unselected.appendSlice(allocator, truncated_value);
+                    try unselected.appendSlice(allocator, styled_description);
+                    return unselected.toOwnedSlice(allocator);
+                }
+            }
+        }
+
+        const max_width = if (width > prefix_width + PRIMARY_COLUMN_GAP) width - prefix_width - PRIMARY_COLUMN_GAP else 0;
+        const truncated_value = try self.truncatePrimary(allocator, item, is_selected, max_width, max_width);
+        defer allocator.free(truncated_value);
+
+        const line = try std.mem.concat(allocator, u8, &.{ prefix, truncated_value });
+        defer allocator.free(line);
+        if (is_selected) return self.theme.selected_text.apply(allocator, line);
+        return allocator.dupe(u8, line);
+    }
+
+    fn getPrimaryColumnWidth(self: *const SelectList) usize {
+        const bounds = self.getPrimaryColumnBounds();
+        var widest_primary: usize = 0;
+        for (self.filtered_indices.items) |item_index| {
+            const item = self.items[item_index].view();
+            widest_primary = @max(widest_primary, visibleWidth(displayValue(item)) + PRIMARY_COLUMN_GAP);
+        }
+        return clampUsize(widest_primary, bounds.min, bounds.max);
+    }
+
+    fn getPrimaryColumnBounds(self: *const SelectList) struct { min: usize, max: usize } {
+        const raw_min = self.layout.min_primary_column_width orelse
+            (self.layout.max_primary_column_width orelse DEFAULT_PRIMARY_COLUMN_WIDTH);
+        const raw_max = self.layout.max_primary_column_width orelse
+            (self.layout.min_primary_column_width orelse DEFAULT_PRIMARY_COLUMN_WIDTH);
+        return .{
+            .min = @max(@as(usize, 1), @min(raw_min, raw_max)),
+            .max = @max(@as(usize, 1), @max(raw_min, raw_max)),
+        };
+    }
+
+    fn truncatePrimary(
+        self: *const SelectList,
+        allocator: std.mem.Allocator,
+        item: SelectItem,
+        is_selected: bool,
+        max_width: usize,
+        column_width: usize,
+    ) ![]u8 {
+        const display_value = displayValue(item);
+        const truncated_value = if (self.layout.truncate_primary) |truncate_primary|
+            try truncate_primary.call(allocator, .{
+                .text = display_value,
+                .max_width = max_width,
+                .column_width = column_width,
+                .item = item,
+                .is_selected = is_selected,
+            })
+        else
+            try truncateToWidth(allocator, display_value, max_width, "", false);
+        defer allocator.free(truncated_value);
+
+        return truncateToWidth(allocator, truncated_value, max_width, "", false);
+    }
+
+    fn notifySelectionChange(self: *SelectList) void {
+        if (self.on_selection_change) |callback| {
+            if (self.getSelectedItem()) |item| callback.call(item);
+        }
+    }
+};
+
+const OwnedSelectItem = struct {
+    value: []u8,
+    label: []u8,
+    description: ?[]u8 = null,
+
+    fn clone(allocator: std.mem.Allocator, item: SelectItem) !OwnedSelectItem {
+        const value = try allocator.dupe(u8, item.value);
+        errdefer allocator.free(value);
+        const label = try allocator.dupe(u8, item.label);
+        errdefer allocator.free(label);
+        const description = if (item.description) |description_text|
+            try allocator.dupe(u8, description_text)
+        else
+            null;
+
+        return .{
+            .value = value,
+            .label = label,
+            .description = description,
+        };
+    }
+
+    fn deinit(self: *OwnedSelectItem, allocator: std.mem.Allocator) void {
+        allocator.free(self.value);
+        allocator.free(self.label);
+        if (self.description) |description| allocator.free(description);
+    }
+
+    fn view(self: *const OwnedSelectItem) SelectItem {
+        return .{
+            .value = self.value,
+            .label = self.label,
+            .description = self.description,
+        };
+    }
+};
+
+fn identityTextStyle(_: ?*anyopaque, allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    return allocator.dupe(u8, text);
+}
+
+fn applyBackgroundStyleToLine(allocator: std.mem.Allocator, line: []const u8, width: usize, bg_fn: BackgroundStyle) ![]u8 {
+    const padded = try padToWidth(allocator, line, width);
+    defer allocator.free(padded);
+    return bg_fn.apply(allocator, padded);
+}
+
+fn contentWidth(width: usize, padding_x: usize) usize {
+    const horizontal_padding = std.math.mul(usize, padding_x, 2) catch std.math.maxInt(usize);
+    if (width > horizontal_padding) return width - horizontal_padding;
+    return 1;
+}
+
+fn replaceTabsWithSpaces(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(allocator);
+    for (text) |byte| {
+        if (byte == '\t') {
+            try output.appendSlice(allocator, "   ");
+        } else {
+            try output.append(allocator, byte);
+        }
+    }
+    return output.toOwnedSlice(allocator);
+}
+
+fn normalizeToSingleLine(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(allocator);
+
+    var in_newline_run = false;
+    for (text) |byte| {
+        if (byte == '\r' or byte == '\n') {
+            if (!in_newline_run) {
+                try output.append(allocator, ' ');
+                in_newline_run = true;
+            }
+        } else {
+            try output.append(allocator, byte);
+            in_newline_run = false;
+        }
+    }
+
+    const trimmed = std.mem.trim(u8, output.items, " \t\r\n");
+    const result = try allocator.dupe(u8, trimmed);
+    output.deinit(allocator);
+    return result;
+}
+
+fn startsWithIgnoreCaseAscii(text: []const u8, prefix: []const u8) bool {
+    if (prefix.len > text.len) return false;
+    for (prefix, 0..) |byte, index| {
+        if (std.ascii.toLower(text[index]) != std.ascii.toLower(byte)) return false;
+    }
+    return true;
+}
+
+fn clampUsize(value: usize, min: usize, max: usize) usize {
+    return @max(min, @min(value, max));
+}
+
+fn displayValue(item: SelectItem) []const u8 {
+    if (item.label.len > 0) return item.label;
+    return item.value;
+}
+
 fn updateTrackerFromText(text: []const u8, tracker: *AnsiCodeTracker) void {
     var index: usize = 0;
     while (index < text.len) {
@@ -1478,6 +2201,252 @@ test "slice helpers preserve ANSI and widths" {
     defer segments.deinit(allocator);
     try std.testing.expectEqualStrings("\x1b[31mab", segments.before);
     try std.testing.expectEqualStrings("\x1b[31mef", segments.after);
+}
+
+test "TruncatedText pads output lines to exactly match width" {
+    const allocator = std.testing.allocator;
+    var text = try TruncatedText.init(allocator, "Hello world", 1, 0);
+    defer text.deinit();
+
+    const lines = try text.render(allocator, 50);
+    defer freeRenderedLines(allocator, lines);
+
+    try std.testing.expectEqual(@as(usize, 1), lines.len);
+    try std.testing.expectEqual(@as(usize, 50), visibleWidth(lines[0]));
+}
+
+test "TruncatedText pads output with vertical padding lines to width" {
+    const allocator = std.testing.allocator;
+    var text = try TruncatedText.init(allocator, "Hello", 0, 2);
+    defer text.deinit();
+
+    const lines = try text.render(allocator, 40);
+    defer freeRenderedLines(allocator, lines);
+
+    try std.testing.expectEqual(@as(usize, 5), lines.len);
+    for (lines) |line| try std.testing.expectEqual(@as(usize, 40), visibleWidth(line));
+}
+
+test "TruncatedText truncates long text and pads to width" {
+    const allocator = std.testing.allocator;
+    const long_text = "This is a very long piece of text that will definitely exceed the available width";
+    var text = try TruncatedText.init(allocator, long_text, 1, 0);
+    defer text.deinit();
+
+    const lines = try text.render(allocator, 30);
+    defer freeRenderedLines(allocator, lines);
+
+    try std.testing.expectEqual(@as(usize, 1), lines.len);
+    try std.testing.expectEqual(@as(usize, 30), visibleWidth(lines[0]));
+    try std.testing.expect(std.mem.indexOf(u8, lines[0], "...") != null);
+}
+
+test "TruncatedText preserves ANSI codes in output and pads correctly" {
+    const allocator = std.testing.allocator;
+    var text = try TruncatedText.init(allocator, "\x1b[31mHello\x1b[0m \x1b[34mworld\x1b[0m", 1, 0);
+    defer text.deinit();
+
+    const lines = try text.render(allocator, 40);
+    defer freeRenderedLines(allocator, lines);
+
+    try std.testing.expectEqual(@as(usize, 1), lines.len);
+    try std.testing.expectEqual(@as(usize, 40), visibleWidth(lines[0]));
+    try std.testing.expect(std.mem.indexOf(u8, lines[0], "\x1b[") != null);
+}
+
+test "TruncatedText truncates styled text and adds reset code before ellipsis" {
+    const allocator = std.testing.allocator;
+    var text = try TruncatedText.init(allocator, "\x1b[31mThis is a very long red text that will be truncated\x1b[0m", 1, 0);
+    defer text.deinit();
+
+    const lines = try text.render(allocator, 20);
+    defer freeRenderedLines(allocator, lines);
+
+    try std.testing.expectEqual(@as(usize, 1), lines.len);
+    try std.testing.expectEqual(@as(usize, 20), visibleWidth(lines[0]));
+    try std.testing.expect(std.mem.indexOf(u8, lines[0], "\x1b[0m...") != null);
+}
+
+test "TruncatedText handles fitting, empty, and multiline text" {
+    const allocator = std.testing.allocator;
+
+    var fitting = try TruncatedText.init(allocator, "Hello world", 1, 0);
+    defer fitting.deinit();
+    const fitting_lines = try fitting.render(allocator, 30);
+    defer freeRenderedLines(allocator, fitting_lines);
+    try std.testing.expectEqual(@as(usize, 30), visibleWidth(fitting_lines[0]));
+    try std.testing.expect(std.mem.indexOf(u8, fitting_lines[0], "...") == null);
+
+    var empty = try TruncatedText.init(allocator, "", 1, 0);
+    defer empty.deinit();
+    const empty_lines = try empty.render(allocator, 30);
+    defer freeRenderedLines(allocator, empty_lines);
+    try std.testing.expectEqual(@as(usize, 30), visibleWidth(empty_lines[0]));
+
+    var multiline = try TruncatedText.init(allocator, "First line\nSecond line\nThird line", 1, 0);
+    defer multiline.deinit();
+    const multiline_lines = try multiline.render(allocator, 40);
+    defer freeRenderedLines(allocator, multiline_lines);
+    try std.testing.expect(std.mem.indexOf(u8, multiline_lines[0], "First line") != null);
+    try std.testing.expect(std.mem.indexOf(u8, multiline_lines[0], "Second line") == null);
+
+    var long_multiline = try TruncatedText.init(allocator, "This is a very long first line that needs truncation\nSecond line", 1, 0);
+    defer long_multiline.deinit();
+    const long_lines = try long_multiline.render(allocator, 25);
+    defer freeRenderedLines(allocator, long_lines);
+    try std.testing.expectEqual(@as(usize, 25), visibleWidth(long_lines[0]));
+    try std.testing.expect(std.mem.indexOf(u8, long_lines[0], "...") != null);
+    try std.testing.expect(std.mem.indexOf(u8, long_lines[0], "Second line") == null);
+}
+
+test "Text and Box render wrapped padded component output" {
+    const allocator = std.testing.allocator;
+    var text = try Text.init(allocator, "Hello\tworld this wraps", 1, 1, null);
+    defer text.deinit();
+
+    const text_lines = try text.render(allocator, 14);
+    defer freeRenderedLines(allocator, text_lines);
+    try std.testing.expect(text_lines.len > 2);
+    for (text_lines) |line| try std.testing.expectEqual(@as(usize, 14), visibleWidth(line));
+
+    var box = Box.init(allocator, 1, 1, null);
+    defer box.deinit();
+    try box.addChild(Component.from(Text, &text));
+    const box_lines = try box.render(allocator, 18);
+    defer freeRenderedLines(allocator, box_lines);
+    try std.testing.expect(box_lines.len > text_lines.len);
+    for (box_lines) |line| try std.testing.expectEqual(@as(usize, 18), visibleWidth(line));
+}
+
+fn visibleIndexOf(line: []const u8, text: []const u8) !usize {
+    const index = std.mem.indexOf(u8, line, text) orelse return error.NotFound;
+    return visibleWidth(line[0..index]);
+}
+
+test "SelectList normalizes multiline descriptions to single line" {
+    const allocator = std.testing.allocator;
+    const items = [_]SelectItem{.{
+        .value = "test",
+        .label = "test",
+        .description = "Line one\nLine two\nLine three",
+    }};
+    var list = try SelectList.init(allocator, &items, 5, .{}, .{});
+    defer list.deinit();
+
+    const rendered = try list.render(allocator, 100);
+    defer freeRenderedLines(allocator, rendered);
+
+    try std.testing.expect(rendered.len > 0);
+    try std.testing.expect(std.mem.indexOfScalar(u8, rendered[0], '\n') == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered[0], "Line one Line two Line three") != null);
+}
+
+test "SelectList keeps descriptions aligned when the primary text is truncated" {
+    const allocator = std.testing.allocator;
+    const items = [_]SelectItem{
+        .{ .value = "short", .label = "short", .description = "short description" },
+        .{
+            .value = "very-long-command-name-that-needs-truncation",
+            .label = "very-long-command-name-that-needs-truncation",
+            .description = "long description",
+        },
+    };
+    var list = try SelectList.init(allocator, &items, 5, .{}, .{});
+    defer list.deinit();
+
+    const rendered = try list.render(allocator, 80);
+    defer freeRenderedLines(allocator, rendered);
+
+    try std.testing.expectEqual(try visibleIndexOf(rendered[0], "short description"), try visibleIndexOf(rendered[1], "long description"));
+}
+
+test "SelectList uses configured minimum and maximum primary column widths" {
+    const allocator = std.testing.allocator;
+    const min_items = [_]SelectItem{
+        .{ .value = "a", .label = "a", .description = "first" },
+        .{ .value = "bb", .label = "bb", .description = "second" },
+    };
+    var min_list = try SelectList.init(allocator, &min_items, 5, .{}, .{
+        .min_primary_column_width = 12,
+        .max_primary_column_width = 20,
+    });
+    defer min_list.deinit();
+    const min_rendered = try min_list.render(allocator, 80);
+    defer freeRenderedLines(allocator, min_rendered);
+    try std.testing.expectEqual(@as(usize, 14), try visibleIndexOf(min_rendered[0], "first"));
+    try std.testing.expectEqual(@as(usize, 14), try visibleIndexOf(min_rendered[1], "second"));
+
+    const max_items = [_]SelectItem{
+        .{
+            .value = "very-long-command-name-that-needs-truncation",
+            .label = "very-long-command-name-that-needs-truncation",
+            .description = "first",
+        },
+        .{ .value = "short", .label = "short", .description = "second" },
+    };
+    var max_list = try SelectList.init(allocator, &max_items, 5, .{}, .{
+        .min_primary_column_width = 12,
+        .max_primary_column_width = 20,
+    });
+    defer max_list.deinit();
+    const max_rendered = try max_list.render(allocator, 80);
+    defer freeRenderedLines(allocator, max_rendered);
+    try std.testing.expectEqual(@as(usize, 22), try visibleIndexOf(max_rendered[0], "first"));
+    try std.testing.expectEqual(@as(usize, 22), try visibleIndexOf(max_rendered[1], "second"));
+}
+
+fn ellipsisTruncate(_: ?*anyopaque, allocator: std.mem.Allocator, context: SelectListTruncatePrimaryContext) ![]u8 {
+    if (context.text.len <= context.max_width) return allocator.dupe(u8, context.text);
+    const prefix_len = if (context.max_width > 0) context.max_width - 1 else 0;
+    return std.mem.concat(allocator, u8, &.{ context.text[0..@min(prefix_len, context.text.len)], "…" });
+}
+
+test "SelectList allows overriding primary truncation while preserving description alignment" {
+    const allocator = std.testing.allocator;
+    const items = [_]SelectItem{
+        .{
+            .value = "very-long-command-name-that-needs-truncation",
+            .label = "very-long-command-name-that-needs-truncation",
+            .description = "first",
+        },
+        .{ .value = "short", .label = "short", .description = "second" },
+    };
+    var list = try SelectList.init(allocator, &items, 5, .{}, .{
+        .min_primary_column_width = 12,
+        .max_primary_column_width = 12,
+        .truncate_primary = .{ .call_fn = ellipsisTruncate },
+    });
+    defer list.deinit();
+
+    const rendered = try list.render(allocator, 80);
+    defer freeRenderedLines(allocator, rendered);
+
+    try std.testing.expect(std.mem.indexOf(u8, rendered[0], "…") != null);
+    try std.testing.expectEqual(try visibleIndexOf(rendered[0], "first"), try visibleIndexOf(rendered[1], "second"));
+}
+
+test "SelectList filters, wraps selection input, and reports no matches" {
+    const allocator = std.testing.allocator;
+    defer keybindings.resetGlobalKeybindings(allocator);
+
+    const items = [_]SelectItem{
+        .{ .value = "alpha", .label = "alpha" },
+        .{ .value = "beta", .label = "beta" },
+    };
+    var list = try SelectList.init(allocator, &items, 5, .{}, .{});
+    defer list.deinit();
+
+    try list.handleInput(allocator, "\x1b[B");
+    try std.testing.expectEqualStrings("beta", list.getSelectedItem().?.value);
+    try list.handleInput(allocator, "\x1b[B");
+    try std.testing.expectEqualStrings("alpha", list.getSelectedItem().?.value);
+
+    try list.setFilter("zzz");
+    try std.testing.expectEqual(@as(?SelectItem, null), list.getSelectedItem());
+    const rendered = try list.render(allocator, 40);
+    defer freeRenderedLines(allocator, rendered);
+    try std.testing.expectEqual(@as(usize, 1), rendered.len);
+    try std.testing.expectEqualStrings("  No matching commands", rendered[0]);
 }
 
 test {
