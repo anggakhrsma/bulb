@@ -750,15 +750,15 @@ packages/tui/src/fuzzy.ts	bulb_tui	source	implemented	src/bulb_tui/fuzzy.zig	Nat
 packages/tui/src/index.ts	bulb_tui	source	pending		
 packages/tui/src/keybindings.ts	bulb_tui	source	implemented	src/bulb_tui/keybindings.zig	Native default keybinding registry, ordered user overrides, duplicate normalization, conflict reporting, resolved config output, and global default-manager foundations ported
 packages/tui/src/keys.ts	bulb_tui	source	implemented	src/bulb_tui/keys.zig	Kitty CSI-u alternate-layout/event parsing, xterm modifyOtherKeys, legacy navigation/function/modifier sequences, printable decoders, release/repeat helpers, Windows Terminal backspace env heuristic, and key matching ported
-packages/tui/src/kill-ring.ts	bulb_tui	source	pending		
+packages/tui/src/kill-ring.ts	bulb_tui	source	implemented	src/bulb_tui/kill_ring.zig	Native kill ring push, peek, rotate, and lifetime behavior ported
 packages/tui/src/native-modifiers.ts	bulb_tui	source	pending		
-packages/tui/src/stdin-buffer.ts	bulb_tui	source	pending		
+packages/tui/src/stdin-buffer.ts	bulb_tui	source	implemented	src/bulb_tui/stdin_buffer.zig	Native buffered input parsing, bracketed paste handling, old-style mouse splitting, kitty duplicate suppression, and timeout flushing ported
 packages/tui/src/terminal-image.ts	bulb_tui	source	pending		
 packages/tui/src/terminal.ts	bulb_tui	source	pending		
 packages/tui/src/tui.ts	bulb_tui	source	pending		
-packages/tui/src/undo-stack.ts	bulb_tui	source	pending		
+packages/tui/src/undo-stack.ts	bulb_tui	source	implemented	src/bulb_tui/undo_stack.zig	Native clonable undo stack with explicit deinit hooks ported
 packages/tui/src/utils.ts	bulb_tui	source	implemented	src/bulb_tui/root.zig	Native visible width, ANSI/OSC/APC extraction, terminal normalization, ANSI-aware wrapping/truncation, slice helpers, SGR state tracking, OSC 8 hyperlink continuation, and regional-indicator/emoji width handling ported
-packages/tui/src/word-navigation.ts	bulb_tui	source	pending		
+packages/tui/src/word-navigation.ts	bulb_tui	source	implemented	src/bulb_tui/word_navigation.zig	Native forward/backward word navigation and atomic segment handling ported
 packages/tui/test/autocomplete.test.ts	bulb_tui	test	implemented	src/bulb_tui/autocomplete.zig	Upstream path-prefix extraction, fuzzy @ attachment, scoped full-path search, hidden/.git filtering, symlink, quoted path, dot-slash, and apply-completion regressions ported with a native walker
 packages/tui/test/bug-regression-isimageline-startswith-bug.test.ts	bulb_tui	test	pending		
 packages/tui/test/chat-simple.ts	bulb_tui	test	pending		
@@ -775,7 +775,7 @@ packages/tui/test/overlay-options.test.ts	bulb_tui	test	pending
 packages/tui/test/overlay-short-content.test.ts	bulb_tui	test	pending		
 packages/tui/test/regression-regional-indicator-width.test.ts	bulb_tui	test	implemented	src/bulb_tui/root.zig	Upstream regional-indicator singleton, flag-pair, partial-list wrapping, and streaming emoji width regressions ported
 packages/tui/test/select-list.test.ts	bulb_tui	test	implemented	src/bulb_tui/root.zig	Upstream multiline-description normalization, description alignment, primary-column bounds, and custom truncation regressions ported
-packages/tui/test/stdin-buffer.test.ts	bulb_tui	test	pending		
+packages/tui/test/stdin-buffer.test.ts	bulb_tui	test	implemented	src/bulb_tui/stdin_buffer.zig	Upstream buffered input, mouse splitting, kitty duplicate suppression, flush, clear, bracketed paste, and destroy regressions ported
 packages/tui/test/terminal-image.test.ts	bulb_tui	test	pending		
 packages/tui/test/terminal.test.ts	bulb_tui	test	pending		
 packages/tui/test/test-themes.ts	bulb_tui	test	pending		
@@ -786,7 +786,7 @@ packages/tui/test/tui-overlay-style-leak.test.ts	bulb_tui	test	pending
 packages/tui/test/tui-render.test.ts	bulb_tui	test	pending		
 packages/tui/test/viewport-overwrite-repro.ts	bulb_tui	test	pending		
 packages/tui/test/virtual-terminal.ts	bulb_tui	test	pending		
-packages/tui/test/word-navigation.test.ts	bulb_tui	test	pending		
+packages/tui/test/word-navigation.test.ts	bulb_tui	test	implemented	src/bulb_tui/word_navigation.zig	Upstream word-boundary backward/forward and punctuation regression coverage ported
 packages/tui/test/wrap-ansi.test.ts	bulb_tui	test	implemented	src/bulb_tui/root.zig	Upstream ANSI wrapping, underline/background preservation, trailing whitespace trimming, OSC marker width, color continuation, and OSC 8 hyperlink continuation regressions ported
 packages/tui/tsconfig.build.json	bulb_tui	source	pending		
 packages/tui/vitest.config.ts	bulb_tui	source	pending		

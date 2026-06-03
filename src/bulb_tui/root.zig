@@ -4,6 +4,10 @@ pub const keys = @import("keys.zig");
 pub const keybindings = @import("keybindings.zig");
 pub const fuzzy = @import("fuzzy.zig");
 pub const autocomplete = @import("autocomplete.zig");
+pub const word_navigation = @import("word_navigation.zig");
+pub const kill_ring = @import("kill_ring.zig");
+pub const undo_stack = @import("undo_stack.zig");
+pub const stdin_buffer = @import("stdin_buffer.zig");
 
 const ESC: u8 = 0x1b;
 const BEL: u8 = 0x07;
@@ -2456,4 +2460,8 @@ test {
     _ = @import("keybindings.zig");
     _ = @import("fuzzy.zig");
     _ = @import("autocomplete.zig");
+    _ = @import("word_navigation.zig");
+    _ = @import("kill_ring.zig");
+    _ = @import("undo_stack.zig");
+    _ = @import("stdin_buffer.zig");
 }
