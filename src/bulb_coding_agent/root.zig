@@ -6,6 +6,7 @@ pub const config = @import("config.zig");
 pub const resolve_config_value = @import("resolve_config_value.zig");
 pub const auth_storage = @import("auth_storage.zig");
 pub const json = @import("json.zig");
+pub const keybindings = @import("keybindings.zig");
 pub const mime = @import("mime.zig");
 pub const model_registry = @import("model_registry.zig");
 pub const model_resolver = @import("model_resolver.zig");
@@ -27,6 +28,7 @@ test {
     _ = @import("resolve_config_value.zig");
     _ = @import("auth_storage.zig");
     _ = @import("json.zig");
+    _ = @import("keybindings.zig");
     _ = @import("mime.zig");
     _ = @import("model_registry.zig");
     _ = @import("model_resolver.zig");

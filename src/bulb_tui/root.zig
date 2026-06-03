@@ -1,5 +1,8 @@
 const std = @import("std");
 
+pub const keys = @import("keys.zig");
+pub const keybindings = @import("keybindings.zig");
+
 pub fn visibleWidth(input: []const u8) usize {
     var index: usize = 0;
     var width: usize = 0;
@@ -135,4 +138,9 @@ test "visible width keeps streaming emoji intermediates stable" {
     for (samples) |sample| {
         try std.testing.expectEqual(@as(usize, 2), visibleWidth(sample));
     }
+}
+
+test {
+    _ = @import("keys.zig");
+    _ = @import("keybindings.zig");
 }
