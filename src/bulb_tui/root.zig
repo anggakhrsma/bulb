@@ -2,6 +2,8 @@ const std = @import("std");
 
 pub const keys = @import("keys.zig");
 pub const keybindings = @import("keybindings.zig");
+pub const fuzzy = @import("fuzzy.zig");
+pub const autocomplete = @import("autocomplete.zig");
 
 const ESC: u8 = 0x1b;
 const BEL: u8 = 0x07;
@@ -2452,4 +2454,6 @@ test "SelectList filters, wraps selection input, and reports no matches" {
 test {
     _ = @import("keys.zig");
     _ = @import("keybindings.zig");
+    _ = @import("fuzzy.zig");
+    _ = @import("autocomplete.zig");
 }
