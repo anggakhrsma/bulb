@@ -8,6 +8,8 @@ pub const word_navigation = @import("word_navigation.zig");
 pub const kill_ring = @import("kill_ring.zig");
 pub const undo_stack = @import("undo_stack.zig");
 pub const stdin_buffer = @import("stdin_buffer.zig");
+pub const terminal_image = @import("terminal_image.zig");
+pub const native_modifiers = @import("native_modifiers.zig");
 
 const ESC: u8 = 0x1b;
 const BEL: u8 = 0x07;
@@ -1151,6 +1153,165 @@ pub const Spacer = struct {
     }
 };
 
+pub const ImageTheme = struct {
+    fallback_color: TextStyle = .{},
+};
+
+pub const ImageOptions = struct {
+    max_width_cells: ?usize = null,
+    max_height_cells: ?usize = null,
+    filename: ?[]const u8 = null,
+    image_id: ?u32 = null,
+};
+
+pub const Image = struct {
+    allocator: std.mem.Allocator,
+    base64_data: []u8,
+    mime_type: []u8,
+    dimensions: terminal_image.ImageDimensions,
+    theme: ImageTheme,
+    options: ImageOptions,
+    owned_filename: ?[]u8 = null,
+    image_id: ?u32 = null,
+    cached_lines: ?[][]u8 = null,
+    cached_width: ?usize = null,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        base64_data: []const u8,
+        mime_type: []const u8,
+        theme: ImageTheme,
+        options: ImageOptions,
+        dimensions: ?terminal_image.ImageDimensions,
+    ) !Image {
+        const owned_base64 = try allocator.dupe(u8, base64_data);
+        errdefer allocator.free(owned_base64);
+        const owned_mime = try allocator.dupe(u8, mime_type);
+        errdefer allocator.free(owned_mime);
+        const owned_filename = if (options.filename) |filename|
+            try allocator.dupe(u8, filename)
+        else
+            null;
+        errdefer if (owned_filename) |filename| allocator.free(filename);
+
+        var stored_options = options;
+        stored_options.filename = owned_filename;
+
+        return .{
+            .allocator = allocator,
+            .base64_data = owned_base64,
+            .mime_type = owned_mime,
+            .dimensions = dimensions orelse
+                (terminal_image.getImageDimensions(allocator, base64_data, mime_type) orelse .{ .width_px = 800, .height_px = 600 }),
+            .theme = theme,
+            .options = stored_options,
+            .owned_filename = owned_filename,
+            .image_id = options.image_id,
+        };
+    }
+
+    pub fn deinit(self: *Image) void {
+        self.clearCache();
+        self.allocator.free(self.base64_data);
+        self.allocator.free(self.mime_type);
+        if (self.owned_filename) |filename| self.allocator.free(filename);
+    }
+
+    pub fn getImageId(self: *const Image) ?u32 {
+        return self.image_id;
+    }
+
+    pub fn invalidate(self: *Image) void {
+        self.clearCache();
+    }
+
+    pub fn render(self: *Image, allocator: std.mem.Allocator, width: usize) ![][]u8 {
+        if (self.cached_lines) |lines| {
+            if (self.cached_width == width) return cloneOwnedLines(allocator, lines);
+        }
+
+        const available = if (width > 2) width - 2 else 0;
+        const requested_max_width = self.options.max_width_cells orelse 60;
+        const max_width = @max(@as(usize, 1), @min(available, requested_max_width));
+        const cell_dimensions = terminal_image.getCellDimensions();
+        const default_max_height = ceilDiv(max_width * cell_dimensions.width_px, cell_dimensions.height_px);
+        const max_height = self.options.max_height_cells orelse @max(@as(usize, 1), default_max_height);
+        const caps = terminal_image.getCapabilities();
+
+        const lines = if (caps.images != null)
+            try self.renderProtocolLines(self.allocator, max_width, max_height, caps.images.?)
+        else
+            try self.renderFallback(self.allocator);
+        errdefer freeOwnedLines(self.allocator, lines);
+
+        self.replaceCache(lines, width);
+        return cloneOwnedLines(allocator, self.cached_lines.?);
+    }
+
+    fn renderProtocolLines(
+        self: *Image,
+        allocator: std.mem.Allocator,
+        max_width: usize,
+        max_height: usize,
+        protocol: terminal_image.ImageProtocol,
+    ) ![][]u8 {
+        if (protocol == .kitty and self.image_id == null) {
+            self.image_id = terminal_image.allocateImageId();
+        }
+
+        const rendered = (try terminal_image.renderImage(allocator, self.base64_data, self.dimensions, .{
+            .max_width_cells = max_width,
+            .max_height_cells = max_height,
+            .image_id = self.image_id,
+            .move_cursor = false,
+        })) orelse return self.renderFallback(allocator);
+        defer rendered.deinit(allocator);
+
+        if (rendered.image_id) |image_id| self.image_id = image_id;
+
+        var lines: std.ArrayList([]u8) = .empty;
+        errdefer freeOwnedLines(allocator, lines.items);
+
+        if (protocol == .kitty) {
+            try lines.append(allocator, try allocator.dupe(u8, rendered.sequence));
+            var row: usize = 1;
+            while (row < rendered.rows) : (row += 1) try lines.append(allocator, try allocator.dupe(u8, ""));
+        } else {
+            var row: usize = 1;
+            while (row < rendered.rows) : (row += 1) try lines.append(allocator, try allocator.dupe(u8, ""));
+            if (rendered.rows > 1) {
+                try lines.append(allocator, try std.fmt.allocPrint(allocator, "\x1b[{d}A{s}", .{ rendered.rows - 1, rendered.sequence }));
+            } else {
+                try lines.append(allocator, try allocator.dupe(u8, rendered.sequence));
+            }
+        }
+
+        return lines.toOwnedSlice(allocator);
+    }
+
+    fn renderFallback(self: *Image, allocator: std.mem.Allocator) ![][]u8 {
+        const fallback = try terminal_image.imageFallback(allocator, self.mime_type, self.dimensions, self.options.filename);
+        defer allocator.free(fallback);
+        const styled = try self.theme.fallback_color.apply(allocator, fallback);
+        errdefer allocator.free(styled);
+        var lines = try allocator.alloc([]u8, 1);
+        lines[0] = styled;
+        return lines;
+    }
+
+    fn replaceCache(self: *Image, lines: [][]u8, width: usize) void {
+        self.clearCache();
+        self.cached_lines = lines;
+        self.cached_width = width;
+    }
+
+    fn clearCache(self: *Image) void {
+        if (self.cached_lines) |lines| freeOwnedLines(self.allocator, lines);
+        self.cached_lines = null;
+        self.cached_width = null;
+    }
+};
+
 pub const LoaderIndicatorOptions = struct {
     frames: ?[]const []const u8 = null,
     interval_ms: ?u64 = null,
@@ -1995,6 +2156,25 @@ fn freeOwnedLines(allocator: std.mem.Allocator, lines: [][]u8) void {
     allocator.free(lines);
 }
 
+fn cloneOwnedLines(allocator: std.mem.Allocator, lines: []const []const u8) ![][]u8 {
+    var result = try allocator.alloc([]u8, lines.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (result[0..initialized]) |line| allocator.free(line);
+        allocator.free(result);
+    }
+    for (lines, 0..) |line, index| {
+        result[index] = try allocator.dupe(u8, line);
+        initialized += 1;
+    }
+    return result;
+}
+
+fn ceilDiv(numerator: usize, denominator: usize) usize {
+    const safe_denominator = @max(@as(usize, 1), denominator);
+    return if (numerator == 0) 0 else 1 + ((numerator - 1) / safe_denominator);
+}
+
 fn flushPendingAnsi(allocator: std.mem.Allocator, output: *std.ArrayList(u8), pending_ansi: *std.ArrayList(u8)) !void {
     if (pending_ansi.items.len == 0) return;
     try output.appendSlice(allocator, pending_ansi.items);
@@ -2692,6 +2872,112 @@ test "CancellableLoader aborts on select cancel keybinding" {
     try std.testing.expect(!loader.loader.animationRunning());
 }
 
+test "Image falls back to styled metadata when terminal images are unavailable" {
+    const allocator = std.testing.allocator;
+    terminal_image.setCapabilities(.{ .images = null, .true_color = false, .hyperlinks = false });
+    defer terminal_image.resetCapabilitiesCache();
+
+    var image = try Image.init(
+        allocator,
+        "AAAA",
+        "image/png",
+        .{ .fallback_color = .{ .apply_fn = bracketStyle } },
+        .{ .filename = "photo.png" },
+        .{ .width_px = 800, .height_px = 600 },
+    );
+    defer image.deinit();
+
+    const rendered = try image.render(allocator, 80);
+    defer freeRenderedLines(allocator, rendered);
+    try std.testing.expectEqual(@as(usize, 1), rendered.len);
+    try std.testing.expectEqualStrings("[[Image: photo.png [image/png] 800x600]]", rendered[0]);
+}
+
+test "Image renders Kitty protocol rows and keeps a reusable image id" {
+    const allocator = std.testing.allocator;
+    terminal_image.setCapabilities(.{ .images = .kitty, .true_color = true, .hyperlinks = true });
+    terminal_image.setCellDimensions(.{ .width_px = 10, .height_px = 10 });
+    defer {
+        terminal_image.resetCapabilitiesCache();
+        terminal_image.setCellDimensions(.{ .width_px = 9, .height_px = 18 });
+    }
+
+    var image = try Image.init(
+        allocator,
+        "AAAA",
+        "image/png",
+        .{},
+        .{ .max_width_cells = 2 },
+        .{ .width_px = 20, .height_px = 20 },
+    );
+    defer image.deinit();
+
+    const rendered = try image.render(allocator, 4);
+    defer freeRenderedLines(allocator, rendered);
+    const image_id = image.getImageId() orelse return error.ExpectedImageId;
+    const id_param = try std.fmt.allocPrint(allocator, ",i={d}", .{image_id});
+    defer allocator.free(id_param);
+
+    try std.testing.expectEqual(@as(usize, 2), rendered.len);
+    try std.testing.expect(std.mem.startsWith(u8, rendered[0], "\x1b_G"));
+    try std.testing.expect(std.mem.indexOf(u8, rendered[0], ",C=1,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered[0], id_param) != null);
+    try std.testing.expect(std.mem.endsWith(u8, rendered[0], "\x1b\\"));
+    try std.testing.expectEqualStrings("", rendered[1]);
+}
+
+test "Image caches per width and invalidates cached render lines" {
+    const allocator = std.testing.allocator;
+    terminal_image.setCapabilities(.{ .images = null, .true_color = false, .hyperlinks = false });
+    defer terminal_image.resetCapabilitiesCache();
+
+    var image = try Image.init(
+        allocator,
+        "AAAA",
+        "image/png",
+        .{},
+        .{},
+        .{ .width_px = 10, .height_px = 10 },
+    );
+    defer image.deinit();
+
+    const first = try image.render(allocator, 40);
+    defer freeRenderedLines(allocator, first);
+    try std.testing.expect(image.cached_lines != null);
+    try std.testing.expectEqual(@as(?usize, 40), image.cached_width);
+
+    image.invalidate();
+    try std.testing.expect(image.cached_lines == null);
+    try std.testing.expect(image.cached_width == null);
+}
+
+test "Image renders iTerm2 sequence on the last accounted row" {
+    const allocator = std.testing.allocator;
+    terminal_image.setCapabilities(.{ .images = .iterm2, .true_color = true, .hyperlinks = true });
+    terminal_image.setCellDimensions(.{ .width_px = 10, .height_px = 10 });
+    defer {
+        terminal_image.resetCapabilitiesCache();
+        terminal_image.setCellDimensions(.{ .width_px = 9, .height_px = 18 });
+    }
+
+    var image = try Image.init(
+        allocator,
+        "AAAA",
+        "image/png",
+        .{},
+        .{ .max_width_cells = 2 },
+        .{ .width_px = 20, .height_px = 20 },
+    );
+    defer image.deinit();
+
+    const rendered = try image.render(allocator, 4);
+    defer freeRenderedLines(allocator, rendered);
+
+    try std.testing.expectEqual(@as(usize, 2), rendered.len);
+    try std.testing.expectEqualStrings("", rendered[0]);
+    try std.testing.expect(std.mem.startsWith(u8, rendered[1], "\x1b[1A\x1b]1337;File="));
+}
+
 fn visibleIndexOf(line: []const u8, text: []const u8) !usize {
     const index = std.mem.indexOf(u8, line, text) orelse return error.NotFound;
     return visibleWidth(line[0..index]);
@@ -2832,4 +3118,6 @@ test {
     _ = @import("kill_ring.zig");
     _ = @import("undo_stack.zig");
     _ = @import("stdin_buffer.zig");
+    _ = @import("terminal_image.zig");
+    _ = @import("native_modifiers.zig");
 }

@@ -6,6 +6,7 @@ const support = @import("support.zig");
 
 pub fn main(init: std.process.Init) !void {
     coding_agent.tui.keys.setProcessEnvironment(init.environ_map);
+    coding_agent.tui.terminal_image.setProcessEnvironment(init.environ_map);
 
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     var stdout_buffer: [4096]u8 = undefined;
