@@ -757,7 +757,7 @@ packages/tui/src/terminal-image.ts	bulb_tui	source	pending
 packages/tui/src/terminal.ts	bulb_tui	source	pending		
 packages/tui/src/tui.ts	bulb_tui	source	pending		
 packages/tui/src/undo-stack.ts	bulb_tui	source	pending		
-packages/tui/src/utils.ts	bulb_tui	source	in_progress	src/bulb_tui/root.zig	Visible-width behavior started
+packages/tui/src/utils.ts	bulb_tui	source	implemented	src/bulb_tui/root.zig	Native visible width, ANSI/OSC/APC extraction, terminal normalization, ANSI-aware wrapping/truncation, slice helpers, SGR state tracking, OSC 8 hyperlink continuation, and regional-indicator/emoji width handling ported
 packages/tui/src/word-navigation.ts	bulb_tui	source	pending		
 packages/tui/test/autocomplete.test.ts	bulb_tui	test	pending		
 packages/tui/test/bug-regression-isimageline-startswith-bug.test.ts	bulb_tui	test	pending		
@@ -773,13 +773,13 @@ packages/tui/test/markdown.test.ts	bulb_tui	test	pending
 packages/tui/test/overlay-non-capturing.test.ts	bulb_tui	test	pending		
 packages/tui/test/overlay-options.test.ts	bulb_tui	test	pending		
 packages/tui/test/overlay-short-content.test.ts	bulb_tui	test	pending		
-packages/tui/test/regression-regional-indicator-width.test.ts	bulb_tui	test	in_progress	src/bulb_tui/root.zig	Regional-indicator regression cases started
+packages/tui/test/regression-regional-indicator-width.test.ts	bulb_tui	test	implemented	src/bulb_tui/root.zig	Upstream regional-indicator singleton, flag-pair, partial-list wrapping, and streaming emoji width regressions ported
 packages/tui/test/select-list.test.ts	bulb_tui	test	pending		
 packages/tui/test/stdin-buffer.test.ts	bulb_tui	test	pending		
 packages/tui/test/terminal-image.test.ts	bulb_tui	test	pending		
 packages/tui/test/terminal.test.ts	bulb_tui	test	pending		
 packages/tui/test/test-themes.ts	bulb_tui	test	pending		
-packages/tui/test/truncate-to-width.test.ts	bulb_tui	test	in_progress	src/bulb_tui/root.zig	Visible-width subset started
+packages/tui/test/truncate-to-width.test.ts	bulb_tui	test	implemented	src/bulb_tui/root.zig	Upstream truncation, ANSI reset, malformed escape, wide ellipsis, padding, contiguous-prefix, visible-width, and Thai/Lao normalization regressions ported
 packages/tui/test/truncated-text.test.ts	bulb_tui	test	pending		
 packages/tui/test/tui-cell-size-input.test.ts	bulb_tui	test	pending		
 packages/tui/test/tui-overlay-style-leak.test.ts	bulb_tui	test	pending		
@@ -787,7 +787,7 @@ packages/tui/test/tui-render.test.ts	bulb_tui	test	pending
 packages/tui/test/viewport-overwrite-repro.ts	bulb_tui	test	pending		
 packages/tui/test/virtual-terminal.ts	bulb_tui	test	pending		
 packages/tui/test/word-navigation.test.ts	bulb_tui	test	pending		
-packages/tui/test/wrap-ansi.test.ts	bulb_tui	test	pending		
+packages/tui/test/wrap-ansi.test.ts	bulb_tui	test	implemented	src/bulb_tui/root.zig	Upstream ANSI wrapping, underline/background preservation, trailing whitespace trimming, OSC marker width, color continuation, and OSC 8 hyperlink continuation regressions ported
 packages/tui/tsconfig.build.json	bulb_tui	source	pending		
 packages/tui/vitest.config.ts	bulb_tui	source	pending		
 pi-test.bat	root	source	pending		
