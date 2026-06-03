@@ -3,6 +3,7 @@ const ai = @import("bulb_ai");
 const auth_storage = @import("auth_storage.zig");
 const config_value = @import("resolve_config_value.zig");
 const model_registry = @import("model_registry.zig");
+const output_guard = @import("output_guard.zig");
 
 pub const default_thinking_level: ai.ThinkingLevel = .medium;
 
@@ -83,8 +84,8 @@ pub const ResolveCliModelOptions = struct {
 pub const ResolveCliModelResult = struct {
     model: ?ai.Model = null,
     thinking_level: ?ai.ThinkingLevel = null,
-    warning: ?[]u8 = null,
-    error_message: ?[]u8 = null,
+    warning: ?[]const u8 = null,
+    error_message: ?[]const u8 = null,
 
     pub fn deinit(self: *ResolveCliModelResult, allocator: std.mem.Allocator) void {
         if (self.warning) |warning| allocator.free(warning);
@@ -107,8 +108,8 @@ pub const FindInitialModelOptions = struct {
 pub const InitialModelResult = struct {
     model: ?ai.Model = null,
     thinking_level: ai.ThinkingLevel = default_thinking_level,
-    fallback_message: ?[]u8 = null,
-    error_message: ?[]u8 = null,
+    fallback_message: ?[]const u8 = null,
+    error_message: ?[]const u8 = null,
 
     pub fn deinit(self: *InitialModelResult, allocator: std.mem.Allocator) void {
         if (self.fallback_message) |message| allocator.free(message);
@@ -119,9 +120,11 @@ pub const InitialModelResult = struct {
 
 pub const RestoreModelResult = struct {
     model: ?ai.Model = null,
-    fallback_message: ?[]u8 = null,
+    restore_warning_message: ?[]const u8 = null,
+    fallback_message: ?[]const u8 = null,
 
     pub fn deinit(self: *RestoreModelResult, allocator: std.mem.Allocator) void {
+        if (self.restore_warning_message) |message| allocator.free(message);
         if (self.fallback_message) |message| allocator.free(message);
         self.* = .{};
     }
@@ -129,7 +132,7 @@ pub const RestoreModelResult = struct {
 
 pub const ResolveModelScopeResult = struct {
     scoped_models: []ScopedModel = &.{},
-    warnings: [][]u8 = &.{},
+    warnings: []const []const u8 = &.{},
 
     pub fn deinit(self: *ResolveModelScopeResult, allocator: std.mem.Allocator) void {
         if (self.scoped_models.len > 0) allocator.free(self.scoped_models);
@@ -137,6 +140,21 @@ pub const ResolveModelScopeResult = struct {
         if (self.warnings.len > 0) allocator.free(self.warnings);
         self.* = .{};
     }
+};
+
+pub const CliColorMode = enum {
+    never,
+    always,
+};
+
+pub const CliPresentation = struct {
+    stdout: output_guard.Sink,
+    stderr: output_guard.Sink,
+    color: CliColorMode = .never,
+};
+
+pub const RestorePresentationOptions = struct {
+    should_print_messages: bool = true,
 };
 
 pub fn defaultModelForProvider(provider: []const u8) ?[]const u8 {
@@ -508,28 +526,155 @@ pub fn restoreModelFromSessionAlloc(
 
     const reason = if (restored_model == null) "model no longer exists" else "no auth configured";
     if (current_model) |model| {
-        return .{
-            .model = model,
-            .fallback_message = try std.fmt.allocPrint(
-                allocator,
-                "Could not restore model {s}/{s} ({s}). Using {s}/{s}.",
-                .{ saved_provider, saved_model_id, reason, model.provider, model.id },
-            ),
-        };
+        return restoreFailureResultAlloc(allocator, saved_provider, saved_model_id, reason, model);
     }
 
     const available = try model_registry_value.getAvailableAlloc(allocator);
     defer allocator.free(available);
-    if (available.len == 0) return .{};
+    if (available.len == 0) {
+        return restoreFailureResultAlloc(allocator, saved_provider, saved_model_id, reason, null);
+    }
 
     const fallback_model = if (findDefaultAvailableModel(available)) |model| model else available[0];
-    return .{
-        .model = fallback_model.*,
-        .fallback_message = try std.fmt.allocPrint(
+    return restoreFailureResultAlloc(allocator, saved_provider, saved_model_id, reason, fallback_model.*);
+}
+
+pub fn writeResolveModelScopeWarnings(presentation: CliPresentation, result: ResolveModelScopeResult) !void {
+    for (result.warnings) |warning| {
+        try writeWarning(presentation, warning);
+    }
+}
+
+pub fn writeResolveCliModelDiagnostics(presentation: CliPresentation, result: ResolveCliModelResult) !void {
+    if (result.warning) |warning| try writeWarning(presentation, warning);
+    if (result.error_message) |message| try writeError(presentation, message);
+}
+
+pub fn writeInitialModelDiagnostics(presentation: CliPresentation, result: InitialModelResult) !void {
+    if (result.error_message) |message| {
+        try writeStyledSegments(
+            presentation.stderr,
+            presentation.color,
+            .red,
+            &.{message},
+        );
+    }
+}
+
+pub fn writeRestoreModelDiagnostics(
+    presentation: CliPresentation,
+    saved_provider: []const u8,
+    saved_model_id: []const u8,
+    result: RestoreModelResult,
+    options: RestorePresentationOptions,
+) !void {
+    if (!options.should_print_messages) return;
+
+    if (result.restore_warning_message) |message| {
+        try writeWarning(presentation, message);
+        if (result.model) |model| {
+            try writeStyledSegments(
+                presentation.stdout,
+                presentation.color,
+                .dim,
+                &.{ "Falling back to: ", model.provider, "/", model.id },
+            );
+        }
+        return;
+    }
+
+    if (result.model) |model| {
+        if (std.mem.eql(u8, model.provider, saved_provider) and std.mem.eql(u8, model.id, saved_model_id)) {
+            try writeStyledSegments(
+                presentation.stdout,
+                presentation.color,
+                .dim,
+                &.{ "Restored model: ", saved_provider, "/", saved_model_id },
+            );
+        }
+    }
+}
+
+fn restoreFailureResultAlloc(
+    allocator: std.mem.Allocator,
+    saved_provider: []const u8,
+    saved_model_id: []const u8,
+    reason: []const u8,
+    fallback_model: ?ai.Model,
+) !RestoreModelResult {
+    var result = RestoreModelResult{
+        .model = fallback_model,
+        .restore_warning_message = try std.fmt.allocPrint(
+            allocator,
+            "Could not restore model {s}/{s} ({s}).",
+            .{ saved_provider, saved_model_id, reason },
+        ),
+    };
+    errdefer result.deinit(allocator);
+
+    if (fallback_model) |model| {
+        result.fallback_message = try std.fmt.allocPrint(
             allocator,
             "Could not restore model {s}/{s} ({s}). Using {s}/{s}.",
-            .{ saved_provider, saved_model_id, reason, fallback_model.provider, fallback_model.id },
-        ),
+            .{ saved_provider, saved_model_id, reason, model.provider, model.id },
+        );
+    }
+
+    return .{
+        .model = result.model,
+        .restore_warning_message = result.restore_warning_message,
+        .fallback_message = result.fallback_message,
+    };
+}
+
+const CliStyle = enum {
+    red,
+    yellow,
+    dim,
+};
+
+fn writeWarning(presentation: CliPresentation, message: []const u8) !void {
+    try writeStyledSegments(
+        presentation.stderr,
+        presentation.color,
+        .yellow,
+        &.{ "Warning: ", message },
+    );
+}
+
+fn writeError(presentation: CliPresentation, message: []const u8) !void {
+    try writeStyledSegments(
+        presentation.stderr,
+        presentation.color,
+        .red,
+        &.{ "Error: ", message },
+    );
+}
+
+fn writeStyledSegments(
+    sink: output_guard.Sink,
+    color_mode: CliColorMode,
+    style: CliStyle,
+    segments: []const []const u8,
+) !void {
+    if (color_mode == .always) try sink.write(styleStart(style));
+    for (segments) |segment| try sink.write(segment);
+    if (color_mode == .always) try sink.write(styleEnd(style));
+    try sink.write("\n");
+}
+
+fn styleStart(style: CliStyle) []const u8 {
+    return switch (style) {
+        .red => "\x1b[31m",
+        .yellow => "\x1b[33m",
+        .dim => "\x1b[2m",
+    };
+}
+
+fn styleEnd(style: CliStyle) []const u8 {
+    return switch (style) {
+        .red, .yellow => "\x1b[39m",
+        .dim => "\x1b[22m",
     };
 }
 
@@ -1151,6 +1296,31 @@ fn resolverDynamicModel(id: []const u8) ai.Model {
     };
 }
 
+const TestCliOutput = struct {
+    stdout: std.Io.Writer.Allocating,
+    stderr: std.Io.Writer.Allocating,
+
+    fn init(allocator: std.mem.Allocator) TestCliOutput {
+        return .{
+            .stdout = .init(allocator),
+            .stderr = .init(allocator),
+        };
+    }
+
+    fn deinit(self: *TestCliOutput) void {
+        self.stdout.deinit();
+        self.stderr.deinit();
+    }
+
+    fn presentation(self: *TestCliOutput, color: CliColorMode) CliPresentation {
+        return .{
+            .stdout = output_guard.sinkFromWriter(&self.stdout.writer),
+            .stderr = output_guard.sinkFromWriter(&self.stderr.writer),
+            .color = color,
+        };
+    }
+};
+
 fn expectParsed(pattern: []const u8, expected_id: ?[]const u8, expected_level: ?ai.ThinkingLevel, expected_warning: ?[]const u8) !void {
     const result = parseModelPattern(pattern, &mock_models, .{});
     if (expected_id) |id| {
@@ -1539,6 +1709,7 @@ test "model resolver restores session models or falls back to available models" 
     );
     try std.testing.expectEqualStrings("current-model", restored.model.?.id);
     try std.testing.expect(restored.fallback_message != null);
+    try std.testing.expect(restored.restore_warning_message != null);
     try std.testing.expect(std.mem.indexOf(u8, restored.fallback_message.?, "model no longer exists") != null);
     try std.testing.expect(std.mem.indexOf(u8, restored.fallback_message.?, "dynamic/current-model") != null);
 
@@ -1554,5 +1725,162 @@ test "model resolver restores session models or falls back to available models" 
     try std.testing.expectEqualStrings("session-provider", restored.model.?.provider);
     try std.testing.expectEqualStrings("session-model", restored.model.?.id);
     try std.testing.expect(restored.fallback_message != null);
+    try std.testing.expect(restored.restore_warning_message != null);
     try std.testing.expect(std.mem.indexOf(u8, restored.fallback_message.?, "no auth configured") != null);
+}
+
+// Source parity with packages/coding-agent/src/core/model-resolver.ts:
+// resolver diagnostics are printed as CLI-facing warning/error lines instead
+// of leaking structured field names.
+test "model resolver CLI presentation writes warnings and errors to stderr" {
+    const allocator = std.testing.allocator;
+    var output = TestCliOutput.init(allocator);
+    defer output.deinit();
+    const presentation = output.presentation(.never);
+
+    try writeResolveModelScopeWarnings(presentation, .{
+        .warnings = &[_][]const u8{
+            "No models match pattern \"ghost\"",
+        },
+    });
+    try writeResolveCliModelDiagnostics(presentation, .{
+        .warning = "Model \"ghost\" not found for provider \"openrouter\". Using custom model id.",
+        .error_message = "Model \"ghost\" not found. Use --list-models to see available models.",
+    });
+    try writeInitialModelDiagnostics(presentation, .{
+        .error_message = "Unknown provider \"bogus\". Use --list-models to see available providers/models.",
+    });
+
+    const stdout_text = try output.stdout.toOwnedSlice();
+    defer allocator.free(stdout_text);
+    const stderr_text = try output.stderr.toOwnedSlice();
+    defer allocator.free(stderr_text);
+
+    try std.testing.expectEqualStrings("", stdout_text);
+    try std.testing.expectEqualStrings(
+        "Warning: No models match pattern \"ghost\"\n" ++
+            "Warning: Model \"ghost\" not found for provider \"openrouter\". Using custom model id.\n" ++
+            "Error: Model \"ghost\" not found. Use --list-models to see available models.\n" ++
+            "Unknown provider \"bogus\". Use --list-models to see available providers/models.\n",
+        stderr_text,
+    );
+}
+
+// Source parity with packages/coding-agent/src/core/model-resolver.ts:
+// chalk yellow/red/dim presentation maps to stable native ANSI sequences when
+// color is forced by the CLI layer.
+test "model resolver CLI presentation can force Pi-style ANSI colors" {
+    const allocator = std.testing.allocator;
+    var output = TestCliOutput.init(allocator);
+    defer output.deinit();
+    const presentation = output.presentation(.always);
+
+    try writeResolveModelScopeWarnings(presentation, .{
+        .warnings = &[_][]const u8{
+            "No models match pattern \"ghost\"",
+        },
+    });
+    try writeResolveCliModelDiagnostics(presentation, .{
+        .error_message = "Model \"ghost\" not found. Use --list-models to see available models.",
+    });
+
+    const stdout_text = try output.stdout.toOwnedSlice();
+    defer allocator.free(stdout_text);
+    const stderr_text = try output.stderr.toOwnedSlice();
+    defer allocator.free(stderr_text);
+
+    try std.testing.expectEqualStrings("", stdout_text);
+    try std.testing.expectEqualStrings(
+        "\x1b[33mWarning: No models match pattern \"ghost\"\x1b[39m\n" ++
+            "\x1b[31mError: Model \"ghost\" not found. Use --list-models to see available models.\x1b[39m\n",
+        stderr_text,
+    );
+}
+
+// Ported from packages/coding-agent/src/core/model-resolver.ts
+// restoreModelFromSession stdout/stderr presentation behavior.
+test "model resolver CLI presentation mirrors session restore output split" {
+    const allocator = std.testing.allocator;
+    var harness = try makeResolverRegistryHarness(allocator);
+    defer harness.deinit();
+    const session_models = [_]ai.Model{resolverDynamicModel("session-model")};
+    try harness.registry.registerProvider("session-provider", .{
+        .base_url = "https://session-provider.test/v1",
+        .api_key = "test-key",
+        .api = ai.types.api.anthropic_messages,
+        .models = &session_models,
+    });
+
+    var output = TestCliOutput.init(allocator);
+    defer output.deinit();
+    const presentation = output.presentation(.never);
+
+    var restored = try restoreModelFromSessionAlloc(
+        allocator,
+        "session-provider",
+        "session-model",
+        null,
+        &harness.registry,
+    );
+    defer restored.deinit(allocator);
+    try writeRestoreModelDiagnostics(presentation, "session-provider", "session-model", restored, .{});
+
+    restored.deinit(allocator);
+    const current_model = resolverDynamicModel("current-model");
+    restored = try restoreModelFromSessionAlloc(
+        allocator,
+        "missing-provider",
+        "missing-model",
+        current_model,
+        &harness.registry,
+    );
+    try writeRestoreModelDiagnostics(presentation, "missing-provider", "missing-model", restored, .{});
+
+    restored.deinit(allocator);
+    restored = try restoreModelFromSessionAlloc(
+        allocator,
+        "openai",
+        "gpt-5.4",
+        null,
+        &harness.registry,
+    );
+    try writeRestoreModelDiagnostics(presentation, "openai", "gpt-5.4", restored, .{ .should_print_messages = false });
+
+    const stdout_text = try output.stdout.toOwnedSlice();
+    defer allocator.free(stdout_text);
+    const stderr_text = try output.stderr.toOwnedSlice();
+    defer allocator.free(stderr_text);
+
+    try std.testing.expectEqualStrings(
+        "Restored model: session-provider/session-model\n" ++
+            "Falling back to: dynamic/current-model\n",
+        stdout_text,
+    );
+    try std.testing.expectEqualStrings(
+        "Warning: Could not restore model missing-provider/missing-model (model no longer exists).\n",
+        stderr_text,
+    );
+}
+
+test "model resolver preserves restore warnings when no fallback model exists" {
+    const allocator = std.testing.allocator;
+    var harness = try makeResolverRegistryHarness(allocator);
+    defer harness.deinit();
+
+    var restored = try restoreModelFromSessionAlloc(
+        allocator,
+        "missing-provider",
+        "missing-model",
+        null,
+        &harness.registry,
+    );
+    defer restored.deinit(allocator);
+
+    try std.testing.expect(restored.model == null);
+    try std.testing.expect(restored.fallback_message == null);
+    try std.testing.expect(restored.restore_warning_message != null);
+    try std.testing.expectEqualStrings(
+        "Could not restore model missing-provider/missing-model (model no longer exists).",
+        restored.restore_warning_message.?,
+    );
 }
