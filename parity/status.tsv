@@ -101,7 +101,10 @@ packages/coding-agent/test/version-check.test.ts	implemented	src/bulb_coding_age
 packages/tui/src/keybindings.ts	implemented	src/bulb_tui/keybindings.zig	Native default keybinding registry, ordered user overrides, duplicate normalization, conflict reporting, resolved config output, and global default-manager foundations ported
 packages/tui/src/keys.ts	implemented	src/bulb_tui/keys.zig	Kitty CSI-u alternate-layout/event parsing, xterm modifyOtherKeys, legacy navigation/function/modifier sequences, printable decoders, release/repeat helpers, Windows Terminal backspace env heuristic, and key matching ported
 packages/tui/src/components/box.ts	implemented	src/bulb_tui/root.zig	Native component adapter, child rendering, padding, background application, and invalidation behavior ported
+packages/tui/src/components/cancellable-loader.ts	implemented	src/bulb_tui/root.zig	Native cancellable loader wrapper, abort signal state, Escape/Ctrl-C keybinding handling, dispose, and abort callback behavior ported
+packages/tui/src/components/loader.ts	implemented	src/bulb_tui/root.zig	Native text-backed loader, default/custom indicator frames, verbatim custom indicators, message updates, render requests, stop/start state, and deterministic frame advancement ported
 packages/tui/src/components/select-list.ts	implemented	src/bulb_tui/root.zig	Native select list filtering, scrolling window, keybinding input, callbacks, description alignment, primary-column bounds, and custom truncation ported
+packages/tui/src/components/spacer.ts	implemented	src/bulb_tui/root.zig	Native empty-line spacer component and mutable line count ported
 packages/tui/src/components/text.ts	implemented	src/bulb_tui/root.zig	Native text component wrapping, tab normalization, padding, optional background styling, mutation, and invalidation behavior ported
 packages/tui/src/components/truncated-text.ts	implemented	src/bulb_tui/root.zig	Native single-line truncating text component with horizontal/vertical padding and ANSI-aware width behavior ported
 packages/tui/src/kill-ring.ts	implemented	src/bulb_tui/kill_ring.zig	Native kill ring push, peek, rotate, and lifetime behavior ported

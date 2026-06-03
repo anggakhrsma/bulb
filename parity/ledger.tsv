@@ -734,15 +734,15 @@ packages/tui/native/win32/src/win32-console-mode.c	bulb_tui	source	pending
 packages/tui/package.json	bulb_tui	source	pending		
 packages/tui/src/autocomplete.ts	bulb_tui	source	implemented	src/bulb_tui/autocomplete.zig	Native combined slash/path autocomplete provider, quoted path application, direct directory completion, fuzzy @ attachment search, scoped recursive filesystem walking, symlink handling, and .git exclusion ported without fd/Node runtime
 packages/tui/src/components/box.ts	bulb_tui	source	implemented	src/bulb_tui/root.zig	Native component adapter, child rendering, padding, background application, and invalidation behavior ported
-packages/tui/src/components/cancellable-loader.ts	bulb_tui	source	pending		
+packages/tui/src/components/cancellable-loader.ts	bulb_tui	source	implemented	src/bulb_tui/root.zig	Native cancellable loader wrapper, abort signal state, Escape/Ctrl-C keybinding handling, dispose, and abort callback behavior ported
 packages/tui/src/components/editor.ts	bulb_tui	source	pending		
 packages/tui/src/components/image.ts	bulb_tui	source	pending		
 packages/tui/src/components/input.ts	bulb_tui	source	pending		
-packages/tui/src/components/loader.ts	bulb_tui	source	pending		
+packages/tui/src/components/loader.ts	bulb_tui	source	implemented	src/bulb_tui/root.zig	Native text-backed loader, default/custom indicator frames, verbatim custom indicators, message updates, render requests, stop/start state, and deterministic frame advancement ported
 packages/tui/src/components/markdown.ts	bulb_tui	source	pending		
 packages/tui/src/components/select-list.ts	bulb_tui	source	implemented	src/bulb_tui/root.zig	Native select list filtering, scrolling window, keybinding input, callbacks, description alignment, primary-column bounds, and custom truncation ported
 packages/tui/src/components/settings-list.ts	bulb_tui	source	pending		
-packages/tui/src/components/spacer.ts	bulb_tui	source	pending		
+packages/tui/src/components/spacer.ts	bulb_tui	source	implemented	src/bulb_tui/root.zig	Native empty-line spacer component and mutable line count ported
 packages/tui/src/components/text.ts	bulb_tui	source	implemented	src/bulb_tui/root.zig	Native text component wrapping, tab normalization, padding, optional background styling, mutation, and invalidation behavior ported
 packages/tui/src/components/truncated-text.ts	bulb_tui	source	implemented	src/bulb_tui/root.zig	Native single-line truncating text component with horizontal/vertical padding and ANSI-aware width behavior ported
 packages/tui/src/editor-component.ts	bulb_tui	source	pending		

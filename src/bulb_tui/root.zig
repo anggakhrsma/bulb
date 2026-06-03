@@ -936,6 +936,15 @@ pub const TextStyle = struct {
 
 pub const BackgroundStyle = TextStyle;
 
+pub const RenderRequester = struct {
+    ptr: ?*anyopaque = null,
+    request_fn: *const fn (?*anyopaque) void,
+
+    pub fn requestRender(self: RenderRequester) void {
+        self.request_fn(self.ptr);
+    }
+};
+
 pub const Component = struct {
     ptr: *anyopaque,
     render_fn: *const fn (*anyopaque, std.mem.Allocator, usize) anyerror![][]u8,
@@ -1118,6 +1127,182 @@ pub const Text = struct {
     }
 };
 
+pub const Spacer = struct {
+    lines: usize = 1,
+
+    pub fn init(lines: usize) Spacer {
+        return .{ .lines = lines };
+    }
+
+    pub fn setLines(self: *Spacer, lines: usize) void {
+        self.lines = lines;
+    }
+
+    pub fn invalidate(_: *Spacer) void {}
+
+    pub fn render(self: *const Spacer, allocator: std.mem.Allocator, _: usize) ![][]u8 {
+        var result: std.ArrayList([]u8) = .empty;
+        errdefer freeOwnedLines(allocator, result.items);
+        var index: usize = 0;
+        while (index < self.lines) : (index += 1) {
+            try result.append(allocator, try allocator.dupe(u8, ""));
+        }
+        return result.toOwnedSlice(allocator);
+    }
+};
+
+pub const LoaderIndicatorOptions = struct {
+    frames: ?[]const []const u8 = null,
+    interval_ms: ?u64 = null,
+};
+
+const DEFAULT_LOADER_FRAMES = [_][]const u8{
+    "\u{280b}",
+    "\u{2819}",
+    "\u{2839}",
+    "\u{2838}",
+    "\u{283c}",
+    "\u{2834}",
+    "\u{2826}",
+    "\u{2827}",
+    "\u{2807}",
+    "\u{280f}",
+};
+const DEFAULT_LOADER_INTERVAL_MS: u64 = 80;
+
+pub const Loader = struct {
+    allocator: std.mem.Allocator,
+    text: Text,
+    frames: [][]u8,
+    interval_ms: u64 = DEFAULT_LOADER_INTERVAL_MS,
+    current_frame: usize = 0,
+    running: bool = false,
+    render_indicator_verbatim: bool = false,
+    requester: ?RenderRequester = null,
+    spinner_color_fn: TextStyle = .{},
+    message_color_fn: TextStyle = .{},
+    message: []u8,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        requester: ?RenderRequester,
+        spinner_color_fn: TextStyle,
+        message_color_fn: TextStyle,
+        message: []const u8,
+        indicator: ?LoaderIndicatorOptions,
+    ) !Loader {
+        var moved = false;
+        var text = try Text.init(allocator, "", 1, 0, null);
+        errdefer if (!moved) text.deinit();
+        const frames = try cloneFrames(allocator, DEFAULT_LOADER_FRAMES[0..]);
+        errdefer if (!moved) freeFrames(allocator, frames);
+        const owned_message = try allocator.dupe(u8, message);
+        errdefer if (!moved) allocator.free(owned_message);
+
+        var loader = Loader{
+            .allocator = allocator,
+            .text = text,
+            .frames = frames,
+            .requester = requester,
+            .spinner_color_fn = spinner_color_fn,
+            .message_color_fn = message_color_fn,
+            .message = owned_message,
+        };
+        moved = true;
+        errdefer loader.deinit();
+        try loader.setIndicator(indicator);
+        return loader;
+    }
+
+    pub fn deinit(self: *Loader) void {
+        self.text.deinit();
+        freeFrames(self.allocator, self.frames);
+        self.allocator.free(self.message);
+    }
+
+    pub fn render(self: *const Loader, allocator: std.mem.Allocator, width: usize) ![][]u8 {
+        const rendered_text = try self.text.render(allocator, width);
+        defer freeOwnedLines(allocator, rendered_text);
+
+        var result = try allocator.alloc([]u8, rendered_text.len + 1);
+        var initialized: usize = 0;
+        errdefer {
+            for (result[0..initialized]) |line| allocator.free(line);
+            allocator.free(result);
+        }
+        result[0] = try allocator.dupe(u8, "");
+        initialized += 1;
+        for (rendered_text, 0..) |line, index| {
+            result[index + 1] = try allocator.dupe(u8, line);
+            initialized += 1;
+        }
+        return result;
+    }
+
+    pub fn start(self: *Loader) !void {
+        self.running = true;
+        try self.updateDisplay();
+    }
+
+    pub fn stop(self: *Loader) void {
+        self.running = false;
+    }
+
+    pub fn animationRunning(self: *const Loader) bool {
+        return self.running and self.frames.len > 1;
+    }
+
+    pub fn setMessage(self: *Loader, message: []const u8) !void {
+        const next = try self.allocator.dupe(u8, message);
+        self.allocator.free(self.message);
+        self.message = next;
+        try self.updateDisplay();
+    }
+
+    pub fn setIndicator(self: *Loader, indicator: ?LoaderIndicatorOptions) !void {
+        const next_frames = if (indicator) |options|
+            try cloneFrames(self.allocator, options.frames orelse DEFAULT_LOADER_FRAMES[0..])
+        else
+            try cloneFrames(self.allocator, DEFAULT_LOADER_FRAMES[0..]);
+        freeFrames(self.allocator, self.frames);
+        self.frames = next_frames;
+        self.interval_ms = if (indicator) |options|
+            if (options.interval_ms) |interval| if (interval > 0) interval else DEFAULT_LOADER_INTERVAL_MS else DEFAULT_LOADER_INTERVAL_MS
+        else
+            DEFAULT_LOADER_INTERVAL_MS;
+        self.current_frame = 0;
+        self.render_indicator_verbatim = indicator != null;
+        try self.start();
+    }
+
+    pub fn advanceFrame(self: *Loader) !void {
+        if (!self.animationRunning()) return;
+        self.current_frame = (self.current_frame + 1) % self.frames.len;
+        try self.updateDisplay();
+    }
+
+    fn updateDisplay(self: *Loader) !void {
+        const frame = if (self.current_frame < self.frames.len) self.frames[self.current_frame] else "";
+        const rendered_frame = if (self.render_indicator_verbatim)
+            try self.allocator.dupe(u8, frame)
+        else
+            try self.spinner_color_fn.apply(self.allocator, frame);
+        defer self.allocator.free(rendered_frame);
+
+        const rendered_message = try self.message_color_fn.apply(self.allocator, self.message);
+        defer self.allocator.free(rendered_message);
+
+        const display_text = if (frame.len > 0)
+            try std.mem.concat(self.allocator, u8, &.{ rendered_frame, " ", rendered_message })
+        else
+            try self.allocator.dupe(u8, rendered_message);
+        defer self.allocator.free(display_text);
+
+        try self.text.setText(display_text);
+        if (self.requester) |requester| requester.requestRender();
+    }
+};
+
 pub const Box = struct {
     allocator: std.mem.Allocator,
     children: std.ArrayList(Component) = .empty,
@@ -1270,6 +1455,65 @@ pub const VoidCallback = struct {
 
     pub fn call(self: VoidCallback) void {
         self.call_fn(self.ptr);
+    }
+};
+
+pub const AbortSignal = struct {
+    aborted: bool = false,
+
+    pub fn abort(self: *AbortSignal) void {
+        self.aborted = true;
+    }
+
+    pub fn isAborted(self: *const AbortSignal) bool {
+        return self.aborted;
+    }
+};
+
+pub const CancellableLoader = struct {
+    loader: Loader,
+    signal: AbortSignal = .{},
+    on_abort: ?VoidCallback = null,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        requester: ?RenderRequester,
+        spinner_color_fn: TextStyle,
+        message_color_fn: TextStyle,
+        message: []const u8,
+        indicator: ?LoaderIndicatorOptions,
+    ) !CancellableLoader {
+        return .{
+            .loader = try Loader.init(allocator, requester, spinner_color_fn, message_color_fn, message, indicator),
+        };
+    }
+
+    pub fn deinit(self: *CancellableLoader) void {
+        self.loader.deinit();
+    }
+
+    pub fn render(self: *const CancellableLoader, allocator: std.mem.Allocator, width: usize) ![][]u8 {
+        return self.loader.render(allocator, width);
+    }
+
+    pub fn start(self: *CancellableLoader) !void {
+        try self.loader.start();
+    }
+
+    pub fn stop(self: *CancellableLoader) void {
+        self.loader.stop();
+    }
+
+    pub fn dispose(self: *CancellableLoader) void {
+        self.stop();
+    }
+
+    pub fn handleInput(self: *CancellableLoader, allocator: std.mem.Allocator, data: []const u8) !void {
+        const manager = try keybindings.getKeybindings(allocator);
+        if (manager.matches(data, "tui.select.cancel")) {
+            self.signal.abort();
+            if (self.on_abort) |callback| callback.call();
+        }
     }
 };
 
@@ -1583,6 +1827,25 @@ fn applyBackgroundStyleToLine(allocator: std.mem.Allocator, line: []const u8, wi
     const padded = try padToWidth(allocator, line, width);
     defer allocator.free(padded);
     return bg_fn.apply(allocator, padded);
+}
+
+fn cloneFrames(allocator: std.mem.Allocator, frames: []const []const u8) ![][]u8 {
+    var result = try allocator.alloc([]u8, frames.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (result[0..initialized]) |frame| allocator.free(frame);
+        allocator.free(result);
+    }
+    for (frames, 0..) |frame, index| {
+        result[index] = try allocator.dupe(u8, frame);
+        initialized += 1;
+    }
+    return result;
+}
+
+fn freeFrames(allocator: std.mem.Allocator, frames: [][]u8) void {
+    for (frames) |frame| allocator.free(frame);
+    allocator.free(frames);
 }
 
 fn contentWidth(width: usize, padding_x: usize) usize {
@@ -1936,6 +2199,23 @@ fn lineHasVisibleText(line: []const u8) bool {
         index += 1;
     }
     return false;
+}
+
+const TestRenderCounter = struct {
+    count: usize = 0,
+
+    fn request(ptr: ?*anyopaque) void {
+        const self: *TestRenderCounter = @ptrCast(@alignCast(ptr.?));
+        self.count += 1;
+    }
+};
+
+fn bracketStyle(_: ?*anyopaque, allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "[{s}]", .{text});
+}
+
+fn parenStyle(_: ?*anyopaque, allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "({s})", .{text});
 }
 
 test "truncateToWidth keeps output within width for very large unicode input" {
@@ -2322,6 +2602,94 @@ test "Text and Box render wrapped padded component output" {
     defer freeRenderedLines(allocator, box_lines);
     try std.testing.expect(box_lines.len > text_lines.len);
     for (box_lines) |line| try std.testing.expectEqual(@as(usize, 18), visibleWidth(line));
+}
+
+test "Spacer renders configurable empty lines" {
+    const allocator = std.testing.allocator;
+    var spacer = Spacer.init(2);
+
+    const lines = try spacer.render(allocator, 80);
+    defer freeRenderedLines(allocator, lines);
+    try std.testing.expectEqual(@as(usize, 2), lines.len);
+    try std.testing.expectEqualStrings("", lines[0]);
+    try std.testing.expectEqualStrings("", lines[1]);
+
+    spacer.setLines(0);
+    const empty = try spacer.render(allocator, 80);
+    defer freeRenderedLines(allocator, empty);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
+}
+
+test "Loader renders messages and advances custom indicators deterministically" {
+    const allocator = std.testing.allocator;
+    var counter: TestRenderCounter = .{};
+    var loader = try Loader.init(
+        allocator,
+        .{ .ptr = &counter, .request_fn = TestRenderCounter.request },
+        .{ .apply_fn = bracketStyle },
+        .{ .apply_fn = parenStyle },
+        "Working",
+        null,
+    );
+    defer loader.deinit();
+
+    try std.testing.expect(loader.animationRunning());
+    try std.testing.expect(counter.count > 0);
+
+    const lines = try loader.render(allocator, 40);
+    defer freeRenderedLines(allocator, lines);
+    try std.testing.expectEqual(@as(usize, 2), lines.len);
+    try std.testing.expectEqualStrings("", lines[0]);
+    try std.testing.expect(std.mem.indexOf(u8, lines[1], "[") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lines[1], "(Working)") != null);
+
+    try loader.setMessage("Done");
+    const custom_frames = [_][]const u8{ ">", "-" };
+    try loader.setIndicator(.{ .frames = custom_frames[0..], .interval_ms = 0 });
+    try std.testing.expectEqual(DEFAULT_LOADER_INTERVAL_MS, loader.interval_ms);
+
+    const custom = try loader.render(allocator, 40);
+    defer freeRenderedLines(allocator, custom);
+    try std.testing.expect(std.mem.indexOf(u8, custom[1], "> (Done)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, custom[1], "[>") == null);
+
+    try loader.advanceFrame();
+    const advanced = try loader.render(allocator, 40);
+    defer freeRenderedLines(allocator, advanced);
+    try std.testing.expect(std.mem.indexOf(u8, advanced[1], "- (Done)") != null);
+
+    loader.stop();
+    const stopped_frame = loader.current_frame;
+    try loader.advanceFrame();
+    try std.testing.expectEqual(stopped_frame, loader.current_frame);
+}
+
+test "CancellableLoader aborts on select cancel keybinding" {
+    const allocator = std.testing.allocator;
+    defer keybindings.resetGlobalKeybindings(allocator);
+
+    var abort_counter: TestRenderCounter = .{};
+    var loader = try CancellableLoader.init(
+        allocator,
+        null,
+        .{},
+        .{},
+        "Cancelling",
+        .{ .frames = &.{"."} },
+    );
+    defer loader.deinit();
+    loader.on_abort = .{ .ptr = &abort_counter, .call_fn = TestRenderCounter.request };
+
+    try loader.handleInput(allocator, "x");
+    try std.testing.expect(!loader.signal.isAborted());
+    try std.testing.expectEqual(@as(usize, 0), abort_counter.count);
+
+    try loader.handleInput(allocator, "\x1b");
+    try std.testing.expect(loader.signal.isAborted());
+    try std.testing.expectEqual(@as(usize, 1), abort_counter.count);
+
+    loader.dispose();
+    try std.testing.expect(!loader.loader.animationRunning());
 }
 
 fn visibleIndexOf(line: []const u8, text: []const u8) !usize {
