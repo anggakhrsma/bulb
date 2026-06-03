@@ -1312,6 +1312,878 @@ pub const Image = struct {
     }
 };
 
+pub const DefaultTextStyle = struct {
+    color: ?TextStyle = null,
+    bg_color: ?BackgroundStyle = null,
+    bold: bool = false,
+    italic: bool = false,
+    strikethrough: bool = false,
+    underline: bool = false,
+};
+
+pub const MarkdownTheme = struct {
+    heading: TextStyle = .{},
+    link: TextStyle = .{},
+    link_url: TextStyle = .{},
+    code: TextStyle = .{},
+    code_block: TextStyle = .{},
+    code_block_border: TextStyle = .{},
+    quote: TextStyle = .{},
+    quote_border: TextStyle = .{},
+    hr: TextStyle = .{},
+    list_bullet: TextStyle = .{},
+    bold: TextStyle = .{},
+    italic: TextStyle = .{},
+    strikethrough: TextStyle = .{},
+    underline: TextStyle = .{},
+    code_block_indent: []const u8 = "  ",
+};
+
+pub const MarkdownOptions = struct {
+    preserve_ordered_list_markers: bool = false,
+};
+
+const InlineStyleKind = enum {
+    default,
+    none,
+    heading_one,
+    heading,
+    quote,
+};
+
+const InlineStyleContext = struct {
+    kind: InlineStyleKind,
+    style_prefix: []u8,
+
+    fn deinit(self: InlineStyleContext, allocator: std.mem.Allocator) void {
+        allocator.free(self.style_prefix);
+    }
+};
+
+const MarkdownBlockKind = enum {
+    paragraph,
+    heading,
+    code,
+    list,
+    table,
+    blockquote,
+    hr,
+    space,
+};
+
+const ListMarker = struct {
+    indent: usize,
+    depth: usize,
+    ordered: bool,
+    number: usize,
+    marker_len: usize,
+    delimiter: u8,
+
+    fn content(self: ListMarker, line: []const u8) []const u8 {
+        return line[self.marker_len..];
+    }
+};
+
+pub const Markdown = struct {
+    allocator: std.mem.Allocator,
+    text: []u8,
+    padding_x: usize,
+    padding_y: usize,
+    theme: MarkdownTheme,
+    default_text_style: ?DefaultTextStyle = null,
+    options: MarkdownOptions = .{},
+    cached_width: ?usize = null,
+    cached_lines: ?[][]u8 = null,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        text: []const u8,
+        padding_x: usize,
+        padding_y: usize,
+        theme: MarkdownTheme,
+        default_text_style: ?DefaultTextStyle,
+        options: MarkdownOptions,
+    ) !Markdown {
+        return .{
+            .allocator = allocator,
+            .text = try allocator.dupe(u8, text),
+            .padding_x = padding_x,
+            .padding_y = padding_y,
+            .theme = theme,
+            .default_text_style = default_text_style,
+            .options = options,
+        };
+    }
+
+    pub fn deinit(self: *Markdown) void {
+        self.clearCache();
+        self.allocator.free(self.text);
+    }
+
+    pub fn setText(self: *Markdown, text: []const u8) !void {
+        const next = try self.allocator.dupe(u8, text);
+        self.allocator.free(self.text);
+        self.text = next;
+        self.invalidate();
+    }
+
+    pub fn invalidate(self: *Markdown) void {
+        self.clearCache();
+    }
+
+    pub fn render(self: *Markdown, allocator: std.mem.Allocator, width: usize) ![][]u8 {
+        if (self.cached_lines) |lines| {
+            if (self.cached_width == width) return cloneOwnedLines(allocator, lines);
+        }
+
+        const rendered = try self.renderFresh(self.allocator, width);
+        errdefer freeOwnedLines(self.allocator, rendered);
+        self.replaceCache(rendered, width);
+        return cloneOwnedLines(allocator, self.cached_lines.?);
+    }
+
+    fn renderFresh(self: *Markdown, allocator: std.mem.Allocator, width: usize) ![][]u8 {
+        if (self.text.len == 0 or std.mem.trim(u8, self.text, " \t\r\n").len == 0) {
+            return allocator.alloc([]u8, 0);
+        }
+
+        const normalized = try replaceTabsWithSpaces(allocator, self.text);
+        defer allocator.free(normalized);
+
+        const content_width = contentWidth(width, self.padding_x);
+        const rendered_lines = try self.renderBlocks(allocator, normalized, content_width, .default);
+        defer freeOwnedLines(allocator, rendered_lines);
+
+        var wrapped_lines: std.ArrayList([]u8) = .empty;
+        defer {
+            for (wrapped_lines.items) |line| allocator.free(line);
+            wrapped_lines.deinit(allocator);
+        }
+        for (rendered_lines) |line| {
+            if (terminal_image.isImageLine(line)) {
+                try wrapped_lines.append(allocator, try allocator.dupe(u8, line));
+                continue;
+            }
+            if (visibleWidth(line) <= content_width) {
+                try wrapped_lines.append(allocator, try allocator.dupe(u8, line));
+                continue;
+            }
+            const wrapped = try wrapTextWithAnsi(allocator, line, content_width);
+            defer freeOwnedLines(allocator, wrapped);
+            for (wrapped) |wrapped_line| try wrapped_lines.append(allocator, try allocator.dupe(u8, wrapped_line));
+        }
+
+        var result: std.ArrayList([]u8) = .empty;
+        errdefer freeOwnedLines(allocator, result.items);
+
+        const empty_line = try repeatedSpaces(allocator, width);
+        defer allocator.free(empty_line);
+        var y: usize = 0;
+        while (y < self.padding_y) : (y += 1) {
+            try result.append(allocator, try self.applyMarkdownBackground(allocator, empty_line, width));
+        }
+
+        for (wrapped_lines.items) |line| {
+            if (terminal_image.isImageLine(line)) {
+                try result.append(allocator, try allocator.dupe(u8, line));
+                continue;
+            }
+
+            var line_with_margins: std.ArrayList(u8) = .empty;
+            defer line_with_margins.deinit(allocator);
+            try appendSpaces(allocator, &line_with_margins, self.padding_x);
+            try line_with_margins.appendSlice(allocator, line);
+            try appendSpaces(allocator, &line_with_margins, self.padding_x);
+            try result.append(allocator, try self.applyMarkdownBackground(allocator, line_with_margins.items, width));
+        }
+
+        y = 0;
+        while (y < self.padding_y) : (y += 1) {
+            try result.append(allocator, try self.applyMarkdownBackground(allocator, empty_line, width));
+        }
+
+        if (result.items.len == 0) try result.append(allocator, try allocator.dupe(u8, ""));
+        return result.toOwnedSlice(allocator);
+    }
+
+    fn renderBlocks(self: *Markdown, allocator: std.mem.Allocator, text: []const u8, width: usize, style_kind: InlineStyleKind) anyerror![][]u8 {
+        const lines = try splitBorrowedLines(allocator, text);
+        defer allocator.free(lines);
+
+        var output: std.ArrayList([]u8) = .empty;
+        errdefer freeOwnedLines(allocator, output.items);
+
+        var index: usize = 0;
+        while (index < lines.len) {
+            const line = lines[index];
+            if (isBlankLine(line)) {
+                try appendSingleBlank(allocator, &output);
+                index += 1;
+                continue;
+            }
+
+            const kind = blockKindAt(lines, index);
+            switch (kind) {
+                .heading => {
+                    const parsed = parseHeading(line).?;
+                    const heading_kind: InlineStyleKind = if (parsed.level == 1) .heading_one else .heading;
+                    const ctx = try self.makeInlineStyleContext(allocator, heading_kind);
+                    defer ctx.deinit(allocator);
+                    const heading_text = try self.renderInlineText(allocator, parsed.text, ctx);
+                    defer allocator.free(heading_text);
+                    if (parsed.level >= 3) {
+                        const prefix = try repeatedSlice(allocator, "#", parsed.level);
+                        defer allocator.free(prefix);
+                        const marker = try std.mem.concat(allocator, u8, &.{ prefix, " " });
+                        defer allocator.free(marker);
+                        const styled_marker = try self.applyStyleKind(allocator, heading_kind, marker);
+                        defer allocator.free(styled_marker);
+                        try output.append(allocator, try std.mem.concat(allocator, u8, &.{ styled_marker, heading_text }));
+                    } else {
+                        try output.append(allocator, try allocator.dupe(u8, heading_text));
+                    }
+                    index += 1;
+                },
+                .code => {
+                    const parsed = try self.renderFencedCode(allocator, lines, index);
+                    defer freeOwnedLines(allocator, parsed.lines);
+                    for (parsed.lines) |rendered| try output.append(allocator, try allocator.dupe(u8, rendered));
+                    index = parsed.next_index;
+                },
+                .list => {
+                    const start = index;
+                    index += 1;
+                    while (index < lines.len and !isBlankLine(lines[index])) : (index += 1) {
+                        if (parseListMarker(lines[index]) != null) continue;
+                        if (leadingSpaceCount(lines[index]) > 0) continue;
+                        break;
+                    }
+                    const list_lines = try self.renderListLines(allocator, lines[start..index], width, style_kind);
+                    defer freeOwnedLines(allocator, list_lines);
+                    for (list_lines) |rendered| try output.append(allocator, try allocator.dupe(u8, rendered));
+                },
+                .table => {
+                    const start = index;
+                    index += 2;
+                    while (index < lines.len and isTableRow(lines[index])) : (index += 1) {}
+                    const table_lines = try self.renderTableLines(allocator, lines[start..index], width, style_kind);
+                    defer freeOwnedLines(allocator, table_lines);
+                    for (table_lines) |rendered| try output.append(allocator, try allocator.dupe(u8, rendered));
+                },
+                .blockquote => {
+                    const start = index;
+                    index += 1;
+                    while (index < lines.len and !isBlankLine(lines[index]) and continuesBlockquote(lines[index])) : (index += 1) {}
+                    const quote_lines = try self.renderQuoteLines(allocator, lines[start..index], width);
+                    defer freeOwnedLines(allocator, quote_lines);
+                    for (quote_lines) |rendered| try output.append(allocator, try allocator.dupe(u8, rendered));
+                },
+                .hr => {
+                    const count = @min(width, 80);
+                    const rule = try repeatedSlice(allocator, "─", count);
+                    defer allocator.free(rule);
+                    try output.append(allocator, try self.theme.hr.apply(allocator, rule));
+                    index += 1;
+                },
+                .paragraph => {
+                    const start = index;
+                    index += 1;
+                    while (index < lines.len and !isBlankLine(lines[index]) and blockKindAt(lines, index) == .paragraph) : (index += 1) {}
+                    const paragraph = try joinLinesWith(allocator, lines[start..index], "\n");
+                    defer allocator.free(paragraph);
+                    const ctx = try self.makeInlineStyleContext(allocator, style_kind);
+                    defer ctx.deinit(allocator);
+                    const rendered = try self.renderInlineText(allocator, paragraph, ctx);
+                    try output.append(allocator, rendered);
+                },
+                .space => unreachable,
+            }
+
+            if (index < lines.len and !isBlankLine(lines[index]) and addsSpacingBeforeNext(kind, blockKindAt(lines, index))) {
+                try appendSingleBlank(allocator, &output);
+            }
+        }
+
+        return output.toOwnedSlice(allocator);
+    }
+
+    fn renderFencedCode(self: *Markdown, allocator: std.mem.Allocator, lines: []const []const u8, start: usize) !struct { lines: [][]u8, next_index: usize } {
+        const fence_line = std.mem.trim(u8, lines[start], " \t");
+        const lang = std.mem.trim(u8, fence_line[3..], " \t");
+        var rendered: std.ArrayList([]u8) = .empty;
+        errdefer freeOwnedLines(allocator, rendered.items);
+
+        const opening = try std.mem.concat(allocator, u8, &.{ "```", lang });
+        defer allocator.free(opening);
+        try rendered.append(allocator, try self.theme.code_block_border.apply(allocator, opening));
+
+        var index = start + 1;
+        while (index < lines.len) : (index += 1) {
+            const trimmed = std.mem.trim(u8, lines[index], " \t");
+            if (std.mem.startsWith(u8, trimmed, "```")) {
+                index += 1;
+                break;
+            }
+            const styled = try self.theme.code_block.apply(allocator, lines[index]);
+            defer allocator.free(styled);
+            try rendered.append(allocator, try std.mem.concat(allocator, u8, &.{ self.theme.code_block_indent, styled }));
+        }
+        try rendered.append(allocator, try self.theme.code_block_border.apply(allocator, "```"));
+
+        return .{ .lines = try rendered.toOwnedSlice(allocator), .next_index = index };
+    }
+
+    fn renderListLines(self: *Markdown, allocator: std.mem.Allocator, lines: []const []const u8, width: usize, style_kind: InlineStyleKind) anyerror![][]u8 {
+        var output: std.ArrayList([]u8) = .empty;
+        errdefer freeOwnedLines(allocator, output.items);
+
+        var ordered_counters = [_]usize{0} ** 16;
+        var ordered_active = [_]bool{false} ** 16;
+        var index: usize = 0;
+        while (index < lines.len) {
+            const marker = parseListMarker(lines[index]) orelse {
+                index += 1;
+                continue;
+            };
+            const depth = @min(marker.depth, ordered_counters.len - 1);
+            var content = trimRightBytes(marker.content(lines[index]), " \t\r");
+
+            var marker_text: []u8 = undefined;
+            if (marker.ordered) {
+                const number = if (self.options.preserve_ordered_list_markers)
+                    marker.number
+                else if (ordered_active[depth] and marker.number == 1)
+                    ordered_counters[depth] + 1
+                else
+                    marker.number;
+                ordered_counters[depth] = number;
+                ordered_active[depth] = true;
+                marker_text = try std.fmt.allocPrint(allocator, "{d}{c} ", .{ number, marker.delimiter });
+            } else {
+                marker_text = try allocator.dupe(u8, "- ");
+                ordered_active[depth] = false;
+            }
+            defer allocator.free(marker_text);
+            for (depth + 1..ordered_active.len) |clear_index| ordered_active[clear_index] = false;
+
+            var task_marker: ?[]const u8 = null;
+            if (std.mem.startsWith(u8, content, "[ ] ")) {
+                task_marker = "[ ] ";
+                content = content[4..];
+            } else if (std.mem.startsWith(u8, content, "[x] ") or std.mem.startsWith(u8, content, "[X] ")) {
+                task_marker = "[x] ";
+                content = content[4..];
+            }
+            const full_marker = if (task_marker) |task|
+                try std.mem.concat(allocator, u8, &.{ marker_text, task })
+            else
+                try allocator.dupe(u8, marker_text);
+            defer allocator.free(full_marker);
+
+            const indent_spaces = marker.depth * 4;
+            const styled_marker = try self.theme.list_bullet.apply(allocator, full_marker);
+            defer allocator.free(styled_marker);
+            const first_prefix = try prefixedSpacesConcat(allocator, indent_spaces, styled_marker);
+            defer allocator.free(first_prefix);
+            const continuation_prefix = try repeatedSpaces(allocator, indent_spaces + visibleWidth(full_marker));
+            defer allocator.free(continuation_prefix);
+            const item_width = if (width > visibleWidth(first_prefix)) width - visibleWidth(first_prefix) else 1;
+
+            if (std.mem.startsWith(u8, trimLeftBytes(content, " \t"), "```")) {
+                const consumed = try self.renderListCode(allocator, lines, index, content, item_width, first_prefix, continuation_prefix);
+                defer freeOwnedLines(allocator, consumed.lines);
+                for (consumed.lines) |rendered| try output.append(allocator, try allocator.dupe(u8, rendered));
+                index = consumed.next_index;
+                continue;
+            }
+
+            if (std.mem.startsWith(u8, trimLeftBytes(content, " \t"), ">")) {
+                const quote_text = stripBlockquoteMarker(trimLeftBytes(content, " \t"));
+                const quote_lines = [_][]const u8{quote_text};
+                const rendered_quote = try self.renderQuoteLines(allocator, quote_lines[0..], item_width);
+                defer freeOwnedLines(allocator, rendered_quote);
+                for (rendered_quote, 0..) |quote_line, quote_index| {
+                    const prefix = if (quote_index == 0) first_prefix else continuation_prefix;
+                    try output.append(allocator, try std.mem.concat(allocator, u8, &.{ prefix, quote_line }));
+                }
+                index += 1;
+                continue;
+            }
+
+            const ctx = try self.makeInlineStyleContext(allocator, style_kind);
+            defer ctx.deinit(allocator);
+            const rendered_content = try self.renderInlineText(allocator, content, ctx);
+            defer allocator.free(rendered_content);
+            const wrapped = try wrapTextWithAnsi(allocator, rendered_content, item_width);
+            defer freeOwnedLines(allocator, wrapped);
+            if (wrapped.len == 0) {
+                try output.append(allocator, try allocator.dupe(u8, first_prefix));
+            } else {
+                for (wrapped, 0..) |wrapped_line, wrapped_index| {
+                    const prefix = if (wrapped_index == 0) first_prefix else continuation_prefix;
+                    try output.append(allocator, try std.mem.concat(allocator, u8, &.{ prefix, wrapped_line }));
+                }
+            }
+            index += 1;
+        }
+
+        return output.toOwnedSlice(allocator);
+    }
+
+    fn renderListCode(
+        self: *Markdown,
+        allocator: std.mem.Allocator,
+        lines: []const []const u8,
+        start: usize,
+        first_content: []const u8,
+        item_width: usize,
+        first_prefix: []const u8,
+        continuation_prefix: []const u8,
+    ) !struct { lines: [][]u8, next_index: usize } {
+        var output: std.ArrayList([]u8) = .empty;
+        errdefer freeOwnedLines(allocator, output.items);
+
+        const opening = std.mem.trim(u8, first_content, " \t");
+        const opening_wrapped = try wrapTextWithAnsi(allocator, opening, item_width);
+        defer freeOwnedLines(allocator, opening_wrapped);
+        for (opening_wrapped, 0..) |line, line_index| {
+            const prefix = if (line_index == 0) first_prefix else continuation_prefix;
+            try output.append(allocator, try std.mem.concat(allocator, u8, &.{ prefix, line }));
+        }
+
+        var index = start + 1;
+        while (index < lines.len) : (index += 1) {
+            const stripped = stripContinuationIndent(lines[index]);
+            const trimmed = std.mem.trim(u8, stripped, " \t");
+            if (std.mem.startsWith(u8, trimmed, "```")) {
+                try output.append(allocator, try std.mem.concat(allocator, u8, &.{ continuation_prefix, "```" }));
+                index += 1;
+                break;
+            }
+
+            const styled = try self.theme.code_block.apply(allocator, stripped);
+            defer allocator.free(styled);
+            const code_line = try std.mem.concat(allocator, u8, &.{ self.theme.code_block_indent, styled });
+            defer allocator.free(code_line);
+            const wrapped = try wrapTextWithAnsi(allocator, code_line, item_width);
+            defer freeOwnedLines(allocator, wrapped);
+            for (wrapped) |line| try output.append(allocator, try std.mem.concat(allocator, u8, &.{ continuation_prefix, line }));
+        }
+
+        return .{ .lines = try output.toOwnedSlice(allocator), .next_index = index };
+    }
+
+    fn renderQuoteLines(self: *Markdown, allocator: std.mem.Allocator, quote_lines: []const []const u8, width: usize) anyerror![][]u8 {
+        var inner: std.ArrayList([]const u8) = .empty;
+        defer inner.deinit(allocator);
+        for (quote_lines) |line| try inner.append(allocator, stripBlockquoteMarker(line));
+
+        const joined = try joinLinesWith(allocator, inner.items, "\n");
+        defer allocator.free(joined);
+        const quote_content_width = if (width > 2) width - 2 else 1;
+        const rendered_inner = try self.renderBlocks(allocator, joined, quote_content_width, .none);
+        defer freeOwnedLines(allocator, rendered_inner);
+
+        var result: std.ArrayList([]u8) = .empty;
+        errdefer freeOwnedLines(allocator, result.items);
+        const quote_ctx = try self.makeInlineStyleContext(allocator, .quote);
+        defer quote_ctx.deinit(allocator);
+        const border = try self.theme.quote_border.apply(allocator, "│ ");
+        defer allocator.free(border);
+
+        var end = rendered_inner.len;
+        while (end > 0 and rendered_inner[end - 1].len == 0) end -= 1;
+        const reset_with_prefix = try std.mem.concat(allocator, u8, &.{ RESET, quote_ctx.style_prefix });
+        defer allocator.free(reset_with_prefix);
+        for (rendered_inner[0..end]) |inner_line| {
+            const restored = try replaceAll(allocator, inner_line, RESET, reset_with_prefix);
+            defer allocator.free(restored);
+            const styled = try self.applyStyleKind(allocator, .quote, restored);
+            defer allocator.free(styled);
+            const wrapped = try wrapTextWithAnsi(allocator, styled, quote_content_width);
+            defer freeOwnedLines(allocator, wrapped);
+            for (wrapped) |wrapped_line| try result.append(allocator, try std.mem.concat(allocator, u8, &.{ border, wrapped_line }));
+        }
+
+        return result.toOwnedSlice(allocator);
+    }
+
+    fn renderTableLines(self: *Markdown, allocator: std.mem.Allocator, table_source: []const []const u8, available_width: usize, style_kind: InlineStyleKind) ![][]u8 {
+        const header = try splitTableRow(allocator, table_source[0]);
+        defer freeOwnedLines(allocator, header);
+        if (header.len == 0) return allocator.alloc([]u8, 0);
+        const num_cols = header.len;
+
+        var rows: std.ArrayList([][]u8) = .empty;
+        defer {
+            for (rows.items) |row| freeOwnedLines(allocator, row);
+            rows.deinit(allocator);
+        }
+        for (table_source[2..]) |row_line| {
+            const row = try splitTableRow(allocator, row_line);
+            errdefer freeOwnedLines(allocator, row);
+            try rows.append(allocator, row);
+        }
+
+        const border_overhead = 3 * num_cols + 1;
+        if (available_width <= border_overhead or available_width - border_overhead < num_cols) {
+            const raw = try joinLinesWith(allocator, table_source, "\n");
+            defer allocator.free(raw);
+            return wrapTextWithAnsi(allocator, raw, available_width);
+        }
+        const available_for_cells = available_width - border_overhead;
+
+        var natural_widths = try allocator.alloc(usize, num_cols);
+        defer allocator.free(natural_widths);
+        var min_word_widths = try allocator.alloc(usize, num_cols);
+        defer allocator.free(min_word_widths);
+        @memset(natural_widths, 0);
+        @memset(min_word_widths, 1);
+
+        const ctx = try self.makeInlineStyleContext(allocator, style_kind);
+        defer ctx.deinit(allocator);
+
+        for (header, 0..) |cell, i| try self.measureTableCell(allocator, cell, ctx, &natural_widths[i], &min_word_widths[i]);
+        for (rows.items) |row| {
+            for (row, 0..) |cell, i| {
+                if (i < num_cols) try self.measureTableCell(allocator, cell, ctx, &natural_widths[i], &min_word_widths[i]);
+            }
+        }
+
+        var min_widths = try allocator.dupe(usize, min_word_widths);
+        defer allocator.free(min_widths);
+        var min_cells_width = sumUsize(min_widths);
+        if (min_cells_width > available_for_cells) {
+            @memset(min_widths, 1);
+            const remaining = available_for_cells - num_cols;
+            if (remaining > 0) {
+                var total_weight: usize = 0;
+                for (min_word_widths) |w| total_weight += w -| 1;
+                var allocated: usize = 0;
+                for (min_widths, 0..) |*w, i| {
+                    const weight = min_word_widths[i] -| 1;
+                    const growth = if (total_weight > 0) (weight * remaining) / total_weight else 0;
+                    w.* += growth;
+                    allocated += growth;
+                }
+                var leftover = remaining - allocated;
+                var i: usize = 0;
+                while (leftover > 0 and i < num_cols) : (i += 1) {
+                    min_widths[i] += 1;
+                    leftover -= 1;
+                }
+            }
+            min_cells_width = sumUsize(min_widths);
+        }
+
+        const column_widths = try allocator.alloc(usize, num_cols);
+        defer allocator.free(column_widths);
+        const total_natural = sumUsize(natural_widths) + border_overhead;
+        if (total_natural <= available_width) {
+            for (column_widths, 0..) |*w, i| w.* = @max(natural_widths[i], min_widths[i]);
+        } else {
+            var total_grow: usize = 0;
+            for (natural_widths, 0..) |w, i| total_grow += w -| min_widths[i];
+            const extra = available_for_cells -| min_cells_width;
+            var allocated: usize = 0;
+            for (column_widths, 0..) |*w, i| {
+                const delta = natural_widths[i] -| min_widths[i];
+                const grow = if (total_grow > 0) (delta * extra) / total_grow else 0;
+                w.* = min_widths[i] + grow;
+                allocated += w.*;
+            }
+            var remaining = available_for_cells -| allocated;
+            while (remaining > 0) {
+                var grew = false;
+                for (column_widths, 0..) |*w, i| {
+                    if (remaining == 0) break;
+                    if (w.* < natural_widths[i]) {
+                        w.* += 1;
+                        remaining -= 1;
+                        grew = true;
+                    }
+                }
+                if (!grew) break;
+            }
+        }
+
+        var result: std.ArrayList([]u8) = .empty;
+        errdefer freeOwnedLines(allocator, result.items);
+        try result.append(allocator, try renderTableBorder(allocator, "┌", "┬", "┐", column_widths));
+        try self.appendTableRow(allocator, &result, header, column_widths, ctx, true);
+        try result.append(allocator, try renderTableBorder(allocator, "├", "┼", "┤", column_widths));
+        for (rows.items, 0..) |row, row_index| {
+            try self.appendTableRow(allocator, &result, row, column_widths, ctx, false);
+            if (row_index < rows.items.len - 1) try result.append(allocator, try renderTableBorder(allocator, "├", "┼", "┤", column_widths));
+        }
+        try result.append(allocator, try renderTableBorder(allocator, "└", "┴", "┘", column_widths));
+        return result.toOwnedSlice(allocator);
+    }
+
+    fn measureTableCell(self: *Markdown, allocator: std.mem.Allocator, cell: []const u8, ctx: InlineStyleContext, natural: *usize, min_word: *usize) !void {
+        const rendered = try self.renderInlineText(allocator, cell, ctx);
+        defer allocator.free(rendered);
+        natural.* = @max(natural.*, visibleWidth(rendered));
+        min_word.* = @max(min_word.*, getLongestWordWidth(rendered, 30));
+    }
+
+    fn appendTableRow(
+        self: *Markdown,
+        allocator: std.mem.Allocator,
+        result: *std.ArrayList([]u8),
+        cells: [][]u8,
+        column_widths: []const usize,
+        ctx: InlineStyleContext,
+        header: bool,
+    ) !void {
+        var wrapped_cells = try allocator.alloc([][]u8, column_widths.len);
+        var initialized: usize = 0;
+        defer {
+            for (wrapped_cells[0..initialized]) |cell_lines| freeOwnedLines(allocator, cell_lines);
+            allocator.free(wrapped_cells);
+        }
+
+        var max_lines: usize = 1;
+        for (column_widths, 0..) |width, i| {
+            const cell_text = if (i < cells.len) cells[i] else "";
+            const rendered = try self.renderInlineText(allocator, cell_text, ctx);
+            defer allocator.free(rendered);
+            wrapped_cells[i] = try wrapTextWithAnsi(allocator, rendered, width);
+            initialized += 1;
+            max_lines = @max(max_lines, wrapped_cells[i].len);
+        }
+
+        var line_index: usize = 0;
+        while (line_index < max_lines) : (line_index += 1) {
+            var line: std.ArrayList(u8) = .empty;
+            errdefer line.deinit(allocator);
+            try line.appendSlice(allocator, "│ ");
+            for (wrapped_cells, 0..) |cell_lines, col| {
+                const text = if (line_index < cell_lines.len) cell_lines[line_index] else "";
+                const padded = try padToWidth(allocator, text, column_widths[col]);
+                defer allocator.free(padded);
+                if (header) {
+                    const styled = try self.theme.bold.apply(allocator, padded);
+                    defer allocator.free(styled);
+                    try line.appendSlice(allocator, styled);
+                } else {
+                    try line.appendSlice(allocator, padded);
+                }
+                if (col + 1 < wrapped_cells.len) try line.appendSlice(allocator, " │ ") else try line.appendSlice(allocator, " │");
+            }
+            try result.append(allocator, try line.toOwnedSlice(allocator));
+        }
+    }
+
+    fn renderInlineText(self: *Markdown, allocator: std.mem.Allocator, text: []const u8, ctx: InlineStyleContext) ![]u8 {
+        var output: std.ArrayList(u8) = .empty;
+        errdefer output.deinit(allocator);
+
+        var index: usize = 0;
+        while (index < text.len) {
+            if (std.mem.startsWith(u8, text[index..], "`")) {
+                if (std.mem.indexOfScalarPos(u8, text, index + 1, '`')) |end| {
+                    const styled = try self.theme.code.apply(allocator, text[index + 1 .. end]);
+                    defer allocator.free(styled);
+                    try output.appendSlice(allocator, styled);
+                    try output.appendSlice(allocator, ctx.style_prefix);
+                    index = end + 1;
+                    continue;
+                }
+            }
+            if (std.mem.startsWith(u8, text[index..], "**")) {
+                if (std.mem.indexOfPos(u8, text, index + 2, "**")) |end| {
+                    const inner = try self.renderInlineText(allocator, text[index + 2 .. end], ctx);
+                    defer allocator.free(inner);
+                    const styled = try self.theme.bold.apply(allocator, inner);
+                    defer allocator.free(styled);
+                    try output.appendSlice(allocator, styled);
+                    try output.appendSlice(allocator, ctx.style_prefix);
+                    index = end + 2;
+                    continue;
+                }
+            }
+            if (std.mem.startsWith(u8, text[index..], "~~")) {
+                if (strictDelEnd(text, index + 2)) |end| {
+                    const inner = try self.renderInlineText(allocator, text[index + 2 .. end], ctx);
+                    defer allocator.free(inner);
+                    const styled = try self.theme.strikethrough.apply(allocator, inner);
+                    defer allocator.free(styled);
+                    try output.appendSlice(allocator, styled);
+                    try output.appendSlice(allocator, ctx.style_prefix);
+                    index = end + 2;
+                    continue;
+                }
+            }
+            if (text[index] == '[') {
+                if (parseInlineLink(text, index)) |link| {
+                    const link_text = try self.renderInlineText(allocator, link.text, ctx);
+                    defer allocator.free(link_text);
+                    try self.appendRenderedLink(allocator, &output, link_text, link.raw_text, link.href, ctx.style_prefix);
+                    index = link.end;
+                    continue;
+                }
+            }
+            if (std.mem.startsWith(u8, text[index..], "http://") or std.mem.startsWith(u8, text[index..], "https://")) {
+                const end = scanBareUrl(text, index);
+                const url = text[index..end];
+                try self.appendRenderedLink(allocator, &output, url, url, url, ctx.style_prefix);
+                index = end;
+                continue;
+            }
+            if (scanEmail(text, index)) |email_end| {
+                const email = text[index..email_end];
+                const href = try std.mem.concat(allocator, u8, &.{ "mailto:", email });
+                defer allocator.free(href);
+                try self.appendRenderedLink(allocator, &output, email, email, href, ctx.style_prefix);
+                index = email_end;
+                continue;
+            }
+            if (text[index] == '*') {
+                if (index + 1 < text.len and text[index + 1] != '*') {
+                    if (std.mem.indexOfScalarPos(u8, text, index + 1, '*')) |end| {
+                        const inner = try self.renderInlineText(allocator, text[index + 1 .. end], ctx);
+                        defer allocator.free(inner);
+                        const styled = try self.theme.italic.apply(allocator, inner);
+                        defer allocator.free(styled);
+                        try output.appendSlice(allocator, styled);
+                        try output.appendSlice(allocator, ctx.style_prefix);
+                        index = end + 1;
+                        continue;
+                    }
+                }
+            }
+
+            const next = nextInlineSpecial(text, index + 1);
+            const styled = try self.applyTextWithNewlines(allocator, text[index..next], ctx.kind);
+            defer allocator.free(styled);
+            try output.appendSlice(allocator, styled);
+            index = next;
+        }
+
+        while (ctx.style_prefix.len > 0 and std.mem.endsWith(u8, output.items, ctx.style_prefix)) {
+            output.shrinkRetainingCapacity(output.items.len - ctx.style_prefix.len);
+        }
+        return output.toOwnedSlice(allocator);
+    }
+
+    fn appendRenderedLink(
+        self: *Markdown,
+        allocator: std.mem.Allocator,
+        output: *std.ArrayList(u8),
+        link_text: []const u8,
+        raw_text: []const u8,
+        href: []const u8,
+        style_prefix: []const u8,
+    ) !void {
+        const underlined = try self.theme.underline.apply(allocator, link_text);
+        defer allocator.free(underlined);
+        const styled_link = try self.theme.link.apply(allocator, underlined);
+        defer allocator.free(styled_link);
+
+        if (terminal_image.getCapabilities().hyperlinks) {
+            const linked = try terminal_image.hyperlink(allocator, styled_link, href);
+            defer allocator.free(linked);
+            try output.appendSlice(allocator, linked);
+            try output.appendSlice(allocator, style_prefix);
+            return;
+        }
+
+        const href_for_comparison = if (std.mem.startsWith(u8, href, "mailto:")) href[7..] else href;
+        try output.appendSlice(allocator, styled_link);
+        if (!std.mem.eql(u8, raw_text, href) and !std.mem.eql(u8, raw_text, href_for_comparison)) {
+            const url_text = try std.fmt.allocPrint(allocator, " ({s})", .{href});
+            defer allocator.free(url_text);
+            const styled_url = try self.theme.link_url.apply(allocator, url_text);
+            defer allocator.free(styled_url);
+            try output.appendSlice(allocator, styled_url);
+        }
+        try output.appendSlice(allocator, style_prefix);
+    }
+
+    fn makeInlineStyleContext(self: *Markdown, allocator: std.mem.Allocator, kind: InlineStyleKind) !InlineStyleContext {
+        return .{ .kind = kind, .style_prefix = try self.getStylePrefix(allocator, kind) };
+    }
+
+    fn applyTextWithNewlines(self: *Markdown, allocator: std.mem.Allocator, text: []const u8, kind: InlineStyleKind) ![]u8 {
+        var output: std.ArrayList(u8) = .empty;
+        errdefer output.deinit(allocator);
+        var start: usize = 0;
+        while (true) {
+            const newline = std.mem.indexOfScalarPos(u8, text, start, '\n') orelse text.len;
+            const styled = try self.applyStyleKind(allocator, kind, text[start..newline]);
+            defer allocator.free(styled);
+            try output.appendSlice(allocator, styled);
+            if (newline == text.len) break;
+            try output.append(allocator, '\n');
+            start = newline + 1;
+        }
+        return output.toOwnedSlice(allocator);
+    }
+
+    fn applyStyleKind(self: *Markdown, allocator: std.mem.Allocator, kind: InlineStyleKind, text: []const u8) ![]u8 {
+        switch (kind) {
+            .default => return self.applyDefaultStyle(allocator, text),
+            .none => return allocator.dupe(u8, text),
+            .heading_one => {
+                const underlined = try self.theme.underline.apply(allocator, text);
+                defer allocator.free(underlined);
+                const bold = try self.theme.bold.apply(allocator, underlined);
+                defer allocator.free(bold);
+                return self.theme.heading.apply(allocator, bold);
+            },
+            .heading => {
+                const bold = try self.theme.bold.apply(allocator, text);
+                defer allocator.free(bold);
+                return self.theme.heading.apply(allocator, bold);
+            },
+            .quote => {
+                const italic = try self.theme.italic.apply(allocator, text);
+                defer allocator.free(italic);
+                return self.theme.quote.apply(allocator, italic);
+            },
+        }
+    }
+
+    fn applyDefaultStyle(self: *Markdown, allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+        const style = self.default_text_style orelse return allocator.dupe(u8, text);
+        var current = try allocator.dupe(u8, text);
+        errdefer allocator.free(current);
+        if (style.color) |color| try replaceStyled(allocator, &current, color);
+        if (style.bold) try replaceStyled(allocator, &current, self.theme.bold);
+        if (style.italic) try replaceStyled(allocator, &current, self.theme.italic);
+        if (style.strikethrough) try replaceStyled(allocator, &current, self.theme.strikethrough);
+        if (style.underline) try replaceStyled(allocator, &current, self.theme.underline);
+        return current;
+    }
+
+    fn getStylePrefix(self: *Markdown, allocator: std.mem.Allocator, kind: InlineStyleKind) ![]u8 {
+        const styled = try self.applyStyleKind(allocator, kind, "\x00");
+        defer allocator.free(styled);
+        const sentinel = std.mem.indexOfScalar(u8, styled, 0) orelse return allocator.dupe(u8, "");
+        return allocator.dupe(u8, styled[0..sentinel]);
+    }
+
+    fn applyMarkdownBackground(self: *Markdown, allocator: std.mem.Allocator, line: []const u8, width: usize) ![]u8 {
+        if (self.default_text_style) |style| {
+            if (style.bg_color) |bg| return applyBackgroundStyleToLine(allocator, line, width, bg);
+        }
+        return padToWidth(allocator, line, width);
+    }
+
+    fn replaceCache(self: *Markdown, lines: [][]u8, width: usize) void {
+        self.clearCache();
+        self.cached_lines = lines;
+        self.cached_width = width;
+    }
+
+    fn clearCache(self: *Markdown) void {
+        if (self.cached_lines) |lines| freeOwnedLines(self.allocator, lines);
+        self.cached_lines = null;
+        self.cached_width = null;
+    }
+};
+
 pub const LoaderIndicatorOptions = struct {
     frames: ?[]const []const u8 = null,
     interval_ms: ?u64 = null,
@@ -1990,6 +2862,378 @@ fn applyBackgroundStyleToLine(allocator: std.mem.Allocator, line: []const u8, wi
     return bg_fn.apply(allocator, padded);
 }
 
+fn replaceStyled(allocator: std.mem.Allocator, current: *[]u8, style: TextStyle) !void {
+    const next = try style.apply(allocator, current.*);
+    allocator.free(current.*);
+    current.* = next;
+}
+
+fn splitBorrowedLines(allocator: std.mem.Allocator, text: []const u8) ![][]const u8 {
+    var lines: std.ArrayList([]const u8) = .empty;
+    errdefer lines.deinit(allocator);
+    var start: usize = 0;
+    while (true) {
+        const newline = std.mem.indexOfScalarPos(u8, text, start, '\n') orelse text.len;
+        var line = text[start..newline];
+        if (std.mem.endsWith(u8, line, "\r")) line = line[0 .. line.len - 1];
+        try lines.append(allocator, line);
+        if (newline == text.len) break;
+        start = newline + 1;
+    }
+    return lines.toOwnedSlice(allocator);
+}
+
+fn isBlankLine(line: []const u8) bool {
+    return std.mem.trim(u8, line, " \t\r\n").len == 0;
+}
+
+fn trimLeftBytes(input: []const u8, values: []const u8) []const u8 {
+    var start: usize = 0;
+    while (start < input.len and std.mem.indexOfScalar(u8, values, input[start]) != null) : (start += 1) {}
+    return input[start..];
+}
+
+fn trimRightBytes(input: []const u8, values: []const u8) []const u8 {
+    var end = input.len;
+    while (end > 0 and std.mem.indexOfScalar(u8, values, input[end - 1]) != null) : (end -= 1) {}
+    return input[0..end];
+}
+
+const ParsedHeading = struct {
+    level: usize,
+    text: []const u8,
+};
+
+fn parseHeading(line: []const u8) ?ParsedHeading {
+    var index: usize = 0;
+    var leading: usize = 0;
+    while (index < line.len and line[index] == ' ' and leading < 4) : ({
+        index += 1;
+        leading += 1;
+    }) {}
+    if (leading > 3) return null;
+    var level: usize = 0;
+    while (index + level < line.len and line[index + level] == '#' and level < 6) : (level += 1) {}
+    if (level == 0) return null;
+    if (index + level >= line.len or line[index + level] != ' ') return null;
+    return .{ .level = level, .text = std.mem.trim(u8, line[index + level + 1 ..], " \t") };
+}
+
+fn blockKindAt(lines: []const []const u8, index: usize) MarkdownBlockKind {
+    if (index >= lines.len) return .space;
+    const line = lines[index];
+    if (isBlankLine(line)) return .space;
+    if (parseHeading(line) != null) return .heading;
+    if (isFenceLine(line)) return .code;
+    if (parseListMarker(line) != null) return .list;
+    if (isBlockquoteStart(line)) return .blockquote;
+    if (isHrLine(line)) return .hr;
+    if (index + 1 < lines.len and isTableRow(line) and isTableDelimiterLine(lines[index + 1])) return .table;
+    return .paragraph;
+}
+
+fn addsSpacingBeforeNext(current: MarkdownBlockKind, next: MarkdownBlockKind) bool {
+    return switch (current) {
+        .heading, .code, .table, .blockquote, .hr => next != .space,
+        .paragraph => next != .space and next != .list,
+        else => false,
+    };
+}
+
+fn appendSingleBlank(allocator: std.mem.Allocator, output: *std.ArrayList([]u8)) !void {
+    if (output.items.len == 0 or output.items[output.items.len - 1].len != 0) {
+        try output.append(allocator, try allocator.dupe(u8, ""));
+    }
+}
+
+fn isFenceLine(line: []const u8) bool {
+    return std.mem.startsWith(u8, trimLeftBytes(line, " \t"), "```");
+}
+
+fn isHrLine(line: []const u8) bool {
+    const trimmed = std.mem.trim(u8, line, " \t");
+    if (trimmed.len < 3) return false;
+    const first = trimmed[0];
+    if (first != '-' and first != '*' and first != '_') return false;
+    for (trimmed) |byte| {
+        if (byte != first) return false;
+    }
+    return true;
+}
+
+fn isBlockquoteStart(line: []const u8) bool {
+    const trimmed = trimLeftBytes(line, " \t");
+    return std.mem.startsWith(u8, trimmed, ">");
+}
+
+fn continuesBlockquote(line: []const u8) bool {
+    if (isBlankLine(line)) return false;
+    const kind = blockKindAt(&.{line}, 0);
+    return kind == .paragraph or kind == .blockquote or kind == .list;
+}
+
+fn stripBlockquoteMarker(line: []const u8) []const u8 {
+    const trimmed = trimLeftBytes(line, " \t");
+    if (!std.mem.startsWith(u8, trimmed, ">")) return trimmed;
+    var rest = trimmed[1..];
+    if (std.mem.startsWith(u8, rest, " ")) rest = rest[1..];
+    return rest;
+}
+
+fn parseListMarker(line: []const u8) ?ListMarker {
+    var index: usize = 0;
+    while (index < line.len and line[index] == ' ') : (index += 1) {}
+    if (index >= line.len) return null;
+    const indent = index;
+    const depth = indent / 2;
+
+    if ((line[index] == '-' or line[index] == '*' or line[index] == '+') and index + 1 < line.len and std.ascii.isWhitespace(line[index + 1])) {
+        return .{
+            .indent = indent,
+            .depth = depth,
+            .ordered = false,
+            .number = 0,
+            .marker_len = index + 2,
+            .delimiter = line[index],
+        };
+    }
+
+    if (!std.ascii.isDigit(line[index])) return null;
+    var end = index;
+    var value: usize = 0;
+    var digits: usize = 0;
+    while (end < line.len and std.ascii.isDigit(line[end]) and digits < 9) : ({
+        end += 1;
+        digits += 1;
+    }) {
+        value = value * 10 + (line[end] - '0');
+    }
+    if (digits == 0 or end >= line.len or (line[end] != '.' and line[end] != ')')) return null;
+    if (end + 1 >= line.len or !std.ascii.isWhitespace(line[end + 1])) return null;
+    return .{
+        .indent = indent,
+        .depth = depth,
+        .ordered = true,
+        .number = value,
+        .marker_len = end + 2,
+        .delimiter = line[end],
+    };
+}
+
+fn leadingSpaceCount(line: []const u8) usize {
+    var count: usize = 0;
+    while (count < line.len and line[count] == ' ') : (count += 1) {}
+    return count;
+}
+
+fn stripContinuationIndent(line: []const u8) []const u8 {
+    var index: usize = 0;
+    var removed: usize = 0;
+    while (index < line.len and line[index] == ' ' and removed < 2) : ({
+        index += 1;
+        removed += 1;
+    }) {}
+    return line[index..];
+}
+
+fn isTableRow(line: []const u8) bool {
+    return std.mem.indexOfScalar(u8, line, '|') != null;
+}
+
+fn isTableDelimiterLine(line: []const u8) bool {
+    var cells = std.mem.splitScalar(u8, std.mem.trim(u8, line, " \t|"), '|');
+    var count: usize = 0;
+    while (cells.next()) |raw_cell| {
+        const cell = std.mem.trim(u8, raw_cell, " \t");
+        if (cell.len == 0) return false;
+        var hyphens: usize = 0;
+        for (cell) |byte| {
+            if (byte == '-') {
+                hyphens += 1;
+            } else if (byte != ':') {
+                return false;
+            }
+        }
+        if (hyphens < 3) return false;
+        count += 1;
+    }
+    return count > 0;
+}
+
+fn splitTableRow(allocator: std.mem.Allocator, line: []const u8) ![][]u8 {
+    const trimmed = std.mem.trim(u8, line, " \t");
+    const without_left = if (std.mem.startsWith(u8, trimmed, "|")) trimmed[1..] else trimmed;
+    const without_edges = if (std.mem.endsWith(u8, without_left, "|")) without_left[0 .. without_left.len - 1] else without_left;
+    var cells: std.ArrayList([]u8) = .empty;
+    errdefer freeOwnedLines(allocator, cells.items);
+    var parts = std.mem.splitScalar(u8, without_edges, '|');
+    while (parts.next()) |part| {
+        try cells.append(allocator, try allocator.dupe(u8, std.mem.trim(u8, part, " \t")));
+    }
+    return cells.toOwnedSlice(allocator);
+}
+
+fn repeatedSlice(allocator: std.mem.Allocator, slice: []const u8, count: usize) ![]u8 {
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(allocator);
+    var index: usize = 0;
+    while (index < count) : (index += 1) try output.appendSlice(allocator, slice);
+    return output.toOwnedSlice(allocator);
+}
+
+fn prefixedSpacesConcat(allocator: std.mem.Allocator, spaces: usize, text: []const u8) ![]u8 {
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(allocator);
+    try appendSpaces(allocator, &output, spaces);
+    try output.appendSlice(allocator, text);
+    return output.toOwnedSlice(allocator);
+}
+
+fn joinLinesWith(allocator: std.mem.Allocator, lines: []const []const u8, separator: []const u8) ![]u8 {
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(allocator);
+    for (lines, 0..) |line, index| {
+        if (index > 0) try output.appendSlice(allocator, separator);
+        try output.appendSlice(allocator, line);
+    }
+    return output.toOwnedSlice(allocator);
+}
+
+fn replaceAll(allocator: std.mem.Allocator, text: []const u8, needle: []const u8, replacement: []const u8) ![]u8 {
+    if (needle.len == 0) return allocator.dupe(u8, text);
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(allocator);
+    var index: usize = 0;
+    while (std.mem.indexOfPos(u8, text, index, needle)) |found| {
+        try output.appendSlice(allocator, text[index..found]);
+        try output.appendSlice(allocator, replacement);
+        index = found + needle.len;
+    }
+    try output.appendSlice(allocator, text[index..]);
+    return output.toOwnedSlice(allocator);
+}
+
+fn renderTableBorder(allocator: std.mem.Allocator, left: []const u8, mid: []const u8, right: []const u8, widths: []const usize) ![]u8 {
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(allocator);
+    try output.appendSlice(allocator, left);
+    try output.appendSlice(allocator, "─");
+    for (widths, 0..) |width, index| {
+        var i: usize = 0;
+        while (i < width) : (i += 1) try output.appendSlice(allocator, "─");
+        if (index + 1 < widths.len) {
+            try output.appendSlice(allocator, "─");
+            try output.appendSlice(allocator, mid);
+            try output.appendSlice(allocator, "─");
+        }
+    }
+    try output.appendSlice(allocator, "─");
+    try output.appendSlice(allocator, right);
+    return output.toOwnedSlice(allocator);
+}
+
+fn sumUsize(values: []const usize) usize {
+    var sum: usize = 0;
+    for (values) |value| sum += value;
+    return sum;
+}
+
+fn getLongestWordWidth(text: []const u8, max_width: usize) usize {
+    var longest: usize = 0;
+    var start: usize = 0;
+    while (start < text.len) {
+        while (start < text.len and std.ascii.isWhitespace(text[start])) : (start += 1) {}
+        const end = blk: {
+            var index = start;
+            while (index < text.len and !std.ascii.isWhitespace(text[index])) : (index += 1) {}
+            break :blk index;
+        };
+        if (end > start) longest = @max(longest, visibleWidth(text[start..end]));
+        start = end + @intFromBool(end < text.len);
+    }
+    return @min(longest, max_width);
+}
+
+const InlineLink = struct {
+    text: []const u8,
+    raw_text: []const u8,
+    href: []const u8,
+    end: usize,
+};
+
+fn parseInlineLink(text: []const u8, start: usize) ?InlineLink {
+    const close_bracket = std.mem.indexOfScalarPos(u8, text, start + 1, ']') orelse return null;
+    if (close_bracket + 1 >= text.len or text[close_bracket + 1] != '(') return null;
+    const close_paren = std.mem.indexOfScalarPos(u8, text, close_bracket + 2, ')') orelse return null;
+    return .{
+        .text = text[start + 1 .. close_bracket],
+        .raw_text = text[start + 1 .. close_bracket],
+        .href = text[close_bracket + 2 .. close_paren],
+        .end = close_paren + 1,
+    };
+}
+
+fn strictDelEnd(text: []const u8, start: usize) ?usize {
+    if (start >= text.len or std.ascii.isWhitespace(text[start]) or text[start] == '~') return null;
+    var index = start;
+    while (std.mem.indexOfPos(u8, text, index, "~~")) |end| {
+        if (end > start and !std.ascii.isWhitespace(text[end - 1]) and text[end - 1] != '~') return end;
+        index = end + 2;
+    }
+    return null;
+}
+
+fn scanBareUrl(text: []const u8, start: usize) usize {
+    var end = start;
+    while (end < text.len) : (end += 1) {
+        const byte = text[end];
+        if (std.ascii.isWhitespace(byte) or byte == '|' or byte == ')' or byte == ']') break;
+    }
+    while (end > start and std.mem.indexOfScalar(u8, ".,;:!?", text[end - 1]) != null) end -= 1;
+    return end;
+}
+
+fn scanEmail(text: []const u8, start: usize) ?usize {
+    if (start > 0 and isEmailChar(text[start - 1])) return null;
+    if (!isEmailLocalStart(text[start])) return null;
+    var end = start;
+    var at_seen = false;
+    var dot_after_at = false;
+    while (end < text.len and isEmailChar(text[end])) : (end += 1) {
+        if (text[end] == '@') at_seen = true;
+        if (at_seen and text[end] == '.') dot_after_at = true;
+    }
+    if (!at_seen or !dot_after_at or end == start) return null;
+    if (end < text.len and isEmailChar(text[end])) return null;
+    return end;
+}
+
+fn isEmailLocalStart(byte: u8) bool {
+    return std.ascii.isAlphanumeric(byte);
+}
+
+fn isEmailChar(byte: u8) bool {
+    return std.ascii.isAlphanumeric(byte) or byte == '@' or byte == '.' or byte == '_' or byte == '%' or byte == '+' or byte == '-';
+}
+
+fn nextInlineSpecial(text: []const u8, start: usize) usize {
+    var index = start;
+    while (index < text.len) : (index += 1) {
+        if (std.mem.startsWith(u8, text[index..], "`") or
+            std.mem.startsWith(u8, text[index..], "**") or
+            std.mem.startsWith(u8, text[index..], "~~") or
+            std.mem.startsWith(u8, text[index..], "http://") or
+            std.mem.startsWith(u8, text[index..], "https://") or
+            text[index] == '[' or
+            text[index] == '*')
+        {
+            return index;
+        }
+        if (scanEmail(text, index) != null) return index;
+    }
+    return text.len;
+}
+
 fn cloneFrames(allocator: std.mem.Allocator, frames: []const []const u8) ![][]u8 {
     var result = try allocator.alloc([]u8, frames.len);
     var initialized: usize = 0;
@@ -2396,6 +3640,127 @@ fn bracketStyle(_: ?*anyopaque, allocator: std.mem.Allocator, text: []const u8) 
 
 fn parenStyle(_: ?*anyopaque, allocator: std.mem.Allocator, text: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "({s})", .{text});
+}
+
+fn ansiBold(_: ?*anyopaque, allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "\x1b[1m{s}\x1b[22m", .{text});
+}
+
+fn ansiItalic(_: ?*anyopaque, allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "\x1b[3m{s}\x1b[23m", .{text});
+}
+
+fn ansiUnderline(_: ?*anyopaque, allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "\x1b[4m{s}\x1b[24m", .{text});
+}
+
+fn ansiStrike(_: ?*anyopaque, allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "\x1b[9m{s}\x1b[29m", .{text});
+}
+
+fn ansiCyan(_: ?*anyopaque, allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "\x1b[36m{s}\x1b[39m", .{text});
+}
+
+fn ansiBlue(_: ?*anyopaque, allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "\x1b[34m{s}\x1b[39m", .{text});
+}
+
+fn ansiDim(_: ?*anyopaque, allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "\x1b[2m{s}\x1b[22m", .{text});
+}
+
+fn ansiYellow(_: ?*anyopaque, allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "\x1b[33m{s}\x1b[39m", .{text});
+}
+
+fn ansiGreen(_: ?*anyopaque, allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "\x1b[32m{s}\x1b[39m", .{text});
+}
+
+fn ansiGray(_: ?*anyopaque, allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "\x1b[90m{s}\x1b[39m", .{text});
+}
+
+fn ansiMagenta(_: ?*anyopaque, allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "\x1b[35m{s}\x1b[39m", .{text});
+}
+
+fn ansiBgBlue(_: ?*anyopaque, allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "\x1b[44m{s}\x1b[49m", .{text});
+}
+
+const test_markdown_theme = MarkdownTheme{
+    .heading = .{ .apply_fn = ansiCyan },
+    .link = .{ .apply_fn = ansiBlue },
+    .link_url = .{ .apply_fn = ansiDim },
+    .code = .{ .apply_fn = ansiYellow },
+    .code_block = .{ .apply_fn = ansiGreen },
+    .code_block_border = .{ .apply_fn = ansiDim },
+    .quote = .{ .apply_fn = ansiItalic },
+    .quote_border = .{ .apply_fn = ansiDim },
+    .hr = .{ .apply_fn = ansiDim },
+    .list_bullet = .{ .apply_fn = ansiCyan },
+    .bold = .{ .apply_fn = ansiBold },
+    .italic = .{ .apply_fn = ansiItalic },
+    .strikethrough = .{ .apply_fn = ansiStrike },
+    .underline = .{ .apply_fn = ansiUnderline },
+};
+
+fn stripAnsiAlloc(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(allocator);
+    var index: usize = 0;
+    while (index < text.len) {
+        if (extractAnsiCode(text, index)) |ansi| {
+            index += ansi.length;
+            continue;
+        }
+        try output.append(allocator, text[index]);
+        index += 1;
+    }
+    return output.toOwnedSlice(allocator);
+}
+
+fn renderMarkdownPlain(allocator: std.mem.Allocator, markdown: *Markdown, width: usize) ![][]u8 {
+    const lines = try markdown.render(allocator, width);
+    defer freeRenderedLines(allocator, lines);
+    var plain = try allocator.alloc([]u8, lines.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (plain[0..initialized]) |line| allocator.free(line);
+        allocator.free(plain);
+    }
+    for (lines, 0..) |line, index| {
+        const stripped = try stripAnsiAlloc(allocator, line);
+        defer allocator.free(stripped);
+        plain[index] = try trimEndSpacesAlloc(allocator, stripped);
+        initialized += 1;
+    }
+    return plain;
+}
+
+fn containsLineWith(lines: []const []const u8, needle: []const u8) bool {
+    for (lines) |line| {
+        if (std.mem.indexOf(u8, line, needle) != null) return true;
+    }
+    return false;
+}
+
+fn removeTableNoise(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(allocator);
+    for (text) |byte| {
+        switch (byte) {
+            ' ', '\t', '\n', '\r' => {},
+            else => {
+                if (std.mem.indexOfScalar(u8, "│├┤┌┐└┘┬┴┼─", byte) == null) {
+                    try output.append(allocator, byte);
+                }
+            },
+        }
+    }
+    return output.toOwnedSlice(allocator);
 }
 
 test "truncateToWidth keeps output within width for very large unicode input" {
@@ -2976,6 +4341,308 @@ test "Image renders iTerm2 sequence on the last accounted row" {
     try std.testing.expectEqual(@as(usize, 2), rendered.len);
     try std.testing.expectEqualStrings("", rendered[0]);
     try std.testing.expect(std.mem.startsWith(u8, rendered[1], "\x1b[1A\x1b]1337;File="));
+}
+
+test "Markdown renders nested and ordered lists with Pi-compatible markers" {
+    const allocator = std.testing.allocator;
+
+    var nested = try Markdown.init(
+        allocator,
+        "- Item 1\n  - Nested 1.1\n  - Nested 1.2\n- Item 2",
+        0,
+        0,
+        test_markdown_theme,
+        null,
+        .{},
+    );
+    defer nested.deinit();
+    const nested_lines = try renderMarkdownPlain(allocator, &nested, 80);
+    defer freeRenderedLines(allocator, nested_lines);
+    try std.testing.expect(containsLineWith(nested_lines, "- Item 1"));
+    try std.testing.expect(containsLineWith(nested_lines, "    - Nested 1.1"));
+    try std.testing.expect(containsLineWith(nested_lines, "    - Nested 1.2"));
+    try std.testing.expect(containsLineWith(nested_lines, "- Item 2"));
+
+    var normalized = try Markdown.init(allocator, "1. alpha\n1. beta\n1. gamma", 0, 0, test_markdown_theme, null, .{});
+    defer normalized.deinit();
+    const normalized_lines = try renderMarkdownPlain(allocator, &normalized, 80);
+    defer freeRenderedLines(allocator, normalized_lines);
+    try std.testing.expectEqualStrings("1. alpha", normalized_lines[0]);
+    try std.testing.expectEqualStrings("2. beta", normalized_lines[1]);
+    try std.testing.expectEqualStrings("3. gamma", normalized_lines[2]);
+
+    var preserved = try Markdown.init(
+        allocator,
+        "  4. forth\n  3. third\n\n10) ten\n7) seven",
+        0,
+        0,
+        test_markdown_theme,
+        null,
+        .{ .preserve_ordered_list_markers = true },
+    );
+    defer preserved.deinit();
+    const preserved_lines = try renderMarkdownPlain(allocator, &preserved, 80);
+    defer freeRenderedLines(allocator, preserved_lines);
+    try std.testing.expectEqualStrings("    4. forth", preserved_lines[0]);
+    try std.testing.expectEqualStrings("    3. third", preserved_lines[1]);
+    try std.testing.expectEqualStrings("", preserved_lines[2]);
+    try std.testing.expectEqualStrings("10) ten", preserved_lines[3]);
+    try std.testing.expectEqualStrings("7) seven", preserved_lines[4]);
+}
+
+test "Markdown indents wrapped list continuations and task markers" {
+    const allocator = std.testing.allocator;
+    var unordered = try Markdown.init(allocator, "- alpha beta gamma delta epsilon", 0, 0, test_markdown_theme, null, .{});
+    defer unordered.deinit();
+    const unordered_lines = try renderMarkdownPlain(allocator, &unordered, 20);
+    defer freeRenderedLines(allocator, unordered_lines);
+    try std.testing.expectEqualStrings("- alpha beta gamma", unordered_lines[0]);
+    try std.testing.expectEqualStrings("  delta epsilon", unordered_lines[1]);
+
+    var ordered = try Markdown.init(allocator, "10. alpha beta gamma delta epsilon", 0, 0, test_markdown_theme, null, .{});
+    defer ordered.deinit();
+    const ordered_lines = try renderMarkdownPlain(allocator, &ordered, 21);
+    defer freeRenderedLines(allocator, ordered_lines);
+    try std.testing.expectEqualStrings("10. alpha beta gamma", ordered_lines[0]);
+    try std.testing.expectEqualStrings("    delta epsilon", ordered_lines[1]);
+
+    var tasks = try Markdown.init(allocator, "- [ ] beep\n- [x] boop", 0, 0, test_markdown_theme, null, .{});
+    defer tasks.deinit();
+    const task_lines = try renderMarkdownPlain(allocator, &tasks, 80);
+    defer freeRenderedLines(allocator, task_lines);
+    try std.testing.expectEqualStrings("- [ ] beep", task_lines[0]);
+    try std.testing.expectEqualStrings("- [x] boop", task_lines[1]);
+}
+
+test "Markdown renders blockquotes inside and outside list items" {
+    const allocator = std.testing.allocator;
+    var list_quote = try Markdown.init(allocator, "- > alpha beta gamma delta epsilon zeta", 0, 0, test_markdown_theme, null, .{});
+    defer list_quote.deinit();
+    const list_quote_lines = try renderMarkdownPlain(allocator, &list_quote, 24);
+    defer freeRenderedLines(allocator, list_quote_lines);
+    try std.testing.expectEqualStrings("- │ alpha beta gamma", list_quote_lines[0]);
+    try std.testing.expectEqualStrings("  │ delta epsilon zeta", list_quote_lines[1]);
+
+    var quote = try Markdown.init(
+        allocator,
+        ">Foo\nbar",
+        0,
+        0,
+        test_markdown_theme,
+        .{ .color = .{ .apply_fn = ansiMagenta } },
+        .{},
+    );
+    defer quote.deinit();
+    const quote_lines = try quote.render(allocator, 80);
+    defer freeRenderedLines(allocator, quote_lines);
+    const stripped_foo = try stripAnsiAlloc(allocator, quote_lines[0]);
+    defer allocator.free(stripped_foo);
+    const stripped_bar = try stripAnsiAlloc(allocator, quote_lines[1]);
+    defer allocator.free(stripped_bar);
+    const plain_foo = try trimEndSpacesAlloc(allocator, stripped_foo);
+    defer allocator.free(plain_foo);
+    const plain_bar = try trimEndSpacesAlloc(allocator, stripped_bar);
+    defer allocator.free(plain_bar);
+    try std.testing.expectEqualStrings("│ Foo", plain_foo);
+    try std.testing.expectEqualStrings("│ bar", plain_bar);
+    try std.testing.expect(std.mem.indexOf(u8, quote_lines[0], "\x1b[3m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, quote_lines[1], "\x1b[3m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, quote_lines[0], "\x1b[35m") == null);
+    try std.testing.expect(std.mem.indexOf(u8, quote_lines[1], "\x1b[35m") == null);
+}
+
+test "Markdown renders list item fenced code with continuation prefixes" {
+    const allocator = std.testing.allocator;
+    var markdown = try Markdown.init(
+        allocator,
+        "- ```ts\n  alpha beta gamma delta epsilon zeta\n  ```",
+        0,
+        0,
+        test_markdown_theme,
+        null,
+        .{},
+    );
+    defer markdown.deinit();
+    const lines = try renderMarkdownPlain(allocator, &markdown, 24);
+    defer freeRenderedLines(allocator, lines);
+    try std.testing.expectEqualStrings("- ```ts", lines[0]);
+    try std.testing.expectEqualStrings("    alpha beta gamma", lines[1]);
+    try std.testing.expectEqualStrings("  delta epsilon zeta", lines[2]);
+    try std.testing.expectEqualStrings("  ```", lines[3]);
+}
+
+test "Markdown renders and wraps tables within the available width" {
+    const allocator = std.testing.allocator;
+    terminal_image.setCapabilities(.{ .images = null, .true_color = false, .hyperlinks = false });
+    defer terminal_image.resetCapabilitiesCache();
+
+    var markdown = try Markdown.init(
+        allocator,
+        "| Value |\n| --- |\n| prefix https://example.com/this/is/a/very/long/url/that/should/wrap |",
+        0,
+        0,
+        test_markdown_theme,
+        null,
+        .{},
+    );
+    defer markdown.deinit();
+    const lines = try renderMarkdownPlain(allocator, &markdown, 30);
+    defer freeRenderedLines(allocator, lines);
+    for (lines) |line| try std.testing.expect(visibleWidth(line) <= 30);
+    for (lines) |line| {
+        if (std.mem.startsWith(u8, line, "│")) {
+            try std.testing.expectEqual(@as(usize, 2), countOccurrences(line, "│"));
+        }
+    }
+    const joined = try joinLinesWith(allocator, lines, "");
+    defer allocator.free(joined);
+    const compact = try removeTableNoise(allocator, joined);
+    defer allocator.free(compact);
+    try std.testing.expect(std.mem.indexOf(u8, compact, "prefix") != null);
+    try std.testing.expect(std.mem.indexOf(u8, compact, "https://example.com/this/is/a/very/long/url/that/should/wrap") != null);
+}
+
+test "Markdown normalizes spacing around block elements without trailing blanks" {
+    const allocator = std.testing.allocator;
+    var code = try Markdown.init(allocator, "hello this is text\n```\ncode block\n```\nmore text", 0, 0, test_markdown_theme, null, .{});
+    defer code.deinit();
+    const code_lines = try renderMarkdownPlain(allocator, &code, 80);
+    defer freeRenderedLines(allocator, code_lines);
+    const expected = [_][]const u8{ "hello this is text", "", "```", "  code block", "```", "", "more text" };
+    try std.testing.expectEqual(expected.len, code_lines.len);
+    for (expected, 0..) |line, index| try std.testing.expectEqualStrings(line, code_lines[index]);
+
+    var heading = try Markdown.init(allocator, "# Hello", 0, 0, test_markdown_theme, null, .{});
+    defer heading.deinit();
+    const heading_lines = try renderMarkdownPlain(allocator, &heading, 80);
+    defer freeRenderedLines(allocator, heading_lines);
+    try std.testing.expect(heading_lines.len > 0);
+    try std.testing.expect(!std.mem.eql(u8, heading_lines[heading_lines.len - 1], ""));
+
+    var divider = try Markdown.init(allocator, "---", 0, 0, test_markdown_theme, null, .{});
+    defer divider.deinit();
+    const divider_lines = try renderMarkdownPlain(allocator, &divider, 80);
+    defer freeRenderedLines(allocator, divider_lines);
+    try std.testing.expect(divider_lines.len > 0);
+    try std.testing.expect(!std.mem.eql(u8, divider_lines[divider_lines.len - 1], ""));
+}
+
+test "Markdown restores default and heading styles after inline spans" {
+    const allocator = std.testing.allocator;
+    var thinking = try Markdown.init(
+        allocator,
+        "This is thinking with `inline code` and **bold text** after",
+        1,
+        0,
+        test_markdown_theme,
+        .{ .color = .{ .apply_fn = ansiGray }, .italic = true },
+        .{},
+    );
+    defer thinking.deinit();
+    const rendered = try thinking.render(allocator, 100);
+    defer freeRenderedLines(allocator, rendered);
+    const joined = try joinLinesWith(allocator, rendered, "\n");
+    defer allocator.free(joined);
+    try std.testing.expect(std.mem.indexOf(u8, joined, "\x1b[90m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, joined, "\x1b[3m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, joined, "\x1b[33m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, joined, "\x1b[1m") != null);
+
+    var heading = try Markdown.init(allocator, "### Why `sourceInfo` should not be optional", 0, 0, test_markdown_theme, null, .{});
+    defer heading.deinit();
+    const heading_rendered = try heading.render(allocator, 80);
+    defer freeRenderedLines(allocator, heading_rendered);
+    const heading_joined = try joinLinesWith(allocator, heading_rendered, "\n");
+    defer allocator.free(heading_joined);
+    const after_code = std.mem.indexOf(u8, heading_joined, "should not be optional") orelse return error.MissingHeadingTail;
+    const prefix_start = after_code -| 64;
+    const preceding = heading_joined[prefix_start..after_code];
+    try std.testing.expect(std.mem.indexOf(u8, preceding, "\x1b[1m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, preceding, "\x1b[36m") != null);
+}
+
+test "Markdown strict strikethrough and single tilde behavior" {
+    const allocator = std.testing.allocator;
+    var struck = try Markdown.init(allocator, "Use ~~strikethrough~~ here", 0, 0, test_markdown_theme, null, .{});
+    defer struck.deinit();
+    const struck_lines = try struck.render(allocator, 80);
+    defer freeRenderedLines(allocator, struck_lines);
+    const struck_joined = try joinLinesWith(allocator, struck_lines, "\n");
+    defer allocator.free(struck_joined);
+    try std.testing.expect(std.mem.indexOf(u8, struck_joined, "\x1b[9m") != null);
+    const struck_plain = try stripAnsiAlloc(allocator, struck_joined);
+    defer allocator.free(struck_plain);
+    try std.testing.expect(std.mem.indexOf(u8, struck_plain, "strikethrough") != null);
+    try std.testing.expect(std.mem.indexOf(u8, struck_plain, "~~strikethrough~~") == null);
+
+    var literal = try Markdown.init(allocator, "Use ~strikethrough~ literally", 0, 0, test_markdown_theme, null, .{});
+    defer literal.deinit();
+    const literal_lines = try literal.render(allocator, 80);
+    defer freeRenderedLines(allocator, literal_lines);
+    const literal_joined = try joinLinesWith(allocator, literal_lines, "\n");
+    defer allocator.free(literal_joined);
+    const literal_plain = try stripAnsiAlloc(allocator, literal_joined);
+    defer allocator.free(literal_plain);
+    try std.testing.expect(std.mem.indexOf(u8, literal_plain, "~strikethrough~") != null);
+    try std.testing.expect(std.mem.indexOf(u8, literal_joined, "\x1b[9m") == null);
+}
+
+test "Markdown links match fallback and OSC8 behavior" {
+    const allocator = std.testing.allocator;
+    terminal_image.setCapabilities(.{ .images = null, .true_color = false, .hyperlinks = false });
+
+    var email = try Markdown.init(allocator, "Contact user@example.com for help", 0, 0, test_markdown_theme, null, .{});
+    defer email.deinit();
+    const email_lines = try renderMarkdownPlain(allocator, &email, 80);
+    defer freeRenderedLines(allocator, email_lines);
+    const email_joined = try joinLinesWith(allocator, email_lines, " ");
+    defer allocator.free(email_joined);
+    try std.testing.expect(std.mem.indexOf(u8, email_joined, "user@example.com") != null);
+    try std.testing.expect(std.mem.indexOf(u8, email_joined, "mailto:") == null);
+
+    var named = try Markdown.init(allocator, "[click here](https://example.com)", 0, 0, test_markdown_theme, null, .{});
+    defer named.deinit();
+    const named_lines = try renderMarkdownPlain(allocator, &named, 80);
+    defer freeRenderedLines(allocator, named_lines);
+    try std.testing.expect(std.mem.indexOf(u8, named_lines[0], "click here") != null);
+    try std.testing.expect(std.mem.indexOf(u8, named_lines[0], "(https://example.com)") != null);
+
+    terminal_image.setCapabilities(.{ .images = null, .true_color = false, .hyperlinks = true });
+    defer terminal_image.resetCapabilitiesCache();
+    var osc = try Markdown.init(allocator, "[click here](https://example.com)", 0, 0, test_markdown_theme, null, .{});
+    defer osc.deinit();
+    const osc_lines = try osc.render(allocator, 80);
+    defer freeRenderedLines(allocator, osc_lines);
+    const osc_joined = try joinLinesWith(allocator, osc_lines, "");
+    defer allocator.free(osc_joined);
+    try std.testing.expect(std.mem.indexOf(u8, osc_joined, "\x1b]8;;https://example.com\x1b\\") != null);
+    try std.testing.expect(std.mem.indexOf(u8, osc_joined, "\x1b]8;;\x1b\\") != null);
+}
+
+test "Markdown caches per width and applies full-line background padding" {
+    const allocator = std.testing.allocator;
+    var markdown = try Markdown.init(
+        allocator,
+        "hello",
+        1,
+        1,
+        test_markdown_theme,
+        .{ .bg_color = .{ .apply_fn = ansiBgBlue } },
+        .{},
+    );
+    defer markdown.deinit();
+    const first = try markdown.render(allocator, 12);
+    defer freeRenderedLines(allocator, first);
+    try std.testing.expect(markdown.cached_lines != null);
+    try std.testing.expectEqual(@as(?usize, 12), markdown.cached_width);
+    try std.testing.expectEqual(@as(usize, 3), first.len);
+    for (first) |line| {
+        try std.testing.expectEqual(@as(usize, 12), visibleWidth(line));
+        try std.testing.expect(std.mem.indexOf(u8, line, "\x1b[44m") != null);
+    }
+    markdown.invalidate();
+    try std.testing.expect(markdown.cached_lines == null);
+    try std.testing.expect(markdown.cached_width == null);
 }
 
 fn visibleIndexOf(line: []const u8, text: []const u8) !usize {
