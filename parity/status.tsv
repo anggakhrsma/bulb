@@ -99,9 +99,9 @@ packages/coding-agent/test/paths.test.ts	implemented	src/bulb_coding_agent/paths
 packages/coding-agent/test/pi-user-agent.test.ts	implemented	src/bulb_coding_agent/user_agent.zig	Upstream user-agent formatting test translated to Bulb product name and Zig-native runtime string
 packages/coding-agent/test/version-check.test.ts	implemented	src/bulb_coding_agent/version_check.zig	Upstream version comparison, newer-only filtering, latest-version API request contract, package metadata, update note, and disabled-check regressions translated to Bulb-native tests
 packages/tui/src/keybindings.ts	implemented	src/bulb_tui/keybindings.zig	Native default keybinding registry, ordered user overrides, duplicate normalization, conflict reporting, resolved config output, and global default-manager foundations ported
-packages/tui/src/keys.ts	in_progress	src/bulb_tui/keys.zig	Common legacy terminal key parsing, key matching, and Kitty-protocol active flag ported; full Kitty/CSI-u parser matrix remains
+packages/tui/src/keys.ts	implemented	src/bulb_tui/keys.zig	Kitty CSI-u alternate-layout/event parsing, xterm modifyOtherKeys, legacy navigation/function/modifier sequences, printable decoders, release/repeat helpers, Windows Terminal backspace env heuristic, and key matching ported
 packages/tui/src/utils.ts	in_progress	src/bulb_tui/root.zig	Visible-width behavior started
 packages/tui/test/keybindings.test.ts	implemented	src/bulb_tui/keybindings.zig	Upstream default-preservation and direct-conflict regressions ported
-packages/tui/test/keys.test.ts	in_progress	src/bulb_tui/keys.zig	Common legacy ctrl/alt/arrow/key matching coverage started; broader upstream Kitty and layout cases remain
+packages/tui/test/keys.test.ts	implemented	src/bulb_tui/keys.zig	Upstream Kitty alternate-layout, super/digit/keypad, event/remap, modifyOtherKeys, legacy ctrl/symbol/alt/navigation, parseKey, printable decode, and event-helper regressions ported
 packages/tui/test/regression-regional-indicator-width.test.ts	in_progress	src/bulb_tui/root.zig	Regional-indicator regression cases started
 packages/tui/test/truncate-to-width.test.ts	in_progress	src/bulb_tui/root.zig	Visible-width subset started

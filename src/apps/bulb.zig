@@ -5,6 +5,8 @@ const build_options = @import("build_options");
 const support = @import("support.zig");
 
 pub fn main(init: std.process.Init) !void {
+    coding_agent.tui.keys.setProcessEnvironment(init.environ_map);
+
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_file_writer: Io.File.Writer = .init(.stdout(), init.io, &stdout_buffer);

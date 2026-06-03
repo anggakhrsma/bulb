@@ -749,7 +749,7 @@ packages/tui/src/editor-component.ts	bulb_tui	source	pending
 packages/tui/src/fuzzy.ts	bulb_tui	source	pending		
 packages/tui/src/index.ts	bulb_tui	source	pending		
 packages/tui/src/keybindings.ts	bulb_tui	source	implemented	src/bulb_tui/keybindings.zig	Native default keybinding registry, ordered user overrides, duplicate normalization, conflict reporting, resolved config output, and global default-manager foundations ported
-packages/tui/src/keys.ts	bulb_tui	source	in_progress	src/bulb_tui/keys.zig	Common legacy terminal key parsing, key matching, and Kitty-protocol active flag ported; full Kitty/CSI-u parser matrix remains
+packages/tui/src/keys.ts	bulb_tui	source	implemented	src/bulb_tui/keys.zig	Kitty CSI-u alternate-layout/event parsing, xterm modifyOtherKeys, legacy navigation/function/modifier sequences, printable decoders, release/repeat helpers, Windows Terminal backspace env heuristic, and key matching ported
 packages/tui/src/kill-ring.ts	bulb_tui	source	pending		
 packages/tui/src/native-modifiers.ts	bulb_tui	source	pending		
 packages/tui/src/stdin-buffer.ts	bulb_tui	source	pending		
@@ -768,7 +768,7 @@ packages/tui/test/image-test.ts	bulb_tui	test	pending
 packages/tui/test/input.test.ts	bulb_tui	test	pending		
 packages/tui/test/key-tester.ts	bulb_tui	test	pending		
 packages/tui/test/keybindings.test.ts	bulb_tui	test	implemented	src/bulb_tui/keybindings.zig	Upstream default-preservation and direct-conflict regressions ported
-packages/tui/test/keys.test.ts	bulb_tui	test	in_progress	src/bulb_tui/keys.zig	Common legacy ctrl/alt/arrow/key matching coverage started; broader upstream Kitty and layout cases remain
+packages/tui/test/keys.test.ts	bulb_tui	test	implemented	src/bulb_tui/keys.zig	Upstream Kitty alternate-layout, super/digit/keypad, event/remap, modifyOtherKeys, legacy ctrl/symbol/alt/navigation, parseKey, printable decode, and event-helper regressions ported
 packages/tui/test/markdown.test.ts	bulb_tui	test	pending		
 packages/tui/test/overlay-non-capturing.test.ts	bulb_tui	test	pending		
 packages/tui/test/overlay-options.test.ts	bulb_tui	test	pending		
