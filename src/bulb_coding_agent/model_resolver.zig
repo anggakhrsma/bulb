@@ -398,7 +398,7 @@ pub fn resolveModelScopeAlloc(
 
             var matched = false;
             for (models) |model| {
-                if (globMatchesModel(glob_pattern, model)) {
+                if (try globMatchesModel(allocator, glob_pattern, model)) {
                     matched = true;
                     if (!containsScopedModel(scoped_models.items, model)) {
                         try scoped_models.append(allocator, .{ .model = model, .thinking_level = thinking_level });
@@ -666,21 +666,38 @@ fn hasGlobCharacters(pattern: []const u8) bool {
     return false;
 }
 
-fn globMatchesModel(pattern: []const u8, model: ai.Model) bool {
-    if (globMatchesIgnoreCase(pattern, model.id)) return true;
+const GlobMatchError = error{OutOfMemory};
+
+fn globMatchesModel(allocator: std.mem.Allocator, pattern: []const u8, model: ai.Model) GlobMatchError!bool {
+    if (try globMatchesIgnoreCase(allocator, pattern, model.id)) return true;
     var full_reference_buffer: [1024]u8 = undefined;
     const full_reference = std.fmt.bufPrint(&full_reference_buffer, "{s}/{s}", .{ model.provider, model.id }) catch return false;
-    return globMatchesIgnoreCase(pattern, full_reference);
+    return try globMatchesIgnoreCase(allocator, pattern, full_reference);
 }
 
-fn globMatchesIgnoreCase(pattern: []const u8, value: []const u8) bool {
-    return globMatchesAt(pattern, 0, value, 0);
+fn globMatchesIgnoreCase(allocator: std.mem.Allocator, pattern: []const u8, value: []const u8) GlobMatchError!bool {
+    if (findFirstBraceAlternativeGroup(pattern) == null) {
+        return try globMatchesAt(allocator, pattern, 0, value, 0);
+    }
+    const expanded = try expandBracePatternsAlloc(allocator, pattern);
+    defer freeStringSlice(allocator, expanded);
+    for (expanded) |expanded_pattern| {
+        if (try globMatchesAt(allocator, expanded_pattern, 0, value, 0)) return true;
+    }
+    return false;
 }
 
-fn globMatchesAt(pattern: []const u8, pattern_index: usize, value: []const u8, value_index: usize) bool {
+fn globMatchesAt(
+    allocator: std.mem.Allocator,
+    pattern: []const u8,
+    pattern_index: usize,
+    value: []const u8,
+    value_index: usize,
+) GlobMatchError!bool {
     var p = pattern_index;
     var v = value_index;
     while (p < pattern.len) {
+        if (try matchExtglobAt(allocator, pattern, p, value, v)) |result| return result;
         switch (pattern[p]) {
             '*' => {
                 var star_count: usize = 1;
@@ -692,7 +709,7 @@ fn globMatchesAt(pattern: []const u8, pattern_index: usize, value: []const u8, v
                 }
                 var next_value_index = v;
                 while (next_value_index <= value.len) : (next_value_index += 1) {
-                    if (globMatchesAt(pattern, p + 1, value, next_value_index)) return true;
+                    if (try globMatchesAt(allocator, pattern, p + 1, value, next_value_index)) return true;
                     if (!crosses_slash and next_value_index < value.len and value[next_value_index] == '/') break;
                 }
                 return false;
@@ -723,6 +740,248 @@ fn globMatchesAt(pattern: []const u8, pattern_index: usize, value: []const u8, v
     }
     return v == value.len;
 }
+
+fn expandBracePatternsAlloc(allocator: std.mem.Allocator, pattern: []const u8) GlobMatchError![][]u8 {
+    if (findFirstBraceAlternativeGroup(pattern)) |group| {
+        var expanded: std.ArrayList([]u8) = .empty;
+        errdefer freeArrayListStrings(allocator, &expanded);
+
+        var alt_start = group.open + 1;
+        var depth: usize = 0;
+        var index = alt_start;
+        while (index <= group.close) : (index += 1) {
+            const at_end = index == group.close;
+            const byte = if (at_end) 0 else pattern[index];
+            if (!at_end) {
+                if (byte == '{') depth += 1;
+                if (byte == '}' and depth > 0) depth -= 1;
+            }
+            if (at_end or (byte == ',' and depth == 0)) {
+                const alt = pattern[alt_start..index];
+                const candidate = try std.mem.concat(allocator, u8, &.{
+                    pattern[0..group.open],
+                    alt,
+                    pattern[group.close + 1 ..],
+                });
+                defer allocator.free(candidate);
+
+                const nested = try expandBracePatternsAlloc(allocator, candidate);
+                defer allocator.free(nested);
+                for (nested) |nested_pattern| {
+                    errdefer allocator.free(nested_pattern);
+                    try expanded.append(allocator, nested_pattern);
+                }
+
+                alt_start = index + 1;
+            }
+        }
+
+        return try expanded.toOwnedSlice(allocator);
+    }
+
+    return singlePatternAlloc(allocator, pattern);
+}
+
+const BraceGroup = struct {
+    open: usize,
+    close: usize,
+};
+
+fn findFirstBraceGroup(pattern: []const u8) ?BraceGroup {
+    var open: ?usize = null;
+    var depth: usize = 0;
+    for (pattern, 0..) |byte, index| {
+        switch (byte) {
+            '{' => {
+                if (depth == 0) open = index;
+                depth += 1;
+            },
+            '}' => {
+                if (depth == 0) return null;
+                depth -= 1;
+                if (depth == 0) return .{ .open = open.?, .close = index };
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+fn findFirstBraceAlternativeGroup(pattern: []const u8) ?BraceGroup {
+    var start: usize = 0;
+    while (start < pattern.len) {
+        const group = findFirstBraceGroup(pattern[start..]) orelse return null;
+        const actual: BraceGroup = .{
+            .open = start + group.open,
+            .close = start + group.close,
+        };
+        if (braceGroupHasAlternatives(pattern[actual.open + 1 .. actual.close])) return actual;
+        start = actual.close + 1;
+    }
+    return null;
+}
+
+fn braceGroupHasAlternatives(content: []const u8) bool {
+    var depth: usize = 0;
+    for (content) |byte| {
+        switch (byte) {
+            '{' => depth += 1,
+            '}' => {
+                if (depth > 0) depth -= 1;
+            },
+            ',' => if (depth == 0) return true,
+            else => {},
+        }
+    }
+    return false;
+}
+
+fn singlePatternAlloc(allocator: std.mem.Allocator, pattern: []const u8) GlobMatchError![][]u8 {
+    const result = try allocator.alloc([]u8, 1);
+    errdefer allocator.free(result);
+    result[0] = try allocator.dupe(u8, pattern);
+    return result;
+}
+
+fn freeStringSlice(allocator: std.mem.Allocator, strings: [][]u8) void {
+    for (strings) |string| allocator.free(string);
+    allocator.free(strings);
+}
+
+fn freeArrayListStrings(allocator: std.mem.Allocator, strings: *std.ArrayList([]u8)) void {
+    for (strings.items) |string| allocator.free(string);
+    strings.deinit(allocator);
+}
+
+fn matchExtglobAt(
+    allocator: std.mem.Allocator,
+    pattern: []const u8,
+    pattern_index: usize,
+    value: []const u8,
+    value_index: usize,
+) GlobMatchError!?bool {
+    if (pattern_index + 1 >= pattern.len or pattern[pattern_index + 1] != '(') return null;
+    const kind = pattern[pattern_index];
+    if (kind != '@' and kind != '?' and kind != '+' and kind != '*' and kind != '!') return null;
+
+    const close_index = findExtglobClose(pattern, pattern_index + 1) orelse return null;
+    const alternatives = pattern[pattern_index + 2 .. close_index];
+    const rest = pattern[close_index + 1 ..];
+
+    return switch (kind) {
+        '@' => try matchOneExtglobAlternative(allocator, alternatives, rest, value, value_index),
+        '?' => blk: {
+            if (try globMatchesAt(allocator, rest, 0, value, value_index)) break :blk true;
+            break :blk try matchOneExtglobAlternative(allocator, alternatives, rest, value, value_index);
+        },
+        '+' => try matchRepeatedExtglobAlternative(allocator, alternatives, rest, value, value_index),
+        '*' => blk: {
+            if (try globMatchesAt(allocator, rest, 0, value, value_index)) break :blk true;
+            break :blk try matchRepeatedExtglobAlternative(allocator, alternatives, rest, value, value_index);
+        },
+        '!' => try matchNegatedExtglobAlternative(allocator, alternatives, rest, value, value_index),
+        else => unreachable,
+    };
+}
+
+fn findExtglobClose(pattern: []const u8, open_paren: usize) ?usize {
+    var depth: usize = 0;
+    var index = open_paren;
+    while (index < pattern.len) : (index += 1) {
+        const byte = pattern[index];
+        if (byte == '(') {
+            depth += 1;
+        } else if (byte == ')') {
+            if (depth == 0) return null;
+            depth -= 1;
+            if (depth == 0) return index;
+        }
+    }
+    return null;
+}
+
+fn matchOneExtglobAlternative(
+    allocator: std.mem.Allocator,
+    alternatives: []const u8,
+    rest: []const u8,
+    value: []const u8,
+    value_index: usize,
+) GlobMatchError!bool {
+    var iterator = ExtglobAlternativeIterator{ .content = alternatives };
+    while (iterator.next()) |alternative| {
+        const combined = try std.mem.concat(allocator, u8, &.{ alternative, rest });
+        defer allocator.free(combined);
+        if (try globMatchesAt(allocator, combined, 0, value, value_index)) return true;
+    }
+    return false;
+}
+
+fn matchRepeatedExtglobAlternative(
+    allocator: std.mem.Allocator,
+    alternatives: []const u8,
+    rest: []const u8,
+    value: []const u8,
+    value_index: usize,
+) GlobMatchError!bool {
+    var iterator = ExtglobAlternativeIterator{ .content = alternatives };
+    while (iterator.next()) |alternative| {
+        if (alternative.len == 0) continue;
+        var end = value_index + 1;
+        while (end <= value.len) : (end += 1) {
+            if (try globMatchesIgnoreCase(allocator, alternative, value[value_index..end])) {
+                if (try globMatchesAt(allocator, rest, 0, value, end)) return true;
+                if (try matchRepeatedExtglobAlternative(allocator, alternatives, rest, value, end)) return true;
+            }
+            if (end < value.len and value[end] == '/') break;
+        }
+    }
+    return false;
+}
+
+fn matchNegatedExtglobAlternative(
+    allocator: std.mem.Allocator,
+    alternatives: []const u8,
+    rest: []const u8,
+    value: []const u8,
+    value_index: usize,
+) GlobMatchError!bool {
+    var end = value_index;
+    while (end < value.len and value[end] != '/') : (end += 1) {}
+    if (end == value_index) return false;
+
+    const segment = value[value_index..end];
+    var iterator = ExtglobAlternativeIterator{ .content = alternatives };
+    while (iterator.next()) |alternative| {
+        if (try globMatchesIgnoreCase(allocator, alternative, segment)) return false;
+    }
+    return try globMatchesAt(allocator, rest, 0, value, end);
+}
+
+const ExtglobAlternativeIterator = struct {
+    content: []const u8,
+    index: usize = 0,
+
+    fn next(self: *ExtglobAlternativeIterator) ?[]const u8 {
+        if (self.index > self.content.len) return null;
+        const start = self.index;
+        var depth: usize = 0;
+        while (self.index < self.content.len) : (self.index += 1) {
+            const byte = self.content[self.index];
+            if (byte == '(') {
+                depth += 1;
+            } else if (byte == ')' and depth > 0) {
+                depth -= 1;
+            } else if (byte == '|' and depth == 0) {
+                const alternative = self.content[start..self.index];
+                self.index += 1;
+                return alternative;
+            }
+        }
+
+        self.index = self.content.len + 1;
+        return self.content[start..];
+    }
+};
 
 const GlobClassResult = struct {
     matched: bool,
@@ -1174,6 +1433,71 @@ test "model resolver resolves scoped models from registry with glob thinking suf
         try std.testing.expectEqualStrings("openrouter", result.scoped_models[0].model.provider);
         try std.testing.expectEqualStrings("qwen/qwen3-coder:exacto", result.scoped_models[0].model.id);
         try std.testing.expectEqual(@as(?ai.ThinkingLevel, .high), result.scoped_models[0].thinking_level);
+        try std.testing.expectEqual(@as(usize, 0), result.warnings.len);
+    }
+}
+
+// Source parity with packages/coding-agent/src/core/model-resolver.ts:
+// resolveModelScope delegates scoped globs to minimatch with brace and extglob
+// syntax enabled.
+test "model resolver scoped globs support minimatch brace and extglob syntax" {
+    const allocator = std.testing.allocator;
+    var harness = try makeResolverRegistryHarness(allocator);
+    defer harness.deinit();
+
+    const openrouter_models = [_]ai.Model{resolverDynamicModel("qwen/qwen3-coder:exacto")};
+    try harness.registry.registerProvider("openrouter", .{
+        .base_url = "https://openrouter.ai/api/v1",
+        .api_key = "test-key",
+        .api = ai.types.api.anthropic_messages,
+        .models = &openrouter_models,
+    });
+    const dynamic_models = [_]ai.Model{
+        resolverDynamicModel("claude-sonnet-4-5"),
+        resolverDynamicModel("gpt-4o"),
+        resolverDynamicModel("deepseek-v4-pro"),
+    };
+    try harness.registry.registerProvider("dynamic", .{
+        .base_url = "https://dynamic.test/v1",
+        .api_key = "test-key",
+        .api = ai.types.api.anthropic_messages,
+        .models = &dynamic_models,
+    });
+
+    {
+        const patterns = [_][]const u8{"{dynamic,openrouter}/**:high"};
+        var result = try resolveModelScopeAlloc(allocator, &patterns, &harness.registry);
+        defer result.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 4), result.scoped_models.len);
+        try std.testing.expectEqual(@as(?ai.ThinkingLevel, .high), result.scoped_models[0].thinking_level);
+        try std.testing.expectEqual(@as(usize, 0), result.warnings.len);
+    }
+
+    {
+        const patterns = [_][]const u8{"@(dynamic|openrouter)/**"};
+        var result = try resolveModelScopeAlloc(allocator, &patterns, &harness.registry);
+        defer result.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 4), result.scoped_models.len);
+        try std.testing.expectEqual(@as(usize, 0), result.warnings.len);
+    }
+
+    {
+        const patterns = [_][]const u8{"dynamic/@(claude-sonnet-4-5|gpt-4o)*"};
+        var result = try resolveModelScopeAlloc(allocator, &patterns, &harness.registry);
+        defer result.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 2), result.scoped_models.len);
+        try std.testing.expectEqualStrings("claude-sonnet-4-5", result.scoped_models[0].model.id);
+        try std.testing.expectEqualStrings("gpt-4o", result.scoped_models[1].model.id);
+        try std.testing.expectEqual(@as(usize, 0), result.warnings.len);
+    }
+
+    {
+        const patterns = [_][]const u8{"!(openrouter)/claude*"};
+        var result = try resolveModelScopeAlloc(allocator, &patterns, &harness.registry);
+        defer result.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 1), result.scoped_models.len);
+        try std.testing.expectEqualStrings("dynamic", result.scoped_models[0].model.provider);
+        try std.testing.expectEqualStrings("claude-sonnet-4-5", result.scoped_models[0].model.id);
         try std.testing.expectEqual(@as(usize, 0), result.warnings.len);
     }
 }
