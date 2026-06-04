@@ -1339,43 +1339,7 @@ pub const VirtualTerminal = struct {
     }
 
     fn captureRenderedPayload(self: *VirtualTerminal, data: []const u8) !void {
-        if (std.mem.indexOf(u8, data, "\x1b[?2026h")) |start_marker| {
-            const payload_start = start_marker + "\x1b[?2026h".len;
-            const payload_end = std.mem.indexOfPos(u8, data, payload_start, "\x1b[?2026l") orelse data.len;
-            var payload = data[payload_start..payload_end];
-            if (std.mem.indexOf(u8, payload, "\x1b[2J")) |_| self.clearScreenCells();
-            payload = stripKnownTuiControls(payload);
-            try self.replaceScreenFromPayload(payload);
-            return;
-        }
-
         try self.applyTerminalWrite(data);
-    }
-
-    fn replaceScreenFromPayload(self: *VirtualTerminal, payload: []const u8) !void {
-        self.clearScreenCells();
-        self.active_italic = false;
-        self.active_underline = false;
-
-        var line_start: usize = 0;
-        while (line_start <= payload.len) {
-            const newline = std.mem.indexOfPos(u8, payload, line_start, "\r\n") orelse payload.len;
-            const raw_line = payload[line_start..newline];
-            const parsed = try parseVirtualLine(self.allocator, raw_line);
-            errdefer {
-                var owned = parsed;
-                owned.deinit(self.allocator);
-            }
-            try self.screen.append(self.allocator, parsed);
-            if (newline == payload.len) break;
-            line_start = newline + 2;
-        }
-
-        if (self.screen.items.len == 0) {
-            try self.screen.append(self.allocator, try parseVirtualLine(self.allocator, ""));
-        }
-        self.cursor_y = if (self.screen.items.len == 0) 0 else self.screen.items.len - 1;
-        self.cursor_x = if (self.screen.items.len == 0) 0 else self.screen.items[self.cursor_y].text.len;
     }
 
     fn applyTerminalWrite(self: *VirtualTerminal, data: []const u8) !void {
@@ -1422,6 +1386,7 @@ pub const VirtualTerminal = struct {
         switch (final) {
             'A' => self.moveCursorUp(parseFirstCsiParam(params, 1)),
             'B' => try self.moveCursorDown(parseFirstCsiParam(params, 1)),
+            'G' => self.cursor_x = parseFirstCsiParam(params, 1) -| 1,
             'H', 'f' => try self.moveCursorTo(params),
             'J' => try self.clearScreenMode(parseFirstCsiParam(params, 0)),
             'K' => try self.clearLineMode(parseFirstCsiParam(params, 0)),
@@ -1649,58 +1614,6 @@ fn byteIndexForCell(text: []const u8, target_col: usize) usize {
         index = end;
     }
     return index;
-}
-
-fn stripKnownTuiControls(payload: []const u8) []const u8 {
-    var start: usize = 0;
-    while (true) {
-        if (std.mem.startsWith(u8, payload[start..], "\x1b[2J")) {
-            start += "\x1b[2J".len;
-        } else if (std.mem.startsWith(u8, payload[start..], "\x1b[H")) {
-            start += "\x1b[H".len;
-        } else if (std.mem.startsWith(u8, payload[start..], "\x1b[3J")) {
-            start += "\x1b[3J".len;
-        } else {
-            break;
-        }
-        if (start >= payload.len) break;
-    }
-    return payload[start..];
-}
-
-fn parseVirtualLine(allocator: std.mem.Allocator, line: []const u8) !VirtualCell {
-    var text: std.ArrayList(u8) = .empty;
-    errdefer text.deinit(allocator);
-    var italic_flags: std.ArrayList(bool) = .empty;
-    errdefer italic_flags.deinit(allocator);
-    var underline_flags: std.ArrayList(bool) = .empty;
-    errdefer underline_flags.deinit(allocator);
-    var tracker: AnsiCodeTracker = .{};
-
-    var index: usize = 0;
-    while (index < line.len) {
-        if (extractAnsiCode(line, index)) |ansi| {
-            tracker.process(ansi.code);
-            index += ansi.length;
-            continue;
-        }
-        const end = nextUtf8SliceEnd(line, index);
-        try text.appendSlice(allocator, line[index..end]);
-        const width = visibleWidth(line[index..end]);
-        const cells = @max(@as(usize, 1), width);
-        var cell: usize = 0;
-        while (cell < cells) : (cell += 1) {
-            try italic_flags.append(allocator, tracker.italic);
-            try underline_flags.append(allocator, tracker.underline);
-        }
-        index = end;
-    }
-
-    return .{
-        .text = try text.toOwnedSlice(allocator),
-        .italic = try italic_flags.toOwnedSlice(allocator),
-        .underline = try underline_flags.toOwnedSlice(allocator),
-    };
 }
 
 pub const SizeValue = union(enum) {
@@ -2175,9 +2088,14 @@ pub const TUI = struct {
         const height = self.terminal_handle.rows();
         const width_changed = self.previous_width != 0 and self.previous_width != width;
         const height_changed = self.previous_height != 0 and self.previous_height != height;
+        const previous_buffer_length = if (self.previous_height > 0) self.previous_viewport_top + self.previous_height else height;
+        var prev_viewport_top = if (height_changed) previous_buffer_length -| height else self.previous_viewport_top;
+        var viewport_top = prev_viewport_top;
+        var hardware_cursor_row = self.hardware_cursor_row;
 
         var new_lines = try self.render(self.allocator, width);
-        errdefer freeOwnedLines(self.allocator, new_lines);
+        var owns_new_lines = true;
+        defer if (owns_new_lines) freeOwnedLines(self.allocator, new_lines);
 
         if (self.overlay_stack.items.len > 0) {
             const composited = try self.compositeOverlays(new_lines, width, height);
@@ -2185,24 +2103,31 @@ pub const TUI = struct {
             new_lines = composited;
         }
 
-        self.extractCursorPosition(&new_lines, height);
+        const cursor_pos = self.extractCursorPosition(&new_lines, height);
         try applyLineResets(self.allocator, new_lines);
 
-        const first_render = self.previous_lines.len == 0 and !width_changed and !height_changed;
-        var full_render = first_render;
-        var should_clear = false;
+        if (self.previous_lines.len == 0 and !width_changed and !height_changed) {
+            try self.writeFullRender(new_lines, width, height, false, cursor_pos);
+            owns_new_lines = false;
+            return;
+        }
+
         if (width_changed) {
-            full_render = true;
-            should_clear = true;
-        } else if (height_changed and !self.termux_session) {
-            full_render = true;
-            should_clear = true;
-        } else if (self.clear_on_shrink and new_lines.len < self.max_lines_rendered and self.overlay_stack.items.len == 0) {
-            full_render = true;
-            should_clear = true;
-        } else if (new_lines.len < self.previous_lines.len and new_lines.len > 0 and new_lines.len - 1 < self.previous_viewport_top) {
-            full_render = true;
-            should_clear = true;
+            try self.writeFullRender(new_lines, width, height, true, cursor_pos);
+            owns_new_lines = false;
+            return;
+        }
+
+        if (height_changed and !self.termux_session) {
+            try self.writeFullRender(new_lines, width, height, true, cursor_pos);
+            owns_new_lines = false;
+            return;
+        }
+
+        if (self.clear_on_shrink and new_lines.len < self.max_lines_rendered and self.overlay_stack.items.len == 0) {
+            try self.writeFullRender(new_lines, width, height, true, cursor_pos);
+            owns_new_lines = false;
+            return;
         }
 
         var first_changed: ?usize = null;
@@ -2217,44 +2142,163 @@ pub const TUI = struct {
                 last_changed = index;
             }
         }
+        const appended_lines = new_lines.len > self.previous_lines.len;
+        if (appended_lines) {
+            if (first_changed == null) first_changed = self.previous_lines.len;
+            last_changed = new_lines.len - 1;
+        }
         if (first_changed) |changed| {
             last_changed = self.expandLastChangedForKittyImages(changed, last_changed);
         }
+        const append_start = appended_lines and first_changed.? == self.previous_lines.len and first_changed.? > 0;
 
-        if (!full_render and first_changed == null) {
-            freeOwnedLines(self.allocator, new_lines);
+        if (first_changed == null) {
+            try self.positionHardwareCursor(cursor_pos, new_lines.len);
+            self.previous_viewport_top = prev_viewport_top;
             self.previous_width = width;
             self.previous_height = height;
+            return;
+        }
+
+        if (first_changed.? >= new_lines.len) {
+            if (self.previous_lines.len > new_lines.len) {
+                var buffer: std.ArrayList(u8) = .empty;
+                defer buffer.deinit(self.allocator);
+                try buffer.appendSlice(self.allocator, "\x1b[?2026h");
+                try self.appendDeleteChangedKittyImages(&buffer, first_changed.?, last_changed);
+
+                const target_row = if (new_lines.len == 0) 0 else new_lines.len - 1;
+                if (target_row < prev_viewport_top) {
+                    try self.writeFullRender(new_lines, width, height, true, cursor_pos);
+                    owns_new_lines = false;
+                    return;
+                }
+
+                const line_diff = computeLineDiff(target_row, viewport_top, prev_viewport_top, hardware_cursor_row);
+                try appendRelativeCursorMove(self.allocator, &buffer, line_diff);
+                try buffer.append(self.allocator, '\r');
+
+                const extra_lines = self.previous_lines.len - new_lines.len;
+                if (extra_lines > height) {
+                    try self.writeFullRender(new_lines, width, height, true, cursor_pos);
+                    owns_new_lines = false;
+                    return;
+                }
+                if (extra_lines > 0) try buffer.appendSlice(self.allocator, "\x1b[1B");
+                var clear_index: usize = 0;
+                while (clear_index < extra_lines) : (clear_index += 1) {
+                    try buffer.appendSlice(self.allocator, "\r\x1b[2K");
+                    if (clear_index + 1 < extra_lines) try buffer.appendSlice(self.allocator, "\x1b[1B");
+                }
+                if (extra_lines > 0) try appendCursorMove(self.allocator, &buffer, extra_lines, 'A');
+                try buffer.appendSlice(self.allocator, "\x1b[?2026l");
+                try self.terminal_handle.write(buffer.items);
+                self.cursor_row = target_row;
+                self.hardware_cursor_row = target_row;
+            }
+
+            try self.positionHardwareCursor(cursor_pos, new_lines.len);
+            self.previous_viewport_top = prev_viewport_top;
+            try self.replaceRenderedState(new_lines, width, height);
+            owns_new_lines = false;
+            return;
+        }
+
+        if (first_changed.? < prev_viewport_top) {
+            try self.writeFullRender(new_lines, width, height, true, cursor_pos);
+            owns_new_lines = false;
             return;
         }
 
         var buffer: std.ArrayList(u8) = .empty;
         defer buffer.deinit(self.allocator);
         try buffer.appendSlice(self.allocator, "\x1b[?2026h");
+        try self.appendDeleteChangedKittyImages(&buffer, first_changed.?, last_changed);
+
+        const prev_viewport_bottom = if (height == 0) prev_viewport_top else prev_viewport_top + height - 1;
+        const move_target_row = if (append_start) first_changed.? - 1 else first_changed.?;
+        if (move_target_row > prev_viewport_bottom) {
+            const current_screen_row = clampScreenRow(hardware_cursor_row, prev_viewport_top, height);
+            const move_to_bottom = (height -| 1) -| current_screen_row;
+            if (move_to_bottom > 0) try appendCursorMove(self.allocator, &buffer, move_to_bottom, 'B');
+            const scroll = move_target_row - prev_viewport_bottom;
+            try appendRepeatedCrlf(self.allocator, &buffer, scroll);
+            prev_viewport_top += scroll;
+            viewport_top += scroll;
+            hardware_cursor_row = move_target_row;
+        }
+
+        const line_diff = computeLineDiff(move_target_row, viewport_top, prev_viewport_top, hardware_cursor_row);
+        try appendRelativeCursorMove(self.allocator, &buffer, line_diff);
+        try buffer.appendSlice(self.allocator, if (append_start) "\r\n" else "\r");
+
+        const render_end = @min(last_changed, new_lines.len - 1);
+        index = first_changed.?;
+        while (index <= render_end) : (index += 1) {
+            if (index > first_changed.?) try buffer.appendSlice(self.allocator, "\r\n");
+            try buffer.appendSlice(self.allocator, "\x1b[2K");
+            const line = new_lines[index];
+            if (!terminal_image.isImageLine(line) and visibleWidth(line) > width) return error.RenderedLineExceedsTerminalWidth;
+            try buffer.appendSlice(self.allocator, line);
+        }
+
+        var final_cursor_row = render_end;
+        if (self.previous_lines.len > new_lines.len) {
+            if (render_end < new_lines.len - 1) {
+                const move_down = new_lines.len - 1 - render_end;
+                try appendCursorMove(self.allocator, &buffer, move_down, 'B');
+                final_cursor_row = new_lines.len - 1;
+            }
+            const extra_lines = self.previous_lines.len - new_lines.len;
+            index = new_lines.len;
+            while (index < self.previous_lines.len) : (index += 1) {
+                try buffer.appendSlice(self.allocator, "\r\n\x1b[2K");
+            }
+            if (extra_lines > 0) try appendCursorMove(self.allocator, &buffer, extra_lines, 'A');
+        }
+
+        try buffer.appendSlice(self.allocator, "\x1b[?2026l");
+        try self.terminal_handle.write(buffer.items);
+
+        self.cursor_row = if (new_lines.len == 0) 0 else new_lines.len - 1;
+        self.hardware_cursor_row = final_cursor_row;
+        self.max_lines_rendered = @max(self.max_lines_rendered, new_lines.len);
+        self.previous_viewport_top = @max(prev_viewport_top, viewportTopForCursor(final_cursor_row, height));
+        try self.positionHardwareCursor(cursor_pos, new_lines.len);
+        try self.replaceRenderedState(new_lines, width, height);
+        owns_new_lines = false;
+    }
+
+    fn writeFullRender(self: *TUI, new_lines: [][]u8, width: usize, height: usize, should_clear: bool, cursor_pos: ?CursorPosition) !void {
+        self.full_redraw_count += 1;
+        var buffer: std.ArrayList(u8) = .empty;
+        defer buffer.deinit(self.allocator);
+        try buffer.appendSlice(self.allocator, "\x1b[?2026h");
         if (should_clear) {
             try self.appendDeleteKittyImages(&buffer, self.previous_kitty_image_ids.items);
             try buffer.appendSlice(self.allocator, "\x1b[2J\x1b[H\x1b[3J");
-        } else if (first_changed) |changed| {
-            try self.appendDeleteChangedKittyImages(&buffer, changed, last_changed);
         }
-
         for (new_lines, 0..) |line, line_index| {
             if (line_index > 0) try buffer.appendSlice(self.allocator, "\r\n");
+            if (!terminal_image.isImageLine(line) and visibleWidth(line) > width) return error.RenderedLineExceedsTerminalWidth;
             try buffer.appendSlice(self.allocator, line);
         }
         try buffer.appendSlice(self.allocator, "\x1b[?2026l");
         try self.terminal_handle.write(buffer.items);
 
-        if (full_render) self.full_redraw_count += 1;
         self.cursor_row = if (new_lines.len == 0) 0 else new_lines.len - 1;
         self.hardware_cursor_row = self.cursor_row;
         self.max_lines_rendered = if (should_clear) new_lines.len else @max(self.max_lines_rendered, new_lines.len);
         const buffer_length = @max(height, new_lines.len);
         self.previous_viewport_top = if (buffer_length > height) buffer_length - height else 0;
+        try self.positionHardwareCursor(cursor_pos, new_lines.len);
+        try self.replaceRenderedState(new_lines, width, height);
+    }
 
+    fn replaceRenderedState(self: *TUI, new_lines: [][]u8, width: usize, height: usize) !void {
+        try self.replacePreviousKittyImageIds(new_lines);
         if (self.previous_lines.len > 0) freeOwnedLines(self.allocator, self.previous_lines);
         self.previous_lines = new_lines;
-        try self.replacePreviousKittyImageIds(new_lines);
         self.previous_width = width;
         self.previous_height = height;
     }
@@ -2364,17 +2408,43 @@ pub const TUI = struct {
         return result;
     }
 
-    fn extractCursorPosition(_: *TUI, lines: *[][]u8, height: usize) void {
+    fn extractCursorPosition(_: *TUI, lines: *[][]u8, height: usize) ?CursorPosition {
         const viewport_top = if (lines.*.len > height) lines.*.len - height else 0;
         var row = lines.*.len;
         while (row > viewport_top) {
             row -= 1;
             if (std.mem.indexOf(u8, lines.*[row], CURSOR_MARKER)) |marker_index| {
                 const line = lines.*[row];
+                const col = visibleWidth(line[0..marker_index]);
                 std.mem.copyForwards(u8, line[marker_index..], line[marker_index + CURSOR_MARKER.len ..]);
                 lines.*[row] = line[0 .. line.len - CURSOR_MARKER.len];
-                return;
+                return .{ .row = row, .col = col };
             }
+        }
+        return null;
+    }
+
+    fn positionHardwareCursor(self: *TUI, cursor_pos: ?CursorPosition, total_lines: usize) !void {
+        if (cursor_pos == null or total_lines == 0) {
+            try self.terminal_handle.hideCursor();
+            return;
+        }
+
+        const pos = cursor_pos.?;
+        const target_row = @min(pos.row, total_lines - 1);
+        var buffer: std.ArrayList(u8) = .empty;
+        defer buffer.deinit(self.allocator);
+        try appendRelativeCursorMove(self.allocator, &buffer, diffSigned(target_row, self.hardware_cursor_row));
+        const sequence = try std.fmt.allocPrint(self.allocator, "\x1b[{d}G", .{pos.col + 1});
+        defer self.allocator.free(sequence);
+        try buffer.appendSlice(self.allocator, sequence);
+        if (buffer.items.len > 0) try self.terminal_handle.write(buffer.items);
+
+        self.hardware_cursor_row = target_row;
+        if (self.show_hardware_cursor) {
+            try self.terminal_handle.showCursor();
+        } else {
+            try self.terminal_handle.hideCursor();
         }
     }
 
@@ -2619,6 +2689,53 @@ const RenderedOverlay = struct {
     col: usize,
     width: usize,
 };
+
+const CursorPosition = struct {
+    row: usize,
+    col: usize,
+};
+
+fn appendCursorMove(allocator: std.mem.Allocator, buffer: *std.ArrayList(u8), amount: usize, direction: u8) !void {
+    if (amount == 0) return;
+    const sequence = try std.fmt.allocPrint(allocator, "\x1b[{d}{c}", .{ amount, direction });
+    defer allocator.free(sequence);
+    try buffer.appendSlice(allocator, sequence);
+}
+
+fn appendRelativeCursorMove(allocator: std.mem.Allocator, buffer: *std.ArrayList(u8), amount: isize) !void {
+    if (amount > 0) {
+        try appendCursorMove(allocator, buffer, @as(usize, @intCast(amount)), 'B');
+    } else if (amount < 0) {
+        try appendCursorMove(allocator, buffer, @as(usize, @intCast(-amount)), 'A');
+    }
+}
+
+fn appendRepeatedCrlf(allocator: std.mem.Allocator, buffer: *std.ArrayList(u8), count: usize) !void {
+    var index: usize = 0;
+    while (index < count) : (index += 1) try buffer.appendSlice(allocator, "\r\n");
+}
+
+fn diffSigned(lhs: usize, rhs: usize) isize {
+    if (lhs >= rhs) return @as(isize, @intCast(lhs - rhs));
+    return -@as(isize, @intCast(rhs - lhs));
+}
+
+fn computeLineDiff(target_row: usize, viewport_top: usize, prev_viewport_top: usize, hardware_cursor_row: usize) isize {
+    const current_screen_row = diffSigned(hardware_cursor_row, prev_viewport_top);
+    const target_screen_row = diffSigned(target_row, viewport_top);
+    return target_screen_row - current_screen_row;
+}
+
+fn clampScreenRow(row: usize, viewport_top: usize, height: usize) usize {
+    if (height == 0) return 0;
+    if (row <= viewport_top) return 0;
+    return @min(height - 1, row - viewport_top);
+}
+
+fn viewportTopForCursor(cursor_row: usize, height: usize) usize {
+    if (height == 0) return cursor_row;
+    return if (cursor_row + 1 > height) cursor_row + 1 - height else 0;
+}
 
 fn overlayLessThan(_: void, lhs: OverlayStackEntry, rhs: OverlayStackEntry) bool {
     return lhs.focus_order < rhs.focus_order;
@@ -5491,6 +5608,62 @@ const TestLinesComponent = struct {
     fn invalidate(_: *TestLinesComponent) void {}
 };
 
+const MutableLinesComponent = struct {
+    allocator: std.mem.Allocator,
+    lines: std.ArrayList([]u8) = .empty,
+
+    fn init(allocator: std.mem.Allocator) MutableLinesComponent {
+        return .{ .allocator = allocator };
+    }
+
+    fn deinit(self: *MutableLinesComponent) void {
+        self.clear();
+        self.lines.deinit(self.allocator);
+    }
+
+    fn clear(self: *MutableLinesComponent) void {
+        for (self.lines.items) |line| self.allocator.free(line);
+        self.lines.clearRetainingCapacity();
+    }
+
+    fn set(self: *MutableLinesComponent, lines: []const []const u8) !void {
+        self.clear();
+        try self.append(lines);
+    }
+
+    fn append(self: *MutableLinesComponent, lines: []const []const u8) !void {
+        for (lines) |line| try self.appendLine(line);
+    }
+
+    fn appendLine(self: *MutableLinesComponent, line: []const u8) !void {
+        try self.lines.append(self.allocator, try self.allocator.dupe(u8, line));
+    }
+
+    fn appendFormatted(self: *MutableLinesComponent, comptime fmt: []const u8, args: anytype) !void {
+        try self.lines.append(self.allocator, try std.fmt.allocPrint(self.allocator, fmt, args));
+    }
+
+    fn render(self: *MutableLinesComponent, allocator: std.mem.Allocator, width: usize) ![][]u8 {
+        var result = try allocator.alloc([]u8, self.lines.items.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (result[0..initialized]) |line| allocator.free(line);
+            allocator.free(result);
+        }
+
+        for (self.lines.items, 0..) |line, index| {
+            result[index] = if (line.len > width)
+                try allocator.dupe(u8, line[0..width])
+            else
+                try padToWidth(allocator, line, width);
+            initialized += 1;
+        }
+        return result;
+    }
+
+    fn invalidate(_: *MutableLinesComponent) void {}
+};
+
 const MarkdownWithInputComponent = struct {
     markdown: *Markdown,
     markdown_line_count: usize = 0,
@@ -5666,6 +5839,14 @@ fn expectViewportLineContains(allocator: std.mem.Allocator, virtual_terminal: *V
     defer freeOwnedLines(allocator, viewport);
     try std.testing.expect(row < viewport.len);
     try expectLineContains(viewport[row], needle);
+}
+
+fn appendViewportReproStream(buffer: *MutableLinesComponent, tui: *TUI, label: []const u8, count: usize) !void {
+    var index: usize = 1;
+    while (index <= count) : (index += 1) {
+        try buffer.appendFormatted("{s} {d:0>2}", .{ label, index });
+        try tui.requestRender(false);
+    }
 }
 
 fn removeTableNoise(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
@@ -6110,6 +6291,56 @@ test "TUI clears stale content after transient component inflates rendered heigh
     for (expected, 0..) |line, index| {
         try std.testing.expectEqualStrings(line, viewport[index]);
     }
+}
+
+test "TUI viewport overwrite repro appends post-tool stream without clobbering scrollback" {
+    const allocator = std.testing.allocator;
+    var virtual_terminal = VirtualTerminal.init(allocator, 40, 6);
+    defer virtual_terminal.deinit();
+    var tui = TUI.init(allocator, virtual_terminal.asTerminal());
+    defer tui.deinit();
+    var buffer = MutableLinesComponent.init(allocator);
+    defer buffer.deinit();
+    try tui.addChild(Component.from(MutableLinesComponent, &buffer));
+
+    const height = virtual_terminal.rows();
+    const pre_count = height + 8;
+    const tool_count = height + 12;
+    const post_count = 6;
+
+    try buffer.set(&.{
+        "TUI viewport overwrite repro",
+        "Viewport rows detected: 6",
+        "(Resize to ~8-12 rows for best repro)",
+        "",
+        "=== PRE-TOOL STREAM ===",
+    });
+    try tui.start();
+    defer tui.stop() catch {};
+
+    try appendViewportReproStream(&buffer, &tui, "PRE-TOOL LINE", pre_count);
+    try buffer.append(&.{ "", "--- TOOL CALL START ---", "(pause...)", "" });
+    try tui.requestRender(false);
+    try appendViewportReproStream(&buffer, &tui, "TOOL OUT", tool_count);
+    try buffer.append(&.{ "", "=== POST-TOOL STREAM ===" });
+    try tui.requestRender(false);
+    try appendViewportReproStream(&buffer, &tui, "POST-TOOL LINE", post_count);
+
+    const viewport = try virtual_terminal.getViewport(allocator);
+    defer freeOwnedLines(allocator, viewport);
+    for (viewport, 0..) |line, index| {
+        const expected = try std.fmt.allocPrint(allocator, "POST-TOOL LINE {d:0>2}", .{index + 1});
+        defer allocator.free(expected);
+        try std.testing.expectEqualStrings(expected, std.mem.trimEnd(u8, line, " "));
+    }
+
+    const scrollback = try virtual_terminal.getScrollBuffer(allocator);
+    defer freeOwnedLines(allocator, scrollback);
+    const pre_index = findLineWith(scrollback, "PRE-TOOL LINE 14") orelse return error.MissingPreToolLine;
+    const tool_index = findLineWith(scrollback, "TOOL OUT 18") orelse return error.MissingToolLine;
+    const post_index = findLineWith(scrollback, "POST-TOOL LINE 06") orelse return error.MissingPostToolLine;
+    try std.testing.expect(pre_index < tool_index);
+    try std.testing.expect(tool_index < post_index);
 }
 
 test "TUI deletes changed Kitty image ids before drawing moved placements" {
