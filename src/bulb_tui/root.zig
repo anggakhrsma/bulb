@@ -5175,6 +5175,49 @@ const OverlayVisibilityToggle = struct {
     }
 };
 
+const FocusOnInputHook = struct {
+    tui: *TUI,
+    input: []const u8,
+    target: ?Component,
+
+    fn call(ptr: ?*anyopaque, data: []const u8) void {
+        const self: *FocusOnInputHook = @ptrCast(@alignCast(ptr.?));
+        if (std.mem.eql(u8, data, self.input)) self.tui.setFocus(self.target);
+    }
+};
+
+const ClearContainerAndFocusOnInputHook = struct {
+    tui: *TUI,
+    container: *Container,
+    input: []const u8,
+    target: Component,
+
+    fn call(ptr: ?*anyopaque, data: []const u8) void {
+        const self: *ClearContainerAndFocusOnInputHook = @ptrCast(@alignCast(ptr.?));
+        if (std.mem.eql(u8, data, self.input)) {
+            self.container.clear();
+            self.container.addChild(self.target) catch unreachable;
+            self.tui.setFocus(self.target);
+        }
+    }
+};
+
+const FocusThenUnfocusOverlayOnInputHook = struct {
+    tui: *TUI,
+    input: []const u8,
+    focus_target: Component,
+    overlay_handle: OverlayHandle,
+    unfocus_target: ?Component,
+
+    fn call(ptr: ?*anyopaque, data: []const u8) void {
+        const self: *FocusThenUnfocusOverlayOnInputHook = @ptrCast(@alignCast(ptr.?));
+        if (std.mem.eql(u8, data, self.input)) {
+            self.tui.setFocus(self.focus_target);
+            self.overlay_handle.unfocus(.{ .target = self.unfocus_target });
+        }
+    }
+};
+
 fn stripAnsiAlloc(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
     var output: std.ArrayList(u8) = .empty;
     errdefer output.deinit(allocator);
@@ -5471,6 +5514,154 @@ test "TUI overlays render over short content and honor percentage width" {
     try std.testing.expect(containsLineWith(viewport, "OVERLAY_MID"));
 }
 
+test "TUI overlay options handle overflow and styled compositing regressions" {
+    const allocator = std.testing.allocator;
+
+    {
+        var virtual_terminal = VirtualTerminal.init(allocator, 80, 24);
+        defer virtual_terminal.deinit();
+        var tui = TUI.init(allocator, virtual_terminal.asTerminal());
+        defer tui.deinit();
+        var content = TestLinesComponent{};
+        var overlay = TestLinesComponent{ .lines = &.{"XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"} };
+        try tui.addChild(Component.from(TestLinesComponent, &content));
+        _ = try tui.showOverlay(Component.from(TestLinesComponent, &overlay), .{ .width = .{ .cells = 20 } });
+
+        try tui.start();
+        defer tui.stop() catch {};
+        try renderAndFlush(&tui);
+
+        const viewport = try virtual_terminal.getViewport(allocator);
+        defer freeOwnedLines(allocator, viewport);
+        for (viewport) |line| try std.testing.expect(line.len <= 80);
+    }
+
+    {
+        var virtual_terminal = VirtualTerminal.init(allocator, 80, 24);
+        defer virtual_terminal.deinit();
+        var tui = TUI.init(allocator, virtual_terminal.asTerminal());
+        defer tui.deinit();
+        var content = TestLinesComponent{};
+        const complex_line =
+            "\x1b[48;2;40;50;40m \x1b[38;2;128;128;128mSome styled content\x1b[39m\x1b[49m" ++
+            "\x1b]8;;http://example.com\x07link\x1b]8;;\x07" ++
+            " more content  more content  more content  more content  more content ";
+        var overlay = TestLinesComponent{ .lines = &.{ complex_line, complex_line, complex_line } };
+        try tui.addChild(Component.from(TestLinesComponent, &content));
+        _ = try tui.showOverlay(Component.from(TestLinesComponent, &overlay), .{ .width = .{ .cells = 60 } });
+
+        try tui.start();
+        defer tui.stop() catch {};
+        try renderAndFlush(&tui);
+
+        const viewport = try virtual_terminal.getViewport(allocator);
+        defer freeOwnedLines(allocator, viewport);
+        try std.testing.expect(viewport.len > 0);
+    }
+
+    {
+        var virtual_terminal = VirtualTerminal.init(allocator, 80, 24);
+        defer virtual_terminal.deinit();
+        var tui = TUI.init(allocator, virtual_terminal.asTerminal());
+        defer tui.deinit();
+        const styled_line = "\x1b[1m\x1b[38;2;255;0;0mXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX\x1b[0m";
+        var content = TestLinesComponent{ .lines = &.{ styled_line, styled_line, styled_line } };
+        var overlay = TestLinesComponent{ .lines = &.{"OVERLAY"} };
+        try tui.addChild(Component.from(TestLinesComponent, &content));
+        _ = try tui.showOverlay(Component.from(TestLinesComponent, &overlay), .{ .anchor = .center, .width = .{ .cells = 20 } });
+
+        try tui.start();
+        defer tui.stop() catch {};
+        try renderAndFlush(&tui);
+
+        const viewport = try virtual_terminal.getViewport(allocator);
+        defer freeOwnedLines(allocator, viewport);
+        try std.testing.expect(containsLineWith(viewport, "OVERLAY"));
+    }
+
+    {
+        var virtual_terminal = VirtualTerminal.init(allocator, 80, 24);
+        defer virtual_terminal.deinit();
+        var tui = TUI.init(allocator, virtual_terminal.asTerminal());
+        defer tui.deinit();
+        var content = TestLinesComponent{};
+        var overlay = TestLinesComponent{ .lines = &.{"中文日本語한글テスト漢字"} };
+        try tui.addChild(Component.from(TestLinesComponent, &content));
+        _ = try tui.showOverlay(Component.from(TestLinesComponent, &overlay), .{ .width = .{ .cells = 15 } });
+
+        try tui.start();
+        defer tui.stop() catch {};
+        try renderAndFlush(&tui);
+
+        const viewport = try virtual_terminal.getViewport(allocator);
+        defer freeOwnedLines(allocator, viewport);
+        try std.testing.expect(viewport.len > 0);
+    }
+
+    {
+        var virtual_terminal = VirtualTerminal.init(allocator, 80, 24);
+        defer virtual_terminal.deinit();
+        var tui = TUI.init(allocator, virtual_terminal.asTerminal());
+        defer tui.deinit();
+        var content = TestLinesComponent{};
+        var overlay = TestLinesComponent{ .lines = &.{"XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"} };
+        try tui.addChild(Component.from(TestLinesComponent, &content));
+        _ = try tui.showOverlay(Component.from(TestLinesComponent, &overlay), .{
+            .col = .{ .cells = 60 },
+            .width = .{ .cells = 20 },
+        });
+
+        try tui.start();
+        defer tui.stop() catch {};
+        try renderAndFlush(&tui);
+
+        const viewport = try virtual_terminal.getViewport(allocator);
+        defer freeOwnedLines(allocator, viewport);
+        try std.testing.expect(viewport.len > 0);
+    }
+
+    {
+        var virtual_terminal = VirtualTerminal.init(allocator, 80, 24);
+        defer virtual_terminal.deinit();
+        var tui = TUI.init(allocator, virtual_terminal.asTerminal());
+        defer tui.deinit();
+        const link = "\x1b]8;;file:///path/to/file.ts\x07file.ts\x1b]8;;\x07";
+        const line = "See " ++ link ++ " for details XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX";
+        var content = TestLinesComponent{ .lines = &.{ line, line, line } };
+        var overlay = TestLinesComponent{ .lines = &.{"OVERLAY-TEXT"} };
+        try tui.addChild(Component.from(TestLinesComponent, &content));
+        _ = try tui.showOverlay(Component.from(TestLinesComponent, &overlay), .{ .anchor = .center, .width = .{ .cells = 20 } });
+
+        try tui.start();
+        defer tui.stop() catch {};
+        try renderAndFlush(&tui);
+
+        const viewport = try virtual_terminal.getViewport(allocator);
+        defer freeOwnedLines(allocator, viewport);
+        try std.testing.expect(containsLineWith(viewport, "OVERLAY-TEXT"));
+    }
+}
+
+test "TUI overlay percentage width respects min width" {
+    const allocator = std.testing.allocator;
+    var virtual_terminal = VirtualTerminal.init(allocator, 100, 24);
+    defer virtual_terminal.deinit();
+    var tui = TUI.init(allocator, virtual_terminal.asTerminal());
+    defer tui.deinit();
+    var content = TestLinesComponent{};
+    var overlay = TestLinesComponent{ .lines = &.{"test"} };
+    try tui.addChild(Component.from(TestLinesComponent, &content));
+    _ = try tui.showOverlay(Component.from(TestLinesComponent, &overlay), .{
+        .width = .{ .percent = 10.0 },
+        .min_width = 30,
+    });
+
+    try tui.start();
+    defer tui.stop() catch {};
+    try renderAndFlush(&tui);
+    try std.testing.expectEqual(@as(usize, 30), overlay.requested_width);
+}
+
 test "TUI overlay anchors position top-left, top-center, and bottom-right content" {
     const allocator = std.testing.allocator;
     var virtual_terminal = VirtualTerminal.init(allocator, 80, 24);
@@ -5549,6 +5740,52 @@ test "TUI overlay layout respects margins, offsets, absolute and percentage posi
     try std.testing.expectEqual(@as(usize, 5), std.mem.indexOf(u8, viewport[3], "ABSOLUTE").?);
 }
 
+test "TUI overlay row percentages clamp to top and bottom" {
+    const allocator = std.testing.allocator;
+
+    {
+        var virtual_terminal = VirtualTerminal.init(allocator, 80, 24);
+        defer virtual_terminal.deinit();
+        var tui = TUI.init(allocator, virtual_terminal.asTerminal());
+        defer tui.deinit();
+        var content = TestLinesComponent{};
+        var overlay = TestLinesComponent{ .lines = &.{"TOP"} };
+        try tui.addChild(Component.from(TestLinesComponent, &content));
+        _ = try tui.showOverlay(Component.from(TestLinesComponent, &overlay), .{
+            .width = .{ .cells = 10 },
+            .row = .{ .percent = 0.0 },
+        });
+
+        try tui.start();
+        defer tui.stop() catch {};
+
+        const viewport = try virtual_terminal.getViewport(allocator);
+        defer freeOwnedLines(allocator, viewport);
+        try std.testing.expect(std.mem.indexOf(u8, viewport[0], "TOP") != null);
+    }
+
+    {
+        var virtual_terminal = VirtualTerminal.init(allocator, 80, 24);
+        defer virtual_terminal.deinit();
+        var tui = TUI.init(allocator, virtual_terminal.asTerminal());
+        defer tui.deinit();
+        var content = TestLinesComponent{};
+        var overlay = TestLinesComponent{ .lines = &.{"BOTTOM"} };
+        try tui.addChild(Component.from(TestLinesComponent, &content));
+        _ = try tui.showOverlay(Component.from(TestLinesComponent, &overlay), .{
+            .width = .{ .cells = 10 },
+            .row = .{ .percent = 100.0 },
+        });
+
+        try tui.start();
+        defer tui.stop() catch {};
+
+        const viewport = try virtual_terminal.getViewport(allocator);
+        defer freeOwnedLines(allocator, viewport);
+        try std.testing.expect(std.mem.indexOf(u8, viewport[23], "BOTTOM") != null);
+    }
+}
+
 test "TUI overlay maxHeight truncates cell and percentage sized overlays" {
     const allocator = std.testing.allocator;
 
@@ -5619,6 +5856,32 @@ test "TUI stacked overlays render later focused overlays on top and reveal previ
     const next_viewport = try virtual_terminal.getViewport(allocator);
     defer freeOwnedLines(allocator, next_viewport);
     try std.testing.expect(std.mem.indexOf(u8, next_viewport[0], "FIRST") != null);
+}
+
+test "TUI stacked overlays at different positions do not interfere" {
+    const allocator = std.testing.allocator;
+    var virtual_terminal = VirtualTerminal.init(allocator, 80, 24);
+    defer virtual_terminal.deinit();
+    var tui = TUI.init(allocator, virtual_terminal.asTerminal());
+    defer tui.deinit();
+    var content = TestLinesComponent{};
+    var top_left = TestLinesComponent{ .lines = &.{"TOP-LEFT"} };
+    var bottom_right = TestLinesComponent{ .lines = &.{"BTM-RIGHT"} };
+    try tui.addChild(Component.from(TestLinesComponent, &content));
+    _ = try tui.showOverlay(Component.from(TestLinesComponent, &top_left), .{ .anchor = .top_left, .width = .{ .cells = 15 } });
+    _ = try tui.showOverlay(Component.from(TestLinesComponent, &bottom_right), .{
+        .anchor = .bottom_right,
+        .width = .{ .cells = 15 },
+        .non_capturing = true,
+    });
+
+    try tui.start();
+    defer tui.stop() catch {};
+
+    const viewport = try virtual_terminal.getViewport(allocator);
+    defer freeOwnedLines(allocator, viewport);
+    try std.testing.expect(std.mem.indexOf(u8, viewport[0], "TOP-LEFT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, viewport[23], "BTM-RIGHT") != null);
 }
 
 test "TUI non-capturing overlays preserve focus and explicit focus can receive input" {
@@ -5825,6 +6088,44 @@ test "TUI overlay input redirection skips non-capturing overlays when focused ov
     try std.testing.expect(fallback.focused);
 }
 
+test "TUI overlay deferred sub-overlay cleanup restores editor focus" {
+    const allocator = std.testing.allocator;
+    var virtual_terminal = VirtualTerminal.init(allocator, 80, 24);
+    defer virtual_terminal.deinit();
+    var tui = TUI.init(allocator, virtual_terminal.asTerminal());
+    defer tui.deinit();
+    var content = TestLinesComponent{};
+    var editor = FocusableInputComponent{ .allocator = allocator, .lines = &.{"EDITOR"} };
+    defer editor.deinit();
+    var timer = FocusableInputComponent{ .allocator = allocator, .lines = &.{"TIMER"} };
+    defer timer.deinit();
+    var controller = FocusableInputComponent{ .allocator = allocator, .lines = &.{"CTRL"} };
+    defer controller.deinit();
+
+    try tui.addChild(Component.from(TestLinesComponent, &content));
+    tui.setFocus(Component.from(FocusableInputComponent, &editor));
+    try tui.start();
+    defer tui.stop() catch {};
+
+    const timer_handle = try tui.showOverlay(Component.from(FocusableInputComponent, &timer), .{ .non_capturing = true });
+    _ = try tui.showOverlay(Component.from(FocusableInputComponent, &controller), .{});
+    try renderAndFlush(&tui);
+    try std.testing.expect(controller.focused);
+    try std.testing.expect(!editor.focused);
+
+    timer_handle.hide();
+    tui.hideOverlay();
+    try renderAndFlush(&tui);
+
+    try std.testing.expect(editor.focused);
+    try std.testing.expect(!controller.focused);
+    try std.testing.expect(!timer.focused);
+    virtual_terminal.sendInput("x");
+    try renderAndFlush(&tui);
+    try std.testing.expectEqualStrings("x", editor.inputs.items);
+    try std.testing.expectEqualStrings("", controller.inputs.items);
+}
+
 test "TUI overlay restores focused overlay after base replacement receives close input" {
     const allocator = std.testing.allocator;
     var virtual_terminal = VirtualTerminal.init(allocator, 80, 24);
@@ -5892,6 +6193,594 @@ test "TUI overlay restores focused overlay after base replacement receives close
     try std.testing.expectEqualStrings("bx", overlay.inputs.items);
 }
 
+test "TUI overlay blocked replacement paths preserve input until release" {
+    const allocator = std.testing.allocator;
+
+    {
+        var virtual_terminal = VirtualTerminal.init(allocator, 80, 24);
+        defer virtual_terminal.deinit();
+        var tui = TUI.init(allocator, virtual_terminal.asTerminal());
+        defer tui.deinit();
+        var content = TestLinesComponent{};
+        var editor = FocusableInputComponent{ .allocator = allocator, .lines = &.{"EDITOR"} };
+        defer editor.deinit();
+        var replacement = FocusableInputComponent{ .allocator = allocator, .lines = &.{"REPLACEMENT"} };
+        defer replacement.deinit();
+        var passive = FocusableInputComponent{ .allocator = allocator, .lines = &.{"PASSIVE"} };
+        defer passive.deinit();
+        var overlay = FocusableInputComponent{ .allocator = allocator, .lines = &.{"OVERLAY"} };
+        defer overlay.deinit();
+        var focus_replacement = FocusOnInputHook{
+            .tui = &tui,
+            .input = "b",
+            .target = Component.from(FocusableInputComponent, &replacement),
+        };
+        var focus_editor = FocusOnInputHook{
+            .tui = &tui,
+            .input = "\r",
+            .target = Component.from(FocusableInputComponent, &editor),
+        };
+        overlay.input_hook = .{ .ptr = &focus_replacement, .call_fn = FocusOnInputHook.call };
+        replacement.input_hook = .{ .ptr = &focus_editor, .call_fn = FocusOnInputHook.call };
+
+        try tui.addChild(Component.from(TestLinesComponent, &content));
+        tui.setFocus(Component.from(FocusableInputComponent, &editor));
+        try tui.start();
+        defer tui.stop() catch {};
+
+        tui.setFocus(Component.from(FocusableInputComponent, &replacement));
+        _ = try tui.showOverlay(Component.from(FocusableInputComponent, &passive), .{ .non_capturing = true });
+        tui.setFocus(Component.from(FocusableInputComponent, &editor));
+        _ = try tui.showOverlay(Component.from(FocusableInputComponent, &overlay), .{});
+        virtual_terminal.sendInput("b");
+        try renderAndFlush(&tui);
+        try std.testing.expect(replacement.focused);
+
+        virtual_terminal.sendInput("1");
+        virtual_terminal.sendInput("\r");
+        try renderAndFlush(&tui);
+        try std.testing.expectEqualStrings("1\r", replacement.inputs.items);
+        try std.testing.expectEqualStrings("b", overlay.inputs.items);
+        try std.testing.expect(overlay.focused);
+    }
+
+    {
+        var virtual_terminal = VirtualTerminal.init(allocator, 80, 24);
+        defer virtual_terminal.deinit();
+        var tui = TUI.init(allocator, virtual_terminal.asTerminal());
+        defer tui.deinit();
+        var base = Container.init(allocator);
+        defer base.deinit();
+        var editor = FocusableInputComponent{ .allocator = allocator, .lines = &.{"EDITOR"} };
+        defer editor.deinit();
+        var first = FocusableInputComponent{ .allocator = allocator, .lines = &.{"FIRST"} };
+        defer first.deinit();
+        var second = FocusableInputComponent{ .allocator = allocator, .lines = &.{"SECOND"} };
+        defer second.deinit();
+        var overlay = FocusableInputComponent{ .allocator = allocator, .lines = &.{"OVERLAY"} };
+        defer overlay.deinit();
+        var focus_first = FocusOnInputHook{
+            .tui = &tui,
+            .input = "b",
+            .target = Component.from(FocusableInputComponent, &first),
+        };
+        var focus_second = FocusOnInputHook{
+            .tui = &tui,
+            .input = "n",
+            .target = Component.from(FocusableInputComponent, &second),
+        };
+        var close_second = ClearContainerAndFocusOnInputHook{
+            .tui = &tui,
+            .container = &base,
+            .input = "\r",
+            .target = Component.from(FocusableInputComponent, &editor),
+        };
+        overlay.input_hook = .{ .ptr = &focus_first, .call_fn = FocusOnInputHook.call };
+        first.input_hook = .{ .ptr = &focus_second, .call_fn = FocusOnInputHook.call };
+        second.input_hook = .{ .ptr = &close_second, .call_fn = ClearContainerAndFocusOnInputHook.call };
+
+        try base.addChild(Component.from(FocusableInputComponent, &editor));
+        try base.addChild(Component.from(FocusableInputComponent, &first));
+        try base.addChild(Component.from(FocusableInputComponent, &second));
+        try tui.addChild(Component.from(Container, &base));
+        tui.setFocus(Component.from(FocusableInputComponent, &editor));
+        try tui.start();
+        defer tui.stop() catch {};
+
+        _ = try tui.showOverlay(Component.from(FocusableInputComponent, &overlay), .{});
+        virtual_terminal.sendInput("b");
+        try renderAndFlush(&tui);
+        virtual_terminal.sendInput("n");
+        try renderAndFlush(&tui);
+        virtual_terminal.sendInput("2");
+        virtual_terminal.sendInput("\r");
+        try renderAndFlush(&tui);
+
+        try std.testing.expectEqualStrings("b", overlay.inputs.items);
+        try std.testing.expectEqualStrings("n", first.inputs.items);
+        try std.testing.expectEqualStrings("2\r", second.inputs.items);
+        try std.testing.expect(overlay.focused);
+    }
+
+    {
+        var virtual_terminal = VirtualTerminal.init(allocator, 80, 24);
+        defer virtual_terminal.deinit();
+        var tui = TUI.init(allocator, virtual_terminal.asTerminal());
+        defer tui.deinit();
+        var base = Container.init(allocator);
+        defer base.deinit();
+        var editor = FocusableInputComponent{ .allocator = allocator, .lines = &.{"EDITOR"} };
+        defer editor.deinit();
+        var palette = FocusableInputComponent{ .allocator = allocator, .lines = &.{"PALETTE"} };
+        defer palette.deinit();
+        var replacement = FocusableInputComponent{ .allocator = allocator, .lines = &.{"REPLACEMENT"} };
+        defer replacement.deinit();
+        var overlay = FocusableInputComponent{ .allocator = allocator, .lines = &.{"OVERLAY"} };
+        defer overlay.deinit();
+        var focus_replacement = FocusOnInputHook{
+            .tui = &tui,
+            .input = "b",
+            .target = Component.from(FocusableInputComponent, &replacement),
+        };
+        var close_replacement = ClearContainerAndFocusOnInputHook{
+            .tui = &tui,
+            .container = &base,
+            .input = "\r",
+            .target = Component.from(FocusableInputComponent, &editor),
+        };
+        overlay.input_hook = .{ .ptr = &focus_replacement, .call_fn = FocusOnInputHook.call };
+        replacement.input_hook = .{ .ptr = &close_replacement, .call_fn = ClearContainerAndFocusOnInputHook.call };
+
+        try base.addChild(Component.from(FocusableInputComponent, &editor));
+        try base.addChild(Component.from(FocusableInputComponent, &palette));
+        try base.addChild(Component.from(FocusableInputComponent, &replacement));
+        try tui.addChild(Component.from(Container, &base));
+        tui.setFocus(Component.from(FocusableInputComponent, &palette));
+        try tui.start();
+        defer tui.stop() catch {};
+
+        _ = try tui.showOverlay(Component.from(FocusableInputComponent, &overlay), .{});
+        virtual_terminal.sendInput("b");
+        try renderAndFlush(&tui);
+        virtual_terminal.sendInput("\r");
+        virtual_terminal.sendInput("x");
+        try renderAndFlush(&tui);
+
+        try std.testing.expectEqualStrings("bx", overlay.inputs.items);
+        try std.testing.expectEqualStrings("\r", replacement.inputs.items);
+        try std.testing.expectEqualStrings("", editor.inputs.items);
+        try std.testing.expect(overlay.focused);
+    }
+
+    {
+        var virtual_terminal = VirtualTerminal.init(allocator, 80, 24);
+        defer virtual_terminal.deinit();
+        var tui = TUI.init(allocator, virtual_terminal.asTerminal());
+        defer tui.deinit();
+        var content = TestLinesComponent{};
+        var fallback = FocusableInputComponent{ .allocator = allocator, .lines = &.{"FALLBACK"} };
+        defer fallback.deinit();
+        var target = FocusableInputComponent{ .allocator = allocator, .lines = &.{"TARGET"} };
+        defer target.deinit();
+        var replacement = FocusableInputComponent{ .allocator = allocator, .lines = &.{"REPLACEMENT"} };
+        defer replacement.deinit();
+        var overlay = FocusableInputComponent{ .allocator = allocator, .lines = &.{"OVERLAY"} };
+        defer overlay.deinit();
+        var focus_fallback = FocusOnInputHook{
+            .tui = &tui,
+            .input = "\r",
+            .target = Component.from(FocusableInputComponent, &fallback),
+        };
+        replacement.input_hook = .{ .ptr = &focus_fallback, .call_fn = FocusOnInputHook.call };
+
+        try tui.addChild(Component.from(TestLinesComponent, &content));
+        try tui.start();
+        defer tui.stop() catch {};
+
+        const overlay_handle = try tui.showOverlay(Component.from(FocusableInputComponent, &overlay), .{});
+        var focus_and_unfocus = FocusThenUnfocusOverlayOnInputHook{
+            .tui = &tui,
+            .input = "b",
+            .focus_target = Component.from(FocusableInputComponent, &replacement),
+            .overlay_handle = overlay_handle,
+            .unfocus_target = Component.from(FocusableInputComponent, &target),
+        };
+        overlay.input_hook = .{ .ptr = &focus_and_unfocus, .call_fn = FocusThenUnfocusOverlayOnInputHook.call };
+
+        virtual_terminal.sendInput("b");
+        try renderAndFlush(&tui);
+        try std.testing.expect(replacement.focused);
+        virtual_terminal.sendInput("\r");
+        virtual_terminal.sendInput("x");
+        try renderAndFlush(&tui);
+
+        try std.testing.expectEqualStrings("b", overlay.inputs.items);
+        try std.testing.expectEqualStrings("\r", replacement.inputs.items);
+        try std.testing.expectEqualStrings("", fallback.inputs.items);
+        try std.testing.expectEqualStrings("x", target.inputs.items);
+    }
+}
+
+test "TUI overlay restore eligibility handles base focus steals and explicit clears" {
+    const allocator = std.testing.allocator;
+
+    {
+        var virtual_terminal = VirtualTerminal.init(allocator, 80, 24);
+        defer virtual_terminal.deinit();
+        var tui = TUI.init(allocator, virtual_terminal.asTerminal());
+        defer tui.deinit();
+        var content = TestLinesComponent{};
+        var editor = FocusableInputComponent{ .allocator = allocator, .lines = &.{"EDITOR"} };
+        defer editor.deinit();
+        var replacement = FocusableInputComponent{ .allocator = allocator, .lines = &.{"REPLACEMENT"} };
+        defer replacement.deinit();
+        var overlay = FocusableInputComponent{ .allocator = allocator, .lines = &.{"OVERLAY"} };
+        defer overlay.deinit();
+
+        try tui.addChild(Component.from(TestLinesComponent, &content));
+        tui.setFocus(Component.from(FocusableInputComponent, &editor));
+        try tui.start();
+        defer tui.stop() catch {};
+
+        _ = try tui.showOverlay(Component.from(FocusableInputComponent, &overlay), .{});
+        try std.testing.expect(overlay.focused);
+        tui.setFocus(Component.from(FocusableInputComponent, &replacement));
+        tui.setFocus(Component.from(FocusableInputComponent, &editor));
+        virtual_terminal.sendInput("x");
+        try renderAndFlush(&tui);
+        try std.testing.expectEqualStrings("x", overlay.inputs.items);
+        try std.testing.expectEqualStrings("", editor.inputs.items);
+        try std.testing.expect(overlay.focused);
+    }
+
+    {
+        var virtual_terminal = VirtualTerminal.init(allocator, 80, 24);
+        defer virtual_terminal.deinit();
+        var tui = TUI.init(allocator, virtual_terminal.asTerminal());
+        defer tui.deinit();
+        var content = TestLinesComponent{};
+        var editor = FocusableInputComponent{ .allocator = allocator, .lines = &.{"EDITOR"} };
+        defer editor.deinit();
+        var controller = FocusableInputComponent{ .allocator = allocator, .lines = &.{"CONTROLLER"} };
+        defer controller.deinit();
+        var sub_overlay = FocusableInputComponent{ .allocator = allocator, .lines = &.{"SUB"} };
+        defer sub_overlay.deinit();
+
+        try tui.addChild(Component.from(TestLinesComponent, &content));
+        tui.setFocus(Component.from(FocusableInputComponent, &editor));
+        try tui.start();
+        defer tui.stop() catch {};
+
+        _ = try tui.showOverlay(Component.from(FocusableInputComponent, &controller), .{});
+        const sub_handle = try tui.showOverlay(Component.from(FocusableInputComponent, &sub_overlay), .{ .non_capturing = true });
+        sub_handle.focus();
+        tui.setFocus(Component.from(FocusableInputComponent, &editor));
+        virtual_terminal.sendInput("x");
+        try renderAndFlush(&tui);
+        try std.testing.expectEqualStrings("x", sub_overlay.inputs.items);
+        try std.testing.expectEqualStrings("", controller.inputs.items);
+        try std.testing.expectEqualStrings("", editor.inputs.items);
+    }
+
+    {
+        var virtual_terminal = VirtualTerminal.init(allocator, 80, 24);
+        defer virtual_terminal.deinit();
+        var tui = TUI.init(allocator, virtual_terminal.asTerminal());
+        defer tui.deinit();
+        var content = TestLinesComponent{};
+        var editor = FocusableInputComponent{ .allocator = allocator, .lines = &.{"EDITOR"} };
+        defer editor.deinit();
+        var passive = FocusableInputComponent{ .allocator = allocator, .lines = &.{"PASSIVE"} };
+        defer passive.deinit();
+
+        try tui.addChild(Component.from(TestLinesComponent, &content));
+        tui.setFocus(Component.from(FocusableInputComponent, &editor));
+        try tui.start();
+        defer tui.stop() catch {};
+
+        _ = try tui.showOverlay(Component.from(FocusableInputComponent, &passive), .{ .non_capturing = true });
+        virtual_terminal.sendInput("x");
+        try renderAndFlush(&tui);
+        try std.testing.expectEqualStrings("x", editor.inputs.items);
+        try std.testing.expectEqualStrings("", passive.inputs.items);
+        try std.testing.expect(editor.focused);
+    }
+
+    {
+        var virtual_terminal = VirtualTerminal.init(allocator, 80, 24);
+        defer virtual_terminal.deinit();
+        var tui = TUI.init(allocator, virtual_terminal.asTerminal());
+        defer tui.deinit();
+        var content = TestLinesComponent{};
+        var editor = FocusableInputComponent{ .allocator = allocator, .lines = &.{"EDITOR"} };
+        defer editor.deinit();
+        var overlay = FocusableInputComponent{ .allocator = allocator, .lines = &.{"NC"} };
+        defer overlay.deinit();
+
+        try tui.addChild(Component.from(TestLinesComponent, &content));
+        tui.setFocus(Component.from(FocusableInputComponent, &editor));
+        try tui.start();
+        defer tui.stop() catch {};
+
+        const handle = try tui.showOverlay(Component.from(FocusableInputComponent, &overlay), .{ .non_capturing = true });
+        handle.focus();
+        tui.setFocus(Component.from(FocusableInputComponent, &editor));
+        virtual_terminal.sendInput("x");
+        try renderAndFlush(&tui);
+        try std.testing.expectEqualStrings("x", overlay.inputs.items);
+        try std.testing.expectEqualStrings("", editor.inputs.items);
+    }
+
+    {
+        var virtual_terminal = VirtualTerminal.init(allocator, 80, 24);
+        defer virtual_terminal.deinit();
+        var tui = TUI.init(allocator, virtual_terminal.asTerminal());
+        defer tui.deinit();
+        var content = TestLinesComponent{};
+        var editor = FocusableInputComponent{ .allocator = allocator, .lines = &.{"EDITOR"} };
+        defer editor.deinit();
+        var overlay = FocusableInputComponent{ .allocator = allocator, .lines = &.{"OVERLAY"} };
+        defer overlay.deinit();
+
+        try tui.addChild(Component.from(TestLinesComponent, &content));
+        tui.setFocus(Component.from(FocusableInputComponent, &editor));
+        try tui.start();
+        defer tui.stop() catch {};
+
+        const handle = try tui.showOverlay(Component.from(FocusableInputComponent, &overlay), .{});
+        handle.unfocus(null);
+        virtual_terminal.sendInput("x");
+        try renderAndFlush(&tui);
+        try std.testing.expectEqualStrings("x", editor.inputs.items);
+        try std.testing.expectEqualStrings("", overlay.inputs.items);
+        try std.testing.expect(editor.focused);
+    }
+
+    {
+        var virtual_terminal = VirtualTerminal.init(allocator, 80, 24);
+        defer virtual_terminal.deinit();
+        var tui = TUI.init(allocator, virtual_terminal.asTerminal());
+        defer tui.deinit();
+        var content = TestLinesComponent{};
+        var overlay = FocusableInputComponent{ .allocator = allocator, .lines = &.{"OVERLAY"} };
+        defer overlay.deinit();
+
+        try tui.addChild(Component.from(TestLinesComponent, &content));
+        try tui.start();
+        defer tui.stop() catch {};
+
+        _ = try tui.showOverlay(Component.from(FocusableInputComponent, &overlay), .{});
+        tui.setFocus(null);
+        virtual_terminal.sendInput("x");
+        try renderAndFlush(&tui);
+        try std.testing.expectEqualStrings("", overlay.inputs.items);
+        try std.testing.expect(!overlay.focused);
+    }
+
+    {
+        var virtual_terminal = VirtualTerminal.init(allocator, 80, 24);
+        defer virtual_terminal.deinit();
+        var tui = TUI.init(allocator, virtual_terminal.asTerminal());
+        defer tui.deinit();
+        var content = TestLinesComponent{};
+        var replacement = FocusableInputComponent{ .allocator = allocator, .lines = &.{"REPLACEMENT"} };
+        defer replacement.deinit();
+        var overlay = FocusableInputComponent{ .allocator = allocator, .lines = &.{"OVERLAY"} };
+        defer overlay.deinit();
+        var clear_focus = FocusOnInputHook{
+            .tui = &tui,
+            .input = "\r",
+            .target = null,
+        };
+        var focus_replacement = FocusOnInputHook{
+            .tui = &tui,
+            .input = "b",
+            .target = Component.from(FocusableInputComponent, &replacement),
+        };
+        replacement.input_hook = .{ .ptr = &clear_focus, .call_fn = FocusOnInputHook.call };
+        overlay.input_hook = .{ .ptr = &focus_replacement, .call_fn = FocusOnInputHook.call };
+
+        try tui.addChild(Component.from(TestLinesComponent, &content));
+        try tui.start();
+        defer tui.stop() catch {};
+
+        _ = try tui.showOverlay(Component.from(FocusableInputComponent, &overlay), .{});
+        virtual_terminal.sendInput("b");
+        try renderAndFlush(&tui);
+        virtual_terminal.sendInput("\r");
+        virtual_terminal.sendInput("x");
+        try renderAndFlush(&tui);
+        try std.testing.expectEqualStrings("\r", replacement.inputs.items);
+        try std.testing.expectEqualStrings("bx", overlay.inputs.items);
+        try std.testing.expect(overlay.focused);
+    }
+}
+
+test "TUI overlay visibility and ancestry restore regressions match Pi" {
+    const allocator = std.testing.allocator;
+
+    {
+        var virtual_terminal = VirtualTerminal.init(allocator, 80, 24);
+        defer virtual_terminal.deinit();
+        var tui = TUI.init(allocator, virtual_terminal.asTerminal());
+        defer tui.deinit();
+        var content = TestLinesComponent{};
+        var editor = FocusableInputComponent{ .allocator = allocator, .lines = &.{"EDITOR"} };
+        defer editor.deinit();
+        var overlay = FocusableInputComponent{ .allocator = allocator, .lines = &.{"OVERLAY"} };
+        defer overlay.deinit();
+        var visible = OverlayVisibilityToggle{ .visible = true };
+
+        try tui.addChild(Component.from(TestLinesComponent, &content));
+        tui.setFocus(Component.from(FocusableInputComponent, &editor));
+        try tui.start();
+        defer tui.stop() catch {};
+
+        _ = try tui.showOverlay(Component.from(FocusableInputComponent, &overlay), .{
+            .visible = .{ .ptr = &visible, .call_fn = OverlayVisibilityToggle.call },
+        });
+        tui.setFocus(Component.from(FocusableInputComponent, &editor));
+        visible.visible = false;
+        virtual_terminal.sendInput("x");
+        try renderAndFlush(&tui);
+        try std.testing.expectEqualStrings("x", editor.inputs.items);
+        try std.testing.expectEqualStrings("", overlay.inputs.items);
+        visible.visible = true;
+        virtual_terminal.sendInput("y");
+        try renderAndFlush(&tui);
+        try std.testing.expectEqualStrings("x", editor.inputs.items);
+        try std.testing.expectEqualStrings("y", overlay.inputs.items);
+    }
+
+    {
+        var virtual_terminal = VirtualTerminal.init(allocator, 80, 24);
+        defer virtual_terminal.deinit();
+        var tui = TUI.init(allocator, virtual_terminal.asTerminal());
+        defer tui.deinit();
+        var content = TestLinesComponent{};
+        var overlay = FocusableInputComponent{ .allocator = allocator, .lines = &.{"OVERLAY"} };
+        defer overlay.deinit();
+        var visible = OverlayVisibilityToggle{ .visible = true };
+
+        try tui.addChild(Component.from(TestLinesComponent, &content));
+        try tui.start();
+        defer tui.stop() catch {};
+
+        _ = try tui.showOverlay(Component.from(FocusableInputComponent, &overlay), .{
+            .visible = .{ .ptr = &visible, .call_fn = OverlayVisibilityToggle.call },
+        });
+        visible.visible = false;
+        virtual_terminal.sendInput("x");
+        try renderAndFlush(&tui);
+        try std.testing.expectEqualStrings("", overlay.inputs.items);
+        visible.visible = true;
+        virtual_terminal.sendInput("y");
+        try renderAndFlush(&tui);
+        try std.testing.expectEqualStrings("y", overlay.inputs.items);
+    }
+
+    {
+        var virtual_terminal = VirtualTerminal.init(allocator, 80, 24);
+        defer virtual_terminal.deinit();
+        var tui = TUI.init(allocator, virtual_terminal.asTerminal());
+        defer tui.deinit();
+        var content = TestLinesComponent{};
+        var editor = FocusableInputComponent{ .allocator = allocator, .lines = &.{"EDITOR"} };
+        defer editor.deinit();
+        var overlay = FocusableInputComponent{ .allocator = allocator, .lines = &.{"OVERLAY"} };
+        defer overlay.deinit();
+
+        try tui.addChild(Component.from(TestLinesComponent, &content));
+        tui.setFocus(Component.from(FocusableInputComponent, &overlay));
+        try tui.start();
+        defer tui.stop() catch {};
+
+        const handle = try tui.showOverlay(Component.from(FocusableInputComponent, &overlay), .{ .non_capturing = true });
+        handle.focus();
+        tui.setFocus(Component.from(FocusableInputComponent, &editor));
+        virtual_terminal.sendInput("x");
+        try renderAndFlush(&tui);
+        try std.testing.expectEqualStrings("x", editor.inputs.items);
+        try std.testing.expectEqualStrings("", overlay.inputs.items);
+    }
+
+    {
+        var virtual_terminal = VirtualTerminal.init(allocator, 80, 24);
+        defer virtual_terminal.deinit();
+        var tui = TUI.init(allocator, virtual_terminal.asTerminal());
+        defer tui.deinit();
+        var content = TestLinesComponent{};
+        var editor = FocusableInputComponent{ .allocator = allocator, .lines = &.{"EDITOR"} };
+        defer editor.deinit();
+        var lower = FocusableInputComponent{ .allocator = allocator, .lines = &.{"LOWER"} };
+        defer lower.deinit();
+        var upper = FocusableInputComponent{ .allocator = allocator, .lines = &.{"UPPER"} };
+        defer upper.deinit();
+
+        try tui.addChild(Component.from(TestLinesComponent, &content));
+        tui.setFocus(Component.from(FocusableInputComponent, &editor));
+        try tui.start();
+        defer tui.stop() catch {};
+
+        const lower_handle = try tui.showOverlay(Component.from(FocusableInputComponent, &lower), .{});
+        _ = try tui.showOverlay(Component.from(FocusableInputComponent, &upper), .{});
+        lower_handle.focus();
+        tui.setFocus(Component.from(FocusableInputComponent, &editor));
+        virtual_terminal.sendInput("x");
+        try renderAndFlush(&tui);
+        try std.testing.expectEqualStrings("x", lower.inputs.items);
+        try std.testing.expectEqualStrings("", upper.inputs.items);
+        try std.testing.expectEqualStrings("", editor.inputs.items);
+    }
+
+    {
+        var virtual_terminal = VirtualTerminal.init(allocator, 80, 24);
+        defer virtual_terminal.deinit();
+        var tui = TUI.init(allocator, virtual_terminal.asTerminal());
+        defer tui.deinit();
+        var content = TestLinesComponent{};
+        var editor = FocusableInputComponent{ .allocator = allocator, .lines = &.{"EDITOR"} };
+        defer editor.deinit();
+        var child = FocusableInputComponent{ .allocator = allocator, .lines = &.{"CHILD"} };
+        defer child.deinit();
+        var parent = FocusableInputComponent{ .allocator = allocator, .lines = &.{"PARENT"} };
+        defer parent.deinit();
+
+        try tui.addChild(Component.from(TestLinesComponent, &content));
+        tui.setFocus(Component.from(FocusableInputComponent, &editor));
+        try tui.start();
+        defer tui.stop() catch {};
+
+        const child_handle = try tui.showOverlay(Component.from(FocusableInputComponent, &child), .{ .non_capturing = true });
+        child_handle.focus();
+        const parent_handle = try tui.showOverlay(Component.from(FocusableInputComponent, &parent), .{});
+        try std.testing.expect(parent.focused);
+        child_handle.hide();
+        parent_handle.hide();
+        virtual_terminal.sendInput("x");
+        try renderAndFlush(&tui);
+        try std.testing.expectEqualStrings("x", editor.inputs.items);
+        try std.testing.expectEqualStrings("", child.inputs.items);
+        try std.testing.expectEqualStrings("", parent.inputs.items);
+        try std.testing.expect(editor.focused);
+    }
+
+    {
+        var virtual_terminal = VirtualTerminal.init(allocator, 80, 24);
+        defer virtual_terminal.deinit();
+        var tui = TUI.init(allocator, virtual_terminal.asTerminal());
+        defer tui.deinit();
+        var content = TestLinesComponent{};
+        var editor = FocusableInputComponent{ .allocator = allocator, .lines = &.{"EDITOR"} };
+        defer editor.deinit();
+        var c1 = FocusableInputComponent{ .allocator = allocator, .lines = &.{"C1"} };
+        defer c1.deinit();
+        var n1 = FocusableInputComponent{ .allocator = allocator, .lines = &.{"N1"} };
+        defer n1.deinit();
+        var c2 = FocusableInputComponent{ .allocator = allocator, .lines = &.{"C2"} };
+        defer c2.deinit();
+        var n2 = FocusableInputComponent{ .allocator = allocator, .lines = &.{"N2"} };
+        defer n2.deinit();
+
+        try tui.addChild(Component.from(TestLinesComponent, &content));
+        tui.setFocus(Component.from(FocusableInputComponent, &editor));
+        try tui.start();
+        defer tui.stop() catch {};
+
+        const c1_handle = try tui.showOverlay(Component.from(FocusableInputComponent, &c1), .{});
+        _ = try tui.showOverlay(Component.from(FocusableInputComponent, &n1), .{ .non_capturing = true });
+        const c2_handle = try tui.showOverlay(Component.from(FocusableInputComponent, &c2), .{});
+        _ = try tui.showOverlay(Component.from(FocusableInputComponent, &n2), .{ .non_capturing = true });
+        try std.testing.expect(c2.focused);
+        c2_handle.hide();
+        try renderAndFlush(&tui);
+        try std.testing.expect(c1.focused);
+        c1_handle.hide();
+        try renderAndFlush(&tui);
+        try std.testing.expect(editor.focused);
+    }
+}
+
 test "TUI overlay focus management preserves non-capturing fallback and topmost unfocus behavior" {
     const allocator = std.testing.allocator;
 
@@ -5943,6 +6832,104 @@ test "TUI overlay focus management preserves non-capturing fallback and topmost 
         try renderAndFlush(&tui);
         try std.testing.expect(editor.focused);
         try std.testing.expect(!capturing.focused);
+    }
+}
+
+test "TUI overlay no-op guards keep hidden and removed overlays passive" {
+    const allocator = std.testing.allocator;
+
+    {
+        var virtual_terminal = VirtualTerminal.init(allocator, 80, 24);
+        defer virtual_terminal.deinit();
+        var tui = TUI.init(allocator, virtual_terminal.asTerminal());
+        defer tui.deinit();
+        var content = TestLinesComponent{};
+        var editor = FocusableInputComponent{ .allocator = allocator, .lines = &.{"EDITOR"} };
+        defer editor.deinit();
+        var overlay = FocusableInputComponent{ .allocator = allocator, .lines = &.{"OVERLAY"} };
+        defer overlay.deinit();
+
+        try tui.addChild(Component.from(TestLinesComponent, &content));
+        tui.setFocus(Component.from(FocusableInputComponent, &editor));
+        try tui.start();
+        defer tui.stop() catch {};
+
+        const handle = try tui.showOverlay(Component.from(FocusableInputComponent, &overlay), .{ .non_capturing = true });
+        handle.setHidden(true);
+        handle.focus();
+        try renderAndFlush(&tui);
+        try std.testing.expect(editor.focused);
+        try std.testing.expect(!handle.isFocused());
+    }
+
+    {
+        var virtual_terminal = VirtualTerminal.init(allocator, 80, 24);
+        defer virtual_terminal.deinit();
+        var tui = TUI.init(allocator, virtual_terminal.asTerminal());
+        defer tui.deinit();
+        var content = TestLinesComponent{};
+        var editor = FocusableInputComponent{ .allocator = allocator, .lines = &.{"EDITOR"} };
+        defer editor.deinit();
+        var overlay = FocusableInputComponent{ .allocator = allocator, .lines = &.{"OVERLAY"} };
+        defer overlay.deinit();
+
+        try tui.addChild(Component.from(TestLinesComponent, &content));
+        tui.setFocus(Component.from(FocusableInputComponent, &editor));
+        try tui.start();
+        defer tui.stop() catch {};
+
+        const handle = try tui.showOverlay(Component.from(FocusableInputComponent, &overlay), .{ .non_capturing = true });
+        handle.hide();
+        handle.focus();
+        try renderAndFlush(&tui);
+        try std.testing.expect(editor.focused);
+        try std.testing.expect(!handle.isFocused());
+    }
+
+    {
+        var virtual_terminal = VirtualTerminal.init(allocator, 80, 24);
+        defer virtual_terminal.deinit();
+        var tui = TUI.init(allocator, virtual_terminal.asTerminal());
+        defer tui.deinit();
+        var content = TestLinesComponent{};
+        var editor = FocusableInputComponent{ .allocator = allocator, .lines = &.{"EDITOR"} };
+        defer editor.deinit();
+        var overlay = FocusableInputComponent{ .allocator = allocator, .lines = &.{"OVERLAY"} };
+        defer overlay.deinit();
+
+        try tui.addChild(Component.from(TestLinesComponent, &content));
+        tui.setFocus(Component.from(FocusableInputComponent, &editor));
+        try tui.start();
+        defer tui.stop() catch {};
+
+        const handle = try tui.showOverlay(Component.from(FocusableInputComponent, &overlay), .{ .non_capturing = true });
+        handle.unfocus(null);
+        try renderAndFlush(&tui);
+        try std.testing.expect(editor.focused);
+        try std.testing.expect(!overlay.focused);
+    }
+
+    {
+        var virtual_terminal = VirtualTerminal.init(allocator, 80, 24);
+        defer virtual_terminal.deinit();
+        var tui = TUI.init(allocator, virtual_terminal.asTerminal());
+        defer tui.deinit();
+        var content = TestLinesComponent{};
+        var overlay = FocusableInputComponent{ .allocator = allocator, .lines = &.{"OVERLAY"} };
+        defer overlay.deinit();
+
+        try tui.addChild(Component.from(TestLinesComponent, &content));
+        try tui.start();
+        defer tui.stop() catch {};
+
+        const handle = try tui.showOverlay(Component.from(FocusableInputComponent, &overlay), .{});
+        try std.testing.expect(overlay.focused);
+        handle.unfocus(null);
+        try std.testing.expect(!overlay.focused);
+        virtual_terminal.sendInput("x");
+        try renderAndFlush(&tui);
+        try std.testing.expectEqualStrings("", overlay.inputs.items);
+        try std.testing.expect(!handle.isFocused());
     }
 }
 
