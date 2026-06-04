@@ -1134,10 +1134,12 @@ pub const Container = struct {
 const VirtualCell = struct {
     text: []u8,
     italic: []bool,
+    underline: []bool,
 
     fn deinit(self: *VirtualCell, allocator: std.mem.Allocator) void {
         allocator.free(self.text);
         allocator.free(self.italic);
+        allocator.free(self.underline);
     }
 };
 
@@ -1272,6 +1274,15 @@ pub const VirtualTerminal = struct {
         return line.italic[col];
     }
 
+    pub fn getCellUnderline(self: *VirtualTerminal, row: usize, col: usize) bool {
+        const viewport_start = if (self.screen.items.len > self.height) self.screen.items.len - self.height else 0;
+        const source_index = viewport_start + row;
+        if (source_index >= self.screen.items.len) return false;
+        const line = self.screen.items[source_index];
+        if (col >= line.underline.len) return false;
+        return line.underline[col];
+    }
+
     pub fn getCursorPosition(self: *const VirtualTerminal) struct { x: usize, y: usize } {
         return .{ .x = self.cursor_x, .y = self.cursor_y };
     }
@@ -1344,6 +1355,8 @@ fn parseVirtualLine(allocator: std.mem.Allocator, line: []const u8) !VirtualCell
     errdefer text.deinit(allocator);
     var italic_flags: std.ArrayList(bool) = .empty;
     errdefer italic_flags.deinit(allocator);
+    var underline_flags: std.ArrayList(bool) = .empty;
+    errdefer underline_flags.deinit(allocator);
     var tracker: AnsiCodeTracker = .{};
 
     var index: usize = 0;
@@ -1358,13 +1371,17 @@ fn parseVirtualLine(allocator: std.mem.Allocator, line: []const u8) !VirtualCell
         const width = visibleWidth(line[index..end]);
         const cells = @max(@as(usize, 1), width);
         var cell: usize = 0;
-        while (cell < cells) : (cell += 1) try italic_flags.append(allocator, tracker.italic);
+        while (cell < cells) : (cell += 1) {
+            try italic_flags.append(allocator, tracker.italic);
+            try underline_flags.append(allocator, tracker.underline);
+        }
         index = end;
     }
 
     return .{
         .text = try text.toOwnedSlice(allocator),
         .italic = try italic_flags.toOwnedSlice(allocator),
+        .underline = try underline_flags.toOwnedSlice(allocator),
     };
 }
 
@@ -5142,6 +5159,37 @@ const TestLinesComponent = struct {
     fn invalidate(_: *TestLinesComponent) void {}
 };
 
+const MarkdownWithInputComponent = struct {
+    markdown: *Markdown,
+    markdown_line_count: usize = 0,
+
+    fn render(self: *MarkdownWithInputComponent, allocator: std.mem.Allocator, width: usize) ![][]u8 {
+        const markdown_lines = try self.markdown.render(allocator, width);
+        errdefer freeOwnedLines(allocator, markdown_lines);
+        const markdown_line_count = markdown_lines.len;
+        self.markdown_line_count = markdown_line_count;
+
+        var result = try allocator.alloc([]u8, markdown_line_count + 1);
+        var initialized: usize = 0;
+        errdefer {
+            for (result[0..initialized]) |line| allocator.free(line);
+            allocator.free(result);
+        }
+        for (markdown_lines, 0..) |line, index| {
+            result[index] = line;
+            initialized += 1;
+        }
+        allocator.free(markdown_lines);
+        result[markdown_line_count] = try allocator.dupe(u8, "INPUT");
+        initialized += 1;
+        return result;
+    }
+
+    fn invalidate(self: *MarkdownWithInputComponent) void {
+        self.markdown.invalidate();
+    }
+};
+
 const FocusableInputComponent = struct {
     allocator: std.mem.Allocator,
     focused: bool = false,
@@ -7997,6 +8045,31 @@ test "Markdown restores default and heading styles after inline spans" {
     const preceding = heading_joined[prefix_start..after_code];
     try std.testing.expect(std.mem.indexOf(u8, preceding, "\x1b[1m") != null);
     try std.testing.expect(std.mem.indexOf(u8, preceding, "\x1b[36m") != null);
+
+    var heading_one = try Markdown.init(allocator, "# Title with `code` inside", 0, 0, test_markdown_theme, null, .{});
+    defer heading_one.deinit();
+    const heading_one_rendered = try heading_one.render(allocator, 80);
+    defer freeRenderedLines(allocator, heading_one_rendered);
+    const heading_one_joined = try joinLinesWith(allocator, heading_one_rendered, "\n");
+    defer allocator.free(heading_one_joined);
+    const after_h1_code = std.mem.indexOf(u8, heading_one_joined, "inside") orelse return error.MissingHeadingOneTail;
+    const h1_prefix_start = after_h1_code -| 64;
+    const h1_preceding = heading_one_joined[h1_prefix_start..after_h1_code];
+    try std.testing.expect(std.mem.indexOf(u8, h1_preceding, "\x1b[1m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, h1_preceding, "\x1b[36m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, h1_preceding, "\x1b[4m") != null);
+
+    var heading_bold = try Markdown.init(allocator, "## Heading with **bold** and more", 0, 0, test_markdown_theme, null, .{});
+    defer heading_bold.deinit();
+    const heading_bold_rendered = try heading_bold.render(allocator, 80);
+    defer freeRenderedLines(allocator, heading_bold_rendered);
+    const heading_bold_joined = try joinLinesWith(allocator, heading_bold_rendered, "\n");
+    defer allocator.free(heading_bold_joined);
+    const after_bold = std.mem.indexOf(u8, heading_bold_joined, "and more") orelse return error.MissingHeadingBoldTail;
+    const bold_prefix_start = after_bold -| 64;
+    const bold_preceding = heading_bold_joined[bold_prefix_start..after_bold];
+    try std.testing.expect(std.mem.indexOf(u8, bold_preceding, "\x1b[1m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bold_preceding, "\x1b[36m") != null);
 }
 
 test "Markdown strict strikethrough and single tilde behavior" {
@@ -8028,6 +8101,7 @@ test "Markdown strict strikethrough and single tilde behavior" {
 test "Markdown links match fallback and OSC8 behavior" {
     const allocator = std.testing.allocator;
     terminal_image.setCapabilities(.{ .images = null, .true_color = false, .hyperlinks = false });
+    defer terminal_image.resetCapabilitiesCache();
 
     var email = try Markdown.init(allocator, "Contact user@example.com for help", 0, 0, test_markdown_theme, null, .{});
     defer email.deinit();
@@ -8045,8 +8119,22 @@ test "Markdown links match fallback and OSC8 behavior" {
     try std.testing.expect(std.mem.indexOf(u8, named_lines[0], "click here") != null);
     try std.testing.expect(std.mem.indexOf(u8, named_lines[0], "(https://example.com)") != null);
 
+    var bare = try Markdown.init(allocator, "Visit https://example.com for more", 0, 0, test_markdown_theme, null, .{});
+    defer bare.deinit();
+    const bare_lines = try renderMarkdownPlain(allocator, &bare, 80);
+    defer freeRenderedLines(allocator, bare_lines);
+    const bare_joined = try joinLinesWith(allocator, bare_lines, " ");
+    defer allocator.free(bare_joined);
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(bare_joined, "https://example.com"));
+
+    var mailto = try Markdown.init(allocator, "[Email me](mailto:test@example.com)", 0, 0, test_markdown_theme, null, .{});
+    defer mailto.deinit();
+    const mailto_lines = try renderMarkdownPlain(allocator, &mailto, 80);
+    defer freeRenderedLines(allocator, mailto_lines);
+    try std.testing.expect(std.mem.indexOf(u8, mailto_lines[0], "Email me") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mailto_lines[0], "(mailto:test@example.com)") != null);
+
     terminal_image.setCapabilities(.{ .images = null, .true_color = false, .hyperlinks = true });
-    defer terminal_image.resetCapabilitiesCache();
     var osc = try Markdown.init(allocator, "[click here](https://example.com)", 0, 0, test_markdown_theme, null, .{});
     defer osc.deinit();
     const osc_lines = try osc.render(allocator, 80);
@@ -8055,6 +8143,25 @@ test "Markdown links match fallback and OSC8 behavior" {
     defer allocator.free(osc_joined);
     try std.testing.expect(std.mem.indexOf(u8, osc_joined, "\x1b]8;;https://example.com\x1b\\") != null);
     try std.testing.expect(std.mem.indexOf(u8, osc_joined, "\x1b]8;;\x1b\\") != null);
+    try std.testing.expect(std.mem.indexOf(u8, osc_joined, "(https://example.com)") == null);
+
+    var osc_mailto = try Markdown.init(allocator, "[Email me](mailto:test@example.com)", 0, 0, test_markdown_theme, null, .{});
+    defer osc_mailto.deinit();
+    const osc_mailto_lines = try osc_mailto.render(allocator, 80);
+    defer freeRenderedLines(allocator, osc_mailto_lines);
+    const osc_mailto_joined = try joinLinesWith(allocator, osc_mailto_lines, "");
+    defer allocator.free(osc_mailto_joined);
+    try std.testing.expect(std.mem.indexOf(u8, osc_mailto_joined, "\x1b]8;;mailto:test@example.com\x1b\\") != null);
+    try std.testing.expect(std.mem.indexOf(u8, osc_mailto_joined, "\x1b]8;;\x1b\\") != null);
+
+    var osc_bare = try Markdown.init(allocator, "Visit https://example.com for more", 0, 0, test_markdown_theme, null, .{});
+    defer osc_bare.deinit();
+    const osc_bare_lines = try osc_bare.render(allocator, 80);
+    defer freeRenderedLines(allocator, osc_bare_lines);
+    const osc_bare_joined = try joinLinesWith(allocator, osc_bare_lines, "");
+    defer allocator.free(osc_bare_joined);
+    try std.testing.expect(std.mem.indexOf(u8, osc_bare_joined, "\x1b]8;;https://example.com\x1b\\") != null);
+    try std.testing.expect(std.mem.indexOf(u8, osc_bare_joined, "(https://example.com)") == null);
 }
 
 test "Markdown caches per width and applies full-line background padding" {
@@ -8081,6 +8188,195 @@ test "Markdown caches per width and applies full-line background padding" {
     markdown.invalidate();
     try std.testing.expect(markdown.cached_lines == null);
     try std.testing.expect(markdown.cached_width == null);
+}
+
+test "Markdown preserves table padding, trailing tables, and mixed blocks" {
+    const allocator = std.testing.allocator;
+
+    var padded = try Markdown.init(
+        allocator,
+        "| Column One | Column Two |\n| --- | --- |\n| Data 1 | Data 2 |",
+        2,
+        0,
+        test_markdown_theme,
+        null,
+        .{},
+    );
+    defer padded.deinit();
+    const padded_lines = try renderMarkdownPlain(allocator, &padded, 40);
+    defer freeRenderedLines(allocator, padded_lines);
+    for (padded_lines) |line| try std.testing.expect(visibleWidth(line) <= 40);
+    const padded_row = findLineWith(padded_lines, "│") orelse return error.MissingPaddedTableRow;
+    try std.testing.expect(std.mem.startsWith(u8, padded_lines[padded_row], "  "));
+
+    var trailing = try Markdown.init(allocator, "| Name |\n| --- |\n| Alice |", 0, 0, test_markdown_theme, null, .{});
+    defer trailing.deinit();
+    const trailing_lines = try renderMarkdownPlain(allocator, &trailing, 80);
+    defer freeRenderedLines(allocator, trailing_lines);
+    try std.testing.expect(trailing_lines.len > 0);
+    try std.testing.expect(!std.mem.eql(u8, trailing_lines[trailing_lines.len - 1], ""));
+
+    var combined = try Markdown.init(
+        allocator,
+        "# Test Document\n\n- Item 1\n  - Nested item\n- Item 2\n\n| Col1 | Col2 |\n| --- | --- |\n| A | B |",
+        0,
+        0,
+        test_markdown_theme,
+        null,
+        .{},
+    );
+    defer combined.deinit();
+    const combined_lines = try renderMarkdownPlain(allocator, &combined, 80);
+    defer freeRenderedLines(allocator, combined_lines);
+    try std.testing.expect(containsLineWith(combined_lines, "Test Document"));
+    try std.testing.expect(containsLineWith(combined_lines, "- Item 1"));
+    try std.testing.expect(containsLineWith(combined_lines, "    - Nested item"));
+    try std.testing.expect(containsLineWith(combined_lines, "Col1"));
+    try std.testing.expect(containsLineWith(combined_lines, "│"));
+}
+
+test "Markdown blockquotes wrap nested content and isolate quote styling" {
+    const allocator = std.testing.allocator;
+
+    var list_quote = try Markdown.init(allocator, "> 1. bla bla\n> - nested bullet", 0, 0, test_markdown_theme, null, .{});
+    defer list_quote.deinit();
+    const list_lines = try renderMarkdownPlain(allocator, &list_quote, 80);
+    defer freeRenderedLines(allocator, list_lines);
+    try std.testing.expect(containsLineWith(list_lines, "│ 1. bla bla"));
+    try std.testing.expect(containsLineWith(list_lines, "│ - nested bullet"));
+
+    var wrapped = try Markdown.init(
+        allocator,
+        "> This is a very long blockquote line that should wrap to multiple lines when rendered",
+        0,
+        0,
+        test_markdown_theme,
+        null,
+        .{},
+    );
+    defer wrapped.deinit();
+    const wrapped_lines = try renderMarkdownPlain(allocator, &wrapped, 30);
+    defer freeRenderedLines(allocator, wrapped_lines);
+    var content_lines: usize = 0;
+    for (wrapped_lines) |line| {
+        if (line.len == 0) continue;
+        content_lines += 1;
+        try std.testing.expect(std.mem.startsWith(u8, line, "│ "));
+    }
+    try std.testing.expect(content_lines > 1);
+    const all_wrapped = try joinLinesWith(allocator, wrapped_lines, " ");
+    defer allocator.free(all_wrapped);
+    try std.testing.expect(std.mem.indexOf(u8, all_wrapped, "very long") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all_wrapped, "blockquote") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all_wrapped, "multiple") != null);
+
+    var styled = try Markdown.init(
+        allocator,
+        "> This is styled text that is long enough to wrap",
+        0,
+        0,
+        test_markdown_theme,
+        .{ .color = .{ .apply_fn = ansiYellow }, .italic = true },
+        .{},
+    );
+    defer styled.deinit();
+    const styled_lines = try styled.render(allocator, 25);
+    defer freeRenderedLines(allocator, styled_lines);
+    const styled_joined = try joinLinesWith(allocator, styled_lines, "\n");
+    defer allocator.free(styled_joined);
+    try std.testing.expect(std.mem.indexOf(u8, styled_joined, "\x1b[3m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styled_joined, "\x1b[33m") == null);
+
+    var inline_quote = try Markdown.init(allocator, "> Quote with **bold** and `code`", 0, 0, test_markdown_theme, null, .{});
+    defer inline_quote.deinit();
+    const inline_lines = try inline_quote.render(allocator, 80);
+    defer freeRenderedLines(allocator, inline_lines);
+    const inline_joined = try joinLinesWith(allocator, inline_lines, "\n");
+    defer allocator.free(inline_joined);
+    const inline_plain = try stripAnsiAlloc(allocator, inline_joined);
+    defer allocator.free(inline_plain);
+    try std.testing.expect(std.mem.indexOf(u8, inline_plain, "│ Quote with bold and code") != null);
+    try std.testing.expect(std.mem.indexOf(u8, inline_joined, "\x1b[1m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, inline_joined, "\x1b[33m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, inline_joined, "\x1b[3m") != null);
+}
+
+test "Markdown TUI rendering resets inline styles before following rows and h1 padding" {
+    const allocator = std.testing.allocator;
+
+    var thinking = try Markdown.init(
+        allocator,
+        "This is thinking with `inline code`",
+        1,
+        0,
+        test_markdown_theme,
+        .{ .color = .{ .apply_fn = ansiGray }, .italic = true },
+        .{},
+    );
+    defer thinking.deinit();
+    var thinking_terminal = VirtualTerminal.init(allocator, 80, 6);
+    defer thinking_terminal.deinit();
+    var thinking_tui = TUI.init(allocator, thinking_terminal.asTerminal());
+    defer thinking_tui.deinit();
+    var component = MarkdownWithInputComponent{ .markdown = &thinking };
+    try thinking_tui.addChild(Component.from(MarkdownWithInputComponent, &component));
+    try thinking_tui.start();
+    defer thinking_tui.stop() catch {};
+
+    try std.testing.expect(component.markdown_line_count > 0);
+    try std.testing.expect(!thinking_terminal.getCellItalic(component.markdown_line_count, 0));
+
+    var heading = try Markdown.init(allocator, "# Important distinction from `open()`", 0, 0, test_markdown_theme, null, .{});
+    defer heading.deinit();
+    var heading_terminal = VirtualTerminal.init(allocator, 80, 4);
+    defer heading_terminal.deinit();
+    var heading_tui = TUI.init(allocator, heading_terminal.asTerminal());
+    defer heading_tui.deinit();
+    try heading_tui.addChild(Component.from(Markdown, &heading));
+    try heading_tui.start();
+    defer heading_tui.stop() catch {};
+
+    const rendered = try heading.render(allocator, 80);
+    defer freeRenderedLines(allocator, rendered);
+    const plain = try stripAnsiAlloc(allocator, rendered[0]);
+    defer allocator.free(plain);
+    const content = try trimEndSpacesAlloc(allocator, plain);
+    defer allocator.free(content);
+    const content_width = visibleWidth(content);
+    try std.testing.expect(content_width > 0);
+    var col = content_width;
+    while (col < 80) : (col += 1) {
+        try std.testing.expect(!heading_terminal.getCellUnderline(0, col));
+    }
+}
+
+test "Markdown renders HTML-like tags as visible text and code" {
+    const allocator = std.testing.allocator;
+
+    var text = try Markdown.init(
+        allocator,
+        "This is text with <thinking>hidden content</thinking> that should be visible",
+        0,
+        0,
+        test_markdown_theme,
+        null,
+        .{},
+    );
+    defer text.deinit();
+    const text_lines = try renderMarkdownPlain(allocator, &text, 80);
+    defer freeRenderedLines(allocator, text_lines);
+    const joined_text = try joinLinesWith(allocator, text_lines, " ");
+    defer allocator.free(joined_text);
+    try std.testing.expect(std.mem.indexOf(u8, joined_text, "hidden content") != null or std.mem.indexOf(u8, joined_text, "<thinking>") != null);
+
+    var code = try Markdown.init(allocator, "```html\n<div>Some HTML</div>\n```", 0, 0, test_markdown_theme, null, .{});
+    defer code.deinit();
+    const code_lines = try renderMarkdownPlain(allocator, &code, 80);
+    defer freeRenderedLines(allocator, code_lines);
+    const joined_code = try joinLinesWith(allocator, code_lines, "\n");
+    defer allocator.free(joined_code);
+    try std.testing.expect(std.mem.indexOf(u8, joined_code, "<div>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, joined_code, "</div>") != null);
 }
 
 fn visibleIndexOf(line: []const u8, text: []const u8) !usize {
