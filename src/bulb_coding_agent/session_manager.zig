@@ -352,6 +352,96 @@ pub const SessionManager = struct {
         return self.file_entries[1..];
     }
 
+    pub fn getLeafId(self: *const SessionManager) ?[]const u8 {
+        return self.leaf_id;
+    }
+
+    pub fn getLeafEntry(self: *const SessionManager) ?FileEntry {
+        const leaf_id = self.leaf_id orelse return null;
+        return self.getEntry(leaf_id);
+    }
+
+    pub fn getEntry(self: *const SessionManager, id: []const u8) ?FileEntry {
+        for (self.getEntries()) |entry| {
+            if (entry.id) |entry_id| {
+                if (std.mem.eql(u8, entry_id, id)) return entry;
+            }
+        }
+        return null;
+    }
+
+    pub fn getBranchAlloc(
+        self: *const SessionManager,
+        allocator: std.mem.Allocator,
+        from_id: ?[]const u8,
+    ) ![]FileEntry {
+        const start_id = from_id orelse self.leaf_id orelse return allocator.alloc(FileEntry, 0);
+        var current = self.getEntry(start_id) orelse return allocator.alloc(FileEntry, 0);
+        var reversed: std.ArrayList(FileEntry) = .empty;
+        errdefer reversed.deinit(allocator);
+
+        while (true) {
+            try reversed.append(allocator, current);
+            const parent_id = try entryParentIdAlloc(allocator, current.raw_json);
+            defer if (parent_id) |id| allocator.free(id);
+            const next_id = parent_id orelse break;
+            current = self.getEntry(next_id) orelse break;
+        }
+
+        std.mem.reverse(FileEntry, reversed.items);
+        return reversed.toOwnedSlice(allocator);
+    }
+
+    pub fn branch(self: *SessionManager, branch_from_id: []const u8) !void {
+        if (self.getEntry(branch_from_id) == null) return error.EntryNotFound;
+        self.leaf_id = branch_from_id;
+    }
+
+    pub fn resetLeaf(self: *SessionManager) void {
+        self.leaf_id = null;
+    }
+
+    pub fn branchWithSummary(
+        self: *SessionManager,
+        io: std.Io,
+        branch_from_id: ?[]const u8,
+        summary: []const u8,
+    ) ![]const u8 {
+        if (branch_from_id) |id| {
+            if (self.getEntry(id) == null) return error.EntryNotFound;
+        }
+        self.leaf_id = branch_from_id;
+
+        const arena_allocator = self.arena.allocator();
+        const entry_id = try generateEntryIdAlloc(arena_allocator, io, self.file_entries);
+        errdefer arena_allocator.free(entry_id);
+        const timestamp = try isoTimestampAlloc(
+            arena_allocator,
+            std.Io.Clock.real.now(io).toMilliseconds(),
+        );
+        errdefer arena_allocator.free(timestamp);
+        const raw_json = try branchSummaryEntryJsonAlloc(
+            arena_allocator,
+            entry_id,
+            branch_from_id,
+            timestamp,
+            branch_from_id orelse "root",
+            summary,
+        );
+        errdefer arena_allocator.free(raw_json);
+        const grown = try arena_allocator.alloc(FileEntry, self.file_entries.len + 1);
+        @memcpy(grown[0..self.file_entries.len], self.file_entries);
+        grown[self.file_entries.len] = .{
+            .raw_json = raw_json,
+            .entry_type = "branch_summary",
+            .id = entry_id,
+        };
+        self.file_entries = grown;
+        self.leaf_id = entry_id;
+        try self.persistEntry(io, raw_json);
+        return entry_id;
+    }
+
     pub fn appendMessageJson(
         self: *SessionManager,
         io: std.Io,
@@ -429,6 +519,77 @@ pub const SessionManager = struct {
             return try allocator.dupe(u8, trimmed);
         }
         return null;
+    }
+
+    pub fn createBranchedSession(
+        self: *SessionManager,
+        io: std.Io,
+        leaf_id: []const u8,
+    ) !?[]const u8 {
+        const scratch_allocator = self.arena.child_allocator;
+        const path = try self.getBranchAlloc(scratch_allocator, leaf_id);
+        defer scratch_allocator.free(path);
+        if (path.len == 0) return error.EntryNotFound;
+
+        var path_without_labels: std.ArrayList(FileEntry) = .empty;
+        defer path_without_labels.deinit(scratch_allocator);
+        for (path) |entry| {
+            if (entryTypeEquals(entry, "label")) continue;
+            try path_without_labels.append(scratch_allocator, entry);
+        }
+
+        var generated_id: [36]u8 = agent.uuid.uuidv7(io);
+        const arena_allocator = self.arena.allocator();
+        const new_session_id = try arena_allocator.dupe(u8, generated_id[0..]);
+        errdefer arena_allocator.free(new_session_id);
+        const timestamp = try isoTimestampAlloc(
+            arena_allocator,
+            std.Io.Clock.real.now(io).toMilliseconds(),
+        );
+        errdefer arena_allocator.free(timestamp);
+        const parent_session = if (self.persist) blk: {
+            const previous = self.session_file orelse break :blk null;
+            break :blk try arena_allocator.dupe(u8, previous);
+        } else null;
+        errdefer if (parent_session) |parent| arena_allocator.free(parent);
+        const header = SessionHeader{
+            .version = current_session_version,
+            .id = new_session_id,
+            .timestamp = timestamp,
+            .cwd = self.cwd,
+            .parent_session = parent_session,
+        };
+        const raw_header = try freshHeaderJsonAlloc(arena_allocator, header);
+        errdefer arena_allocator.free(raw_header);
+
+        const new_entries = try arena_allocator.alloc(FileEntry, path_without_labels.items.len + 1);
+        new_entries[0] = .{
+            .raw_json = raw_header,
+            .entry_type = "session",
+            .id = new_session_id,
+        };
+        @memcpy(new_entries[1..], path_without_labels.items);
+
+        const new_session_file = if (self.persist)
+            try freshSessionFileAlloc(arena_allocator, self.session_dir, timestamp, new_session_id)
+        else
+            null;
+        errdefer if (new_session_file) |file| arena_allocator.free(file);
+
+        self.session_id = new_session_id;
+        self.header = header;
+        self.file_entries = new_entries;
+        self.session_file = new_session_file;
+        self.leaf_id = findLeafId(self.file_entries);
+
+        if (self.persist and self.hasAssistantMessage()) {
+            try self.rewriteFile(io);
+            self.flushed = true;
+        } else {
+            self.flushed = false;
+        }
+
+        return self.session_file;
     }
 
     pub fn list(
@@ -623,6 +784,73 @@ pub const SessionManager = struct {
         return false;
     }
 };
+
+pub fn forkFrom(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    source_path: []const u8,
+    target_cwd: []const u8,
+    session_dir: []const u8,
+    options: NewSessionOptions,
+) !SessionManager {
+    if (options.id) |id| try assertValidSessionId(id);
+
+    const process_cwd = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(process_cwd);
+    const resolved_source_path = try paths.resolvePathAlloc(allocator, source_path, process_cwd, .{});
+    defer allocator.free(resolved_source_path);
+    const resolved_target_cwd = try paths.resolvePathAlloc(allocator, target_cwd, process_cwd, .{});
+    defer allocator.free(resolved_target_cwd);
+    const normalized_session_dir = try paths.normalizePathAlloc(allocator, session_dir, .{});
+    defer allocator.free(normalized_session_dir);
+    try std.Io.Dir.cwd().createDirPath(io, normalized_session_dir);
+
+    var loaded = try loadEntriesFromFile(allocator, io, resolved_source_path);
+    defer loaded.deinit();
+    if (loaded.header == null) return error.InvalidSourceSession;
+
+    var generated_id: [36]u8 = undefined;
+    const new_session_id = options.id orelse blk: {
+        generated_id = agent.uuid.uuidv7(io);
+        break :blk generated_id[0..];
+    };
+    const timestamp = try isoTimestampAlloc(allocator, std.Io.Clock.real.now(io).toMilliseconds());
+    defer allocator.free(timestamp);
+    const new_session_file = try freshSessionFileAlloc(allocator, normalized_session_dir, timestamp, new_session_id);
+    defer allocator.free(new_session_file);
+    const header = SessionHeader{
+        .version = current_session_version,
+        .id = new_session_id,
+        .timestamp = timestamp,
+        .cwd = resolved_target_cwd,
+        .parent_session = resolved_source_path,
+    };
+    const raw_header = try freshHeaderJsonAlloc(allocator, header);
+    defer allocator.free(raw_header);
+
+    {
+        var file = try std.Io.Dir.cwd().createFile(io, new_session_file, .{
+            .read = false,
+            .truncate = false,
+            .exclusive = true,
+        });
+        defer file.close(io);
+        var buffer: [4096]u8 = undefined;
+        var writer = std.Io.File.Writer.init(file, io, &buffer);
+        try writer.interface.writeAll(raw_header);
+        try writer.interface.writeByte('\n');
+        for (loaded.entries[1..]) |entry| {
+            try writer.interface.writeAll(entry.raw_json);
+            try writer.interface.writeByte('\n');
+        }
+        try writer.flush();
+    }
+
+    return SessionManager.open(allocator, io, new_session_file, .{
+        .session_dir = normalized_session_dir,
+        .cwd_override = resolved_target_cwd,
+    });
+}
 
 pub fn getDefaultSessionDirPathAlloc(
     allocator: std.mem.Allocator,
@@ -1153,6 +1381,38 @@ fn sessionInfoEntryJsonAlloc(
     return output.toOwnedSlice();
 }
 
+fn branchSummaryEntryJsonAlloc(
+    allocator: std.mem.Allocator,
+    id: []const u8,
+    parent_id: ?[]const u8,
+    timestamp: []const u8,
+    from_id: []const u8,
+    summary: []const u8,
+) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    var json: std.json.Stringify = .{ .writer = &output.writer };
+    try json.beginObject();
+    try json.objectField("type");
+    try json.write("branch_summary");
+    try json.objectField("id");
+    try json.write(id);
+    try json.objectField("parentId");
+    if (parent_id) |parent| {
+        try json.write(parent);
+    } else {
+        try json.write(null);
+    }
+    try json.objectField("timestamp");
+    try json.write(timestamp);
+    try json.objectField("fromId");
+    try json.write(from_id);
+    try json.objectField("summary");
+    try json.write(summary);
+    try json.endObject();
+    return output.toOwnedSlice();
+}
+
 fn appendJsonLine(io: std.Io, path: []const u8, raw_json: []const u8) !void {
     var file = try std.Io.Dir.cwd().openFile(io, path, .{
         .mode = .write_only,
@@ -1180,6 +1440,31 @@ fn messageRoleEquals(
     if (message_value != .object) return false;
     const role = optionalString(message_value.object, "role") orelse return false;
     return std.mem.eql(u8, role, expected);
+}
+
+fn entryTypeEquals(entry: FileEntry, expected: []const u8) bool {
+    const entry_type = entry.entry_type orelse return false;
+    return std.mem.eql(u8, entry_type, expected);
+}
+
+fn entryParentIdAlloc(allocator: std.mem.Allocator, raw_json: []const u8) !?[]const u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw_json, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return null,
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    return optionalStringDup(allocator, parsed.value.object, "parentId");
+}
+
+fn entryStringFieldAlloc(allocator: std.mem.Allocator, raw_json: []const u8, field: []const u8) !?[]const u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw_json, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return null,
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    return optionalStringDup(allocator, parsed.value.object, field);
 }
 
 pub fn isValidSessionId(id: []const u8) bool {
@@ -1252,9 +1537,11 @@ fn freshSessionFileAlloc(
     id: []const u8,
 ) ![]u8 {
     const file_timestamp = try allocator.dupe(u8, timestamp);
+    defer allocator.free(file_timestamp);
     std.mem.replaceScalar(u8, file_timestamp, ':', '-');
     std.mem.replaceScalar(u8, file_timestamp, '.', '-');
     const filename = try std.fmt.allocPrint(allocator, "{s}_{s}.jsonl", .{ file_timestamp, id });
+    defer allocator.free(filename);
     return std.fs.path.join(allocator, &.{ session_dir, filename });
 }
 
@@ -1554,6 +1841,50 @@ fn createPersistedTestSession(
     return allocator.dupe(u8, session_file);
 }
 
+fn expectEntryParent(
+    allocator: std.mem.Allocator,
+    entry: FileEntry,
+    expected_parent: ?[]const u8,
+) !void {
+    const parent = try entryParentIdAlloc(allocator, entry.raw_json);
+    defer if (parent) |value| allocator.free(value);
+    if (expected_parent) |expected| {
+        try std.testing.expectEqualStrings(expected, parent.?);
+    } else {
+        try std.testing.expectEqual(null, parent);
+    }
+}
+
+fn expectOneHeaderAndUniqueEntryIds(allocator: std.mem.Allocator, path: []const u8) !void {
+    const content = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        path,
+        allocator,
+        .limited(1024 * 1024),
+    );
+    defer allocator.free(content);
+
+    var seen_ids = std.StringHashMap(void).init(allocator);
+    defer seen_ids.deinit();
+    var session_headers: usize = 0;
+    var lines = std.mem.splitScalar(u8, std.mem.trim(u8, content, " \t\r\n"), '\n');
+    while (lines.next()) |line| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value == .object);
+        const object = parsed.value.object;
+        const entry_type = optionalString(object, "type") orelse continue;
+        if (std.mem.eql(u8, entry_type, "session")) {
+            session_headers += 1;
+            continue;
+        }
+        const id = optionalString(object, "id") orelse continue;
+        try std.testing.expect(!seen_ids.contains(id));
+        try seen_ids.put(id, {});
+    }
+    try std.testing.expectEqual(@as(usize, 1), session_headers);
+}
+
 // Ported from packages/coding-agent/src/core/session-manager.ts default directory helpers.
 test "default session directories use Bulb agent dir and Pi-compatible cwd encoding" {
     const allocator = std.testing.allocator;
@@ -1755,6 +2086,59 @@ test "SessionManager create uses a custom id in a deferred persisted session pat
     );
 }
 
+test "SessionManager createBranchedSession generates UUIDv7 ids" {
+    const allocator = std.testing.allocator;
+    var session = try SessionManager.inMemory(allocator, std.testing.io, null);
+    defer session.deinit();
+
+    const user_json = try testUserMessageJsonAlloc(allocator, "hello", 1);
+    defer allocator.free(user_json);
+    const first_id = try session.appendMessageJson(std.testing.io, user_json);
+
+    try std.testing.expectEqual(null, try session.createBranchedSession(std.testing.io, first_id));
+    try expectUuidV7(session.getSessionId());
+    try std.testing.expectEqualStrings(session.getSessionId(), session.getHeader().?.id);
+}
+
+test "SessionManager forkFrom generates and accepts custom ids" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tempDirPathAlloc(allocator, &tmp);
+    defer allocator.free(tmp_path);
+    const source_path = try std.fs.path.join(allocator, &.{ tmp_path, "source.jsonl" });
+    defer allocator.free(source_path);
+    const header = try sessionHeaderJsonAlloc(allocator, "source-session-id", tmp_path);
+    defer allocator.free(header);
+    try writeAbsoluteFile(std.testing.io, source_path, header);
+
+    var generated = try forkFrom(
+        allocator,
+        std.testing.io,
+        source_path,
+        tmp_path,
+        tmp_path,
+        .{},
+    );
+    defer generated.deinit();
+    try expectUuidV7(generated.getSessionId());
+    try std.testing.expectEqualStrings(source_path, generated.getHeader().?.parent_session.?);
+
+    var custom = try forkFrom(
+        allocator,
+        std.testing.io,
+        source_path,
+        tmp_path,
+        tmp_path,
+        .{ .id = "forked-session-id" },
+    );
+    defer custom.deinit();
+    try std.testing.expectEqualStrings("forked-session-id", custom.getSessionId());
+    try std.testing.expectEqualStrings("forked-session-id", custom.getHeader().?.id);
+    try std.testing.expectEqualStrings(source_path, custom.getHeader().?.parent_session.?);
+    try expectTimestampedSessionBasename(custom.getSessionFile().?, "forked-session-id");
+}
+
 // Ported from packages/coding-agent/test/session-manager/file-operations.test.ts.
 test "loadEntriesFromFile returns empty entries for missing empty malformed and headerless files" {
     const allocator = std.testing.allocator;
@@ -1805,6 +2189,49 @@ test "loadEntriesFromFile loads valid entries and skips malformed lines" {
     try std.testing.expectEqualStrings("session", loaded.entries[0].entry_type.?);
     try std.testing.expectEqualStrings("message", loaded.entries[1].entry_type.?);
     try std.testing.expectEqualStrings("abc", loaded.header.?.id);
+}
+
+test "loadEntriesFromFile opens sparse session files larger than one read buffer" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tempDirPathAlloc(allocator, &tmp);
+    defer allocator.free(tmp_path);
+    const path = try std.fs.path.join(allocator, &.{ tmp_path, "large.jsonl" });
+    defer allocator.free(path);
+    try writeAbsoluteFile(
+        std.testing.io,
+        path,
+        "{\"type\":\"session\",\"version\":3,\"id\":\"abc\",\"timestamp\":\"2025-01-01T00:00:00Z\",\"cwd\":\"/tmp\"}\n",
+    );
+
+    {
+        var file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{
+            .mode = .write_only,
+            .allow_directory = false,
+        });
+        defer file.close(std.testing.io);
+        var buffer: [4096]u8 = undefined;
+        var writer = std.Io.File.Writer.init(file, std.testing.io, &buffer);
+        const stride: u64 = 2 * 1024 * 1024;
+        const final_offset: u64 = stride * 8;
+        var offset: u64 = stride;
+        while (offset <= final_offset) : (offset += stride) {
+            try writer.seekTo(offset);
+            try writer.interface.writeByte('\n');
+        }
+        try writer.seekTo(final_offset + 1);
+        try writer.interface.writeAll(
+            "{\"type\":\"message\",\"id\":\"1\",\"parentId\":null,\"timestamp\":\"2025-01-01T00:00:01Z\",\"message\":{\"role\":\"user\",\"content\":\"hi\",\"timestamp\":1}}\n",
+        );
+        try writer.flush();
+    }
+
+    var loaded = try loadEntriesFromFile(allocator, std.testing.io, path);
+    defer loaded.deinit();
+    try std.testing.expectEqual(@as(usize, 2), loaded.entries.len);
+    try std.testing.expectEqualStrings("abc", loaded.header.?.id);
+    try std.testing.expectEqualStrings("message", loaded.entries[1].entry_type.?);
 }
 
 test "findMostRecentSession returns null for empty missing and invalid directories" {
@@ -2239,4 +2666,147 @@ test "SessionManager preserves stored cwd issues and supports effective cwd over
         null,
         session_cwd.getMissingSessionCwdIssue(std.testing.io, overridden.cwdSource(), fallback_cwd),
     );
+}
+
+// Ported from packages/coding-agent/test/session-manager/tree-traversal.test.ts branch/fork cases.
+test "SessionManager branches update leaf and parent chains" {
+    const allocator = std.testing.allocator;
+    var session = try SessionManager.inMemory(allocator, std.testing.io, null);
+    defer session.deinit();
+
+    const first_json = try testUserMessageJsonAlloc(allocator, "first", 1);
+    defer allocator.free(first_json);
+    const second_json = try testAssistantMessageJsonAlloc(allocator, "second", 2);
+    defer allocator.free(second_json);
+    const third_json = try testUserMessageJsonAlloc(allocator, "third", 3);
+    defer allocator.free(third_json);
+    const branch_json = try testUserMessageJsonAlloc(allocator, "branched", 4);
+    defer allocator.free(branch_json);
+
+    const id1 = try session.appendMessageJson(std.testing.io, first_json);
+    const id2 = try session.appendMessageJson(std.testing.io, second_json);
+    const id3 = try session.appendMessageJson(std.testing.io, third_json);
+    try std.testing.expectEqualStrings(id3, session.getLeafId().?);
+
+    try session.branch(id1);
+    try std.testing.expectEqualStrings(id1, session.getLeafId().?);
+    const branched_id = try session.appendMessageJson(std.testing.io, branch_json);
+    const branched = session.getEntry(branched_id) orelse return error.MissingBranchedEntry;
+    try expectEntryParent(allocator, branched, id1);
+
+    const branch = try session.getBranchAlloc(allocator, branched_id);
+    defer allocator.free(branch);
+    try std.testing.expectEqual(@as(usize, 2), branch.len);
+    try std.testing.expectEqualStrings(id1, branch[0].id.?);
+    try std.testing.expectEqualStrings(branched_id, branch[1].id.?);
+
+    const original_branch = try session.getBranchAlloc(allocator, id2);
+    defer allocator.free(original_branch);
+    try std.testing.expectEqual(@as(usize, 2), original_branch.len);
+    try std.testing.expectEqualStrings(id1, original_branch[0].id.?);
+    try std.testing.expectEqualStrings(id2, original_branch[1].id.?);
+
+    try std.testing.expectError(error.EntryNotFound, session.branch("nonexistent"));
+}
+
+test "SessionManager branchWithSummary appends summary under branch point" {
+    const allocator = std.testing.allocator;
+    var session = try SessionManager.inMemory(allocator, std.testing.io, null);
+    defer session.deinit();
+
+    const first_json = try testUserMessageJsonAlloc(allocator, "first", 1);
+    defer allocator.free(first_json);
+    const second_json = try testAssistantMessageJsonAlloc(allocator, "second", 2);
+    defer allocator.free(second_json);
+    const id1 = try session.appendMessageJson(std.testing.io, first_json);
+    _ = try session.appendMessageJson(std.testing.io, second_json);
+
+    const summary_id = try session.branchWithSummary(std.testing.io, id1, "Summary of abandoned work");
+    try std.testing.expectEqualStrings(summary_id, session.getLeafId().?);
+    const summary_entry = session.getEntry(summary_id) orelse return error.MissingSummaryEntry;
+    try std.testing.expect(entryTypeEquals(summary_entry, "branch_summary"));
+    try expectEntryParent(allocator, summary_entry, id1);
+
+    const from_id = try entryStringFieldAlloc(allocator, summary_entry.raw_json, "fromId");
+    defer allocator.free(from_id.?);
+    try std.testing.expectEqualStrings(id1, from_id.?);
+    const summary = try entryStringFieldAlloc(allocator, summary_entry.raw_json, "summary");
+    defer allocator.free(summary.?);
+    try std.testing.expectEqualStrings("Summary of abandoned work", summary.?);
+    try std.testing.expectError(
+        error.EntryNotFound,
+        session.branchWithSummary(std.testing.io, "nonexistent", "summary"),
+    );
+}
+
+test "SessionManager createBranchedSession extracts selected path in memory" {
+    const allocator = std.testing.allocator;
+    var session = try SessionManager.inMemory(allocator, std.testing.io, null);
+    defer session.deinit();
+
+    const msg1 = try testUserMessageJsonAlloc(allocator, "1", 1);
+    defer allocator.free(msg1);
+    const msg2 = try testAssistantMessageJsonAlloc(allocator, "2", 2);
+    defer allocator.free(msg2);
+    const msg3 = try testUserMessageJsonAlloc(allocator, "3", 3);
+    defer allocator.free(msg3);
+    const msg4 = try testAssistantMessageJsonAlloc(allocator, "4", 4);
+    defer allocator.free(msg4);
+    const msg5 = try testUserMessageJsonAlloc(allocator, "5", 5);
+    defer allocator.free(msg5);
+
+    const id1 = try session.appendMessageJson(std.testing.io, msg1);
+    const id2 = try session.appendMessageJson(std.testing.io, msg2);
+    const id3 = try session.appendMessageJson(std.testing.io, msg3);
+    _ = try session.appendMessageJson(std.testing.io, msg4);
+    try session.branch(id3);
+    const id5 = try session.appendMessageJson(std.testing.io, msg5);
+
+    try std.testing.expectEqual(null, try session.createBranchedSession(std.testing.io, id5));
+    const entries = session.getEntries();
+    try std.testing.expectEqual(@as(usize, 4), entries.len);
+    try std.testing.expectEqualStrings(id1, entries[0].id.?);
+    try std.testing.expectEqualStrings(id2, entries[1].id.?);
+    try std.testing.expectEqualStrings(id3, entries[2].id.?);
+    try std.testing.expectEqualStrings(id5, entries[3].id.?);
+}
+
+test "SessionManager createBranchedSession defers or writes forked files by assistant presence" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tempDirPathAlloc(allocator, &tmp);
+    defer allocator.free(tmp_path);
+
+    var session = try SessionManager.create(allocator, std.testing.io, tmp_path, tmp_path, .{});
+    defer session.deinit();
+    const first_question = try testUserMessageJsonAlloc(allocator, "first question", 1);
+    defer allocator.free(first_question);
+    const first_answer = try testAssistantMessageJsonAlloc(allocator, "first answer", 2);
+    defer allocator.free(first_answer);
+    const second_question = try testUserMessageJsonAlloc(allocator, "second question", 3);
+    defer allocator.free(second_question);
+    const second_answer = try testAssistantMessageJsonAlloc(allocator, "second answer", 4);
+    defer allocator.free(second_answer);
+    const new_answer = try testAssistantMessageJsonAlloc(allocator, "new answer", 5);
+    defer allocator.free(new_answer);
+
+    const id1 = try session.appendMessageJson(std.testing.io, first_question);
+    const id2 = try session.appendMessageJson(std.testing.io, first_answer);
+    _ = try session.appendMessageJson(std.testing.io, second_question);
+    _ = try session.appendMessageJson(std.testing.io, second_answer);
+
+    const assistant_file = (try session.createBranchedSession(std.testing.io, id2)).?;
+    try std.Io.Dir.cwd().access(std.testing.io, assistant_file, .{});
+    try expectOneHeaderAndUniqueEntryIds(allocator, assistant_file);
+
+    const user_only_file = (try session.createBranchedSession(std.testing.io, id1)).?;
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.cwd().access(std.testing.io, user_only_file, .{}),
+    );
+    _ = try session.appendSessionInfo(std.testing.io, "preset state");
+    _ = try session.appendMessageJson(std.testing.io, new_answer);
+    try std.Io.Dir.cwd().access(std.testing.io, user_only_file, .{});
+    try expectOneHeaderAndUniqueEntryIds(allocator, user_only_file);
 }
