@@ -69,6 +69,61 @@ pub const CompletionApplication = struct {
     }
 };
 
+pub const AutocompleteProvider = struct {
+    context: ?*anyopaque = null,
+    get_suggestions_fn: *const fn (
+        ?*anyopaque,
+        std.mem.Allocator,
+        []const []const u8,
+        usize,
+        usize,
+        SuggestionOptions,
+    ) anyerror!?AutocompleteSuggestions,
+    apply_completion_fn: *const fn (
+        ?*anyopaque,
+        std.mem.Allocator,
+        []const []const u8,
+        usize,
+        usize,
+        AutocompleteItem,
+        []const u8,
+    ) anyerror!CompletionApplication,
+    should_trigger_file_completion_fn: ?*const fn (?*anyopaque, []const []const u8, usize, usize) bool = null,
+
+    pub fn getSuggestions(
+        self: AutocompleteProvider,
+        allocator: std.mem.Allocator,
+        lines: []const []const u8,
+        cursor_line: usize,
+        cursor_col: usize,
+        options: SuggestionOptions,
+    ) !?AutocompleteSuggestions {
+        return self.get_suggestions_fn(self.context, allocator, lines, cursor_line, cursor_col, options);
+    }
+
+    pub fn applyCompletion(
+        self: AutocompleteProvider,
+        allocator: std.mem.Allocator,
+        lines: []const []const u8,
+        cursor_line: usize,
+        cursor_col: usize,
+        item: AutocompleteItem,
+        prefix: []const u8,
+    ) !CompletionApplication {
+        return self.apply_completion_fn(self.context, allocator, lines, cursor_line, cursor_col, item, prefix);
+    }
+
+    pub fn shouldTriggerFileCompletion(
+        self: AutocompleteProvider,
+        lines: []const []const u8,
+        cursor_line: usize,
+        cursor_col: usize,
+    ) bool {
+        const call_fn = self.should_trigger_file_completion_fn orelse return true;
+        return call_fn(self.context, lines, cursor_line, cursor_col);
+    }
+};
+
 const OwnedSlashCommand = struct {
     name: []u8,
     description: ?[]u8 = null,
@@ -142,6 +197,15 @@ pub const CombinedAutocompleteProvider = struct {
         if (self.fd_path) |fd_path| self.allocator.free(fd_path);
         self.allocator.free(self.home_dir);
         self.* = undefined;
+    }
+
+    pub fn provider(self: *CombinedAutocompleteProvider) AutocompleteProvider {
+        return .{
+            .context = self,
+            .get_suggestions_fn = combinedGetSuggestions,
+            .apply_completion_fn = combinedApplyCompletion,
+            .should_trigger_file_completion_fn = combinedShouldTriggerFileCompletion,
+        };
     }
 
     pub fn getSuggestions(
@@ -563,6 +627,65 @@ pub const CombinedAutocompleteProvider = struct {
     }
 };
 
+fn combinedGetSuggestions(
+    context: ?*anyopaque,
+    allocator: std.mem.Allocator,
+    lines: []const []const u8,
+    cursor_line: usize,
+    cursor_col: usize,
+    options: SuggestionOptions,
+) !?AutocompleteSuggestions {
+    const provider: *CombinedAutocompleteProvider = @ptrCast(@alignCast(context.?));
+    const suggestions = try provider.getSuggestions(lines, cursor_line, cursor_col, options) orelse return null;
+    defer suggestions.deinit(provider.allocator);
+
+    return .{
+        .items = try cloneAutocompleteItems(allocator, suggestions.items),
+        .prefix = try allocator.dupe(u8, suggestions.prefix),
+    };
+}
+
+fn combinedApplyCompletion(
+    context: ?*anyopaque,
+    allocator: std.mem.Allocator,
+    lines: []const []const u8,
+    cursor_line: usize,
+    cursor_col: usize,
+    item: AutocompleteItem,
+    prefix: []const u8,
+) !CompletionApplication {
+    const provider: *CombinedAutocompleteProvider = @ptrCast(@alignCast(context.?));
+    var applied = try provider.applyCompletion(lines, cursor_line, cursor_col, item, prefix);
+    defer applied.deinit(provider.allocator);
+
+    var cloned_lines = try allocator.alloc([]u8, applied.lines.len);
+    errdefer allocator.free(cloned_lines);
+    var initialized: usize = 0;
+    errdefer {
+        for (cloned_lines[0..initialized]) |line| allocator.free(line);
+    }
+    for (applied.lines, 0..) |line, index| {
+        cloned_lines[index] = try allocator.dupe(u8, line);
+        initialized += 1;
+    }
+
+    return .{
+        .lines = cloned_lines,
+        .cursor_line = applied.cursor_line,
+        .cursor_col = applied.cursor_col,
+    };
+}
+
+fn combinedShouldTriggerFileCompletion(
+    context: ?*anyopaque,
+    lines: []const []const u8,
+    cursor_line: usize,
+    cursor_col: usize,
+) bool {
+    const provider: *CombinedAutocompleteProvider = @ptrCast(@alignCast(context.?));
+    return provider.shouldTriggerFileCompletion(lines, cursor_line, cursor_col);
+}
+
 const CommandFilterItem = struct {
     name: []const u8,
     label: []const u8,
@@ -613,6 +736,20 @@ const FuzzyFileEntry = struct {
 pub fn freeAutocompleteItems(allocator: std.mem.Allocator, items: []AutocompleteItem) void {
     for (items) |item| item.deinit(allocator);
     allocator.free(items);
+}
+
+pub fn cloneAutocompleteItems(allocator: std.mem.Allocator, items: []const AutocompleteItem) ![]AutocompleteItem {
+    var owned_items = try allocator.alloc(AutocompleteItem, items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (owned_items[0..initialized]) |item| item.deinit(allocator);
+        allocator.free(owned_items);
+    }
+    for (items, 0..) |item, index| {
+        owned_items[index] = try AutocompleteItem.clone(allocator, item);
+        initialized += 1;
+    }
+    return owned_items;
 }
 
 fn commandDescription(allocator: std.mem.Allocator, description: ?[]const u8, argument_hint: ?[]const u8) !?[]u8 {

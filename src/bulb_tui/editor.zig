@@ -1,4 +1,5 @@
 const std = @import("std");
+const autocomplete = @import("autocomplete.zig");
 const keybindings = @import("keybindings.zig");
 const keys = @import("keys.zig");
 const kill_ring = @import("kill_ring.zig");
@@ -13,6 +14,11 @@ const BRACKETED_PASTE_END = "\x1b[201~";
 
 const LastAction = enum { kill, yank, type_word };
 const JumpMode = enum { forward, backward };
+const AutocompleteState = enum { regular, force };
+const AutocompleteRequest = struct {
+    force: bool,
+    explicit_tab: bool,
+};
 
 pub const Cursor = struct {
     line: usize,
@@ -142,6 +148,13 @@ pub const Editor = struct {
     is_in_paste: bool = false,
     jump_mode: ?JumpMode = null,
     preferred_visual_col: ?usize = null,
+    autocomplete_provider: ?autocomplete.AutocompleteProvider = null,
+    autocomplete_state: ?AutocompleteState = null,
+    autocomplete_items: []autocomplete.AutocompleteItem = &.{},
+    autocomplete_prefix: []const u8 = "",
+    autocomplete_selected_index: usize = 0,
+    autocomplete_pending: ?AutocompleteRequest = null,
+    autocomplete_max_visible: usize = 5,
 
     pub fn init(allocator: std.mem.Allocator, options: EditorOptions) !Editor {
         var editor = Editor{
@@ -157,6 +170,7 @@ pub const Editor = struct {
     }
 
     pub fn deinit(self: *Editor) void {
+        self.cancelAutocomplete();
         self.freeCurrentLines();
         self.lines.deinit(self.allocator);
         for (self.history.items) |entry| self.allocator.free(entry);
@@ -227,6 +241,34 @@ pub const Editor = struct {
         self.padding_x = padding;
     }
 
+    pub fn getAutocompleteMaxVisible(self: *const Editor) usize {
+        return self.autocomplete_max_visible;
+    }
+
+    pub fn setAutocompleteMaxVisible(self: *Editor, max_visible: usize) void {
+        self.autocomplete_max_visible = std.math.clamp(max_visible, 3, 20);
+    }
+
+    pub fn setAutocompleteProvider(self: *Editor, provider: autocomplete.AutocompleteProvider) void {
+        self.cancelAutocomplete();
+        self.autocomplete_provider = provider;
+    }
+
+    pub fn clearAutocompleteProvider(self: *Editor) void {
+        self.cancelAutocomplete();
+        self.autocomplete_provider = null;
+    }
+
+    pub fn isShowingAutocomplete(self: *const Editor) bool {
+        return self.autocomplete_state != null;
+    }
+
+    pub fn flushAutocomplete(self: *Editor) !void {
+        const request = self.autocomplete_pending orelse return;
+        self.autocomplete_pending = null;
+        try self.startAutocompleteRequest(request);
+    }
+
     pub fn addToHistory(self: *Editor, text: []const u8) !void {
         const trimmed = std.mem.trim(u8, text, " \t\r\n");
         if (trimmed.len == 0) return;
@@ -240,6 +282,7 @@ pub const Editor = struct {
     }
 
     pub fn setText(self: *Editor, text: []const u8) !void {
+        self.cancelAutocomplete();
         self.last_action = null;
         self.history_index = -1;
 
@@ -257,6 +300,7 @@ pub const Editor = struct {
 
     pub fn insertTextAtCursor(self: *Editor, text: []const u8) !void {
         if (text.len == 0) return;
+        self.cancelAutocomplete();
         self.last_action = null;
         self.history_index = -1;
         try self.pushUndoSnapshot();
@@ -310,23 +354,56 @@ pub const Editor = struct {
         if (kb.matches(data, "tui.input.copy")) return;
 
         if (kb.matches(data, "tui.editor.undo")) {
+            self.cancelAutocomplete();
             try self.undo();
             return;
         }
 
+        if (self.autocomplete_state != null) {
+            if (kb.matches(data, "tui.select.cancel")) {
+                self.cancelAutocomplete();
+                return;
+            }
+            if (kb.matches(data, "tui.select.up")) {
+                self.moveAutocompleteSelection(-1);
+                return;
+            }
+            if (kb.matches(data, "tui.select.down")) {
+                self.moveAutocompleteSelection(1);
+                return;
+            }
+            if (kb.matches(data, "tui.input.tab")) {
+                _ = try self.applyAutocompleteSelection(false);
+                return;
+            }
+            if (kb.matches(data, "tui.select.confirm")) {
+                const fallthrough_submit = try self.applyAutocompleteSelection(true);
+                if (!fallthrough_submit) return;
+            }
+        }
+
+        if (kb.matches(data, "tui.input.tab")) {
+            try self.handleTabCompletion();
+            return;
+        }
+
         if (kb.matches(data, "tui.editor.deleteToLineEnd")) {
+            self.cancelAutocomplete();
             try self.deleteToEndOfLine();
             return;
         }
         if (kb.matches(data, "tui.editor.deleteToLineStart")) {
+            self.cancelAutocomplete();
             try self.deleteToStartOfLine();
             return;
         }
         if (kb.matches(data, "tui.editor.deleteWordBackward")) {
+            self.cancelAutocomplete();
             try self.deleteWordBackwards();
             return;
         }
         if (kb.matches(data, "tui.editor.deleteWordForward")) {
+            self.cancelAutocomplete();
             try self.deleteWordForward();
             return;
         }
@@ -340,36 +417,44 @@ pub const Editor = struct {
         }
 
         if (kb.matches(data, "tui.editor.yank")) {
+            self.cancelAutocomplete();
             try self.yank();
             return;
         }
         if (kb.matches(data, "tui.editor.yankPop")) {
+            self.cancelAutocomplete();
             try self.yankPop();
             return;
         }
 
         if (kb.matches(data, "tui.editor.cursorLineStart")) {
+            self.cancelAutocomplete();
             self.moveToLineStart();
             return;
         }
         if (kb.matches(data, "tui.editor.cursorLineEnd")) {
+            self.cancelAutocomplete();
             self.moveToLineEnd();
             return;
         }
         if (kb.matches(data, "tui.editor.cursorWordLeft")) {
+            self.cancelAutocomplete();
             self.moveWordBackwards();
             return;
         }
         if (kb.matches(data, "tui.editor.cursorWordRight")) {
+            self.cancelAutocomplete();
             self.moveWordForwards();
             return;
         }
 
         if (kb.matches(data, "tui.editor.jumpForward")) {
+            self.cancelAutocomplete();
             self.jump_mode = .forward;
             return;
         }
         if (kb.matches(data, "tui.editor.jumpBackward")) {
+            self.cancelAutocomplete();
             self.jump_mode = .backward;
             return;
         }
@@ -379,6 +464,7 @@ pub const Editor = struct {
             std.mem.eql(u8, data, "\x1b\r") or
             std.mem.eql(u8, data, "\x1b[13;2~"))
         {
+            self.cancelAutocomplete();
             try self.addNewLine();
             return;
         }
@@ -396,6 +482,7 @@ pub const Editor = struct {
         }
 
         if (kb.matches(data, "tui.editor.cursorUp")) {
+            self.cancelAutocomplete();
             if (self.isEditorEmpty()) {
                 try self.navigateHistory(-1);
             } else if (self.history_index > -1 and self.isOnFirstVisualLine()) {
@@ -408,6 +495,7 @@ pub const Editor = struct {
             return;
         }
         if (kb.matches(data, "tui.editor.cursorDown")) {
+            self.cancelAutocomplete();
             if (self.history_index > -1 and self.isOnLastVisualLine()) {
                 try self.navigateHistory(1);
             } else if (self.isOnLastVisualLine()) {
@@ -418,18 +506,22 @@ pub const Editor = struct {
             return;
         }
         if (kb.matches(data, "tui.editor.cursorRight")) {
+            self.cancelAutocomplete();
             self.moveCursorHorizontal(1);
             return;
         }
         if (kb.matches(data, "tui.editor.cursorLeft")) {
+            self.cancelAutocomplete();
             self.moveCursorHorizontal(-1);
             return;
         }
         if (kb.matches(data, "tui.editor.pageUp")) {
+            self.cancelAutocomplete();
             self.pageScroll(-1);
             return;
         }
         if (kb.matches(data, "tui.editor.pageDown")) {
+            self.cancelAutocomplete();
             self.pageScroll(1);
             return;
         }
@@ -598,9 +690,11 @@ pub const Editor = struct {
         self.currentLineMut().* = replacement;
         self.setCursorCol(self.cursor_col + char.len);
         try self.emitChange();
+        try self.afterTextMutationForAutocomplete(char);
     }
 
     fn handlePaste(self: *Editor, pasted_text: []const u8) !void {
+        self.cancelAutocomplete();
         self.history_index = -1;
         self.last_action = null;
         try self.pushUndoSnapshot();
@@ -759,6 +853,7 @@ pub const Editor = struct {
         }
 
         try self.emitChange();
+        try self.afterDeletionForAutocomplete();
     }
 
     fn handleForwardDelete(self: *Editor) !void {
@@ -784,6 +879,7 @@ pub const Editor = struct {
         }
 
         try self.emitChange();
+        try self.afterDeletionForAutocomplete();
     }
 
     fn deleteToStartOfLine(self: *Editor) !void {
@@ -1058,6 +1154,212 @@ pub const Editor = struct {
                 }
             },
         }
+    }
+
+    fn handleTabCompletion(self: *Editor) !void {
+        if (self.autocomplete_provider == null) return;
+
+        const line = self.currentLine();
+        const before_cursor = line[0..@min(self.cursor_col, line.len)];
+        if (self.isInSlashCommandContext(before_cursor) and std.mem.indexOfScalar(u8, trimLeftWhitespace(before_cursor), ' ') == null) {
+            try self.requestAutocomplete(.{ .force = false, .explicit_tab = true });
+        } else {
+            try self.requestAutocomplete(.{ .force = true, .explicit_tab = true });
+        }
+    }
+
+    fn requestAutocomplete(self: *Editor, request: AutocompleteRequest) !void {
+        const provider = self.autocomplete_provider orelse return;
+        if (request.force and !provider.shouldTriggerFileCompletion(self.lines.items, self.cursor_line, self.cursor_col)) return;
+
+        self.autocomplete_pending = null;
+        if (self.getAutocompleteDebounceMs(request) > 0) {
+            self.autocomplete_pending = request;
+            return;
+        }
+
+        try self.startAutocompleteRequest(request);
+    }
+
+    fn startAutocompleteRequest(self: *Editor, request: AutocompleteRequest) !void {
+        const provider = self.autocomplete_provider orelse return;
+        const suggestions = try provider.getSuggestions(
+            self.allocator,
+            self.lines.items,
+            self.cursor_line,
+            self.cursor_col,
+            .{ .force = request.force },
+        );
+
+        if (suggestions) |owned_suggestions| {
+            if (owned_suggestions.items.len == 0) {
+                owned_suggestions.deinit(self.allocator);
+                self.clearAutocompleteUi();
+                return;
+            }
+
+            if (request.force and request.explicit_tab and owned_suggestions.items.len == 1) {
+                const item = owned_suggestions.items[0];
+                try self.pushUndoSnapshot();
+                self.last_action = null;
+                try self.applyAutocompleteItem(provider, item, owned_suggestions.prefix);
+                owned_suggestions.deinit(self.allocator);
+                self.clearAutocompleteUi();
+                try self.emitChange();
+                return;
+            }
+
+            self.applyAutocompleteSuggestions(owned_suggestions, if (request.force) .force else .regular);
+            return;
+        }
+
+        self.clearAutocompleteUi();
+    }
+
+    fn getAutocompleteDebounceMs(self: *const Editor, request: AutocompleteRequest) usize {
+        if (request.explicit_tab or request.force) return 0;
+        const line = self.currentLine();
+        const before_cursor = line[0..@min(self.cursor_col, line.len)];
+        return if (isSymbolAutocompleteContext(before_cursor)) 25 else 0;
+    }
+
+    fn applyAutocompleteSuggestions(self: *Editor, suggestions: autocomplete.AutocompleteSuggestions, state: AutocompleteState) void {
+        self.clearAutocompleteUi();
+        self.autocomplete_items = suggestions.items;
+        self.autocomplete_prefix = suggestions.prefix;
+        self.autocomplete_selected_index = 0;
+        if (getBestAutocompleteMatchIndex(suggestions.items, suggestions.prefix)) |index| {
+            self.autocomplete_selected_index = index;
+        }
+        self.autocomplete_state = state;
+    }
+
+    fn applyAutocompleteSelection(self: *Editor, from_submit: bool) !bool {
+        const provider = self.autocomplete_provider orelse return false;
+        if (self.autocomplete_state == null or self.autocomplete_items.len == 0) return false;
+        const selected = self.autocomplete_items[@min(self.autocomplete_selected_index, self.autocomplete_items.len - 1)];
+        const prefix = self.autocomplete_prefix;
+        const should_fallthrough_submit = from_submit and std.mem.startsWith(u8, prefix, "/");
+
+        try self.pushUndoSnapshot();
+        self.last_action = null;
+        try self.applyAutocompleteItem(provider, selected, prefix);
+        self.clearAutocompleteUi();
+        try self.emitChange();
+        return should_fallthrough_submit;
+    }
+
+    fn applyAutocompleteItem(
+        self: *Editor,
+        provider: autocomplete.AutocompleteProvider,
+        item: autocomplete.AutocompleteItem,
+        prefix: []const u8,
+    ) !void {
+        var applied = try provider.applyCompletion(
+            self.allocator,
+            self.lines.items,
+            self.cursor_line,
+            self.cursor_col,
+            item,
+            prefix,
+        );
+        errdefer applied.deinit(self.allocator);
+
+        var new_lines: std.ArrayList([]u8) = .empty;
+        errdefer new_lines.deinit(self.allocator);
+        try new_lines.appendSlice(self.allocator, applied.lines);
+
+        self.freeCurrentLines();
+        self.lines.deinit(self.allocator);
+        self.lines = new_lines;
+        self.allocator.free(applied.lines);
+        applied.lines = &.{};
+        self.cursor_line = @min(applied.cursor_line, self.lines.items.len - 1);
+        self.setCursorCol(applied.cursor_col);
+    }
+
+    fn clearAutocompleteUi(self: *Editor) void {
+        if (self.autocomplete_state != null) {
+            autocomplete.freeAutocompleteItems(self.allocator, self.autocomplete_items);
+            self.allocator.free(self.autocomplete_prefix);
+        }
+        self.autocomplete_state = null;
+        self.autocomplete_items = &.{};
+        self.autocomplete_prefix = "";
+        self.autocomplete_selected_index = 0;
+    }
+
+    fn cancelAutocomplete(self: *Editor) void {
+        self.autocomplete_pending = null;
+        self.clearAutocompleteUi();
+    }
+
+    fn moveAutocompleteSelection(self: *Editor, direction: i32) void {
+        if (self.autocomplete_state == null or self.autocomplete_items.len == 0) return;
+        if (direction < 0) {
+            self.autocomplete_selected_index = if (self.autocomplete_selected_index == 0)
+                self.autocomplete_items.len - 1
+            else
+                self.autocomplete_selected_index - 1;
+        } else {
+            self.autocomplete_selected_index = (self.autocomplete_selected_index + 1) % self.autocomplete_items.len;
+        }
+    }
+
+    fn afterTextMutationForAutocomplete(self: *Editor, inserted: []const u8) !void {
+        if (self.autocomplete_provider == null or inserted.len == 0) return;
+        const line = self.currentLine();
+        const before_cursor = line[0..@min(self.cursor_col, line.len)];
+
+        if (self.autocomplete_state != null) {
+            try self.updateAutocomplete();
+            return;
+        }
+
+        if (std.mem.eql(u8, inserted, "/") and self.isAtStartOfMessage()) {
+            try self.requestAutocomplete(.{ .force = false, .explicit_tab = false });
+        } else if ((std.mem.eql(u8, inserted, "@") or std.mem.eql(u8, inserted, "#")) and isSymbolAtTokenBoundary(before_cursor)) {
+            try self.requestAutocomplete(.{ .force = false, .explicit_tab = false });
+        } else if (isAutocompleteWordText(inserted)) {
+            if (self.isInSlashCommandContext(before_cursor) or isSymbolAutocompleteContext(before_cursor)) {
+                try self.requestAutocomplete(.{ .force = false, .explicit_tab = false });
+            }
+        }
+    }
+
+    fn afterDeletionForAutocomplete(self: *Editor) !void {
+        if (self.autocomplete_provider == null) return;
+        if (self.autocomplete_state != null) {
+            try self.updateAutocomplete();
+            return;
+        }
+
+        const line = self.currentLine();
+        const before_cursor = line[0..@min(self.cursor_col, line.len)];
+        if (self.isInSlashCommandContext(before_cursor) or isSymbolAutocompleteContext(before_cursor)) {
+            try self.requestAutocomplete(.{ .force = false, .explicit_tab = false });
+        }
+    }
+
+    fn updateAutocomplete(self: *Editor) !void {
+        const state = self.autocomplete_state orelse return;
+        try self.requestAutocomplete(.{ .force = state == .force, .explicit_tab = false });
+    }
+
+    fn isSlashMenuAllowed(self: *const Editor) bool {
+        return self.cursor_line == 0;
+    }
+
+    fn isAtStartOfMessage(self: *const Editor) bool {
+        if (!self.isSlashMenuAllowed()) return false;
+        const line = self.currentLine();
+        const before_cursor = line[0..@min(self.cursor_col, line.len)];
+        const trimmed = std.mem.trim(u8, before_cursor, " \t\r\n");
+        return trimmed.len == 0 or std.mem.eql(u8, trimmed, "/");
+    }
+
+    fn isInSlashCommandContext(self: *const Editor, before_cursor: []const u8) bool {
+        return self.isSlashMenuAllowed() and std.mem.startsWith(u8, trimLeftWhitespace(before_cursor), "/");
     }
 
     fn moveCursorHorizontal(self: *Editor, direction: i32) void {
@@ -1692,6 +1994,61 @@ fn isWhitespaceCodepoint(cp: u21) bool {
     return cp == ' ' or cp == '\t' or cp == '\r' or cp == '\n';
 }
 
+fn trimLeftWhitespace(text: []const u8) []const u8 {
+    var index: usize = 0;
+    while (index < text.len and isWhitespaceByte(text[index])) : (index += 1) {}
+    return text[index..];
+}
+
+fn isWhitespaceByte(byte: u8) bool {
+    return byte == ' ' or byte == '\t' or byte == '\r' or byte == '\n';
+}
+
+fn getBestAutocompleteMatchIndex(items: []const autocomplete.AutocompleteItem, prefix: []const u8) ?usize {
+    if (prefix.len == 0) return null;
+    var first_prefix_index: ?usize = null;
+    for (items, 0..) |item, index| {
+        if (std.mem.eql(u8, item.value, prefix)) return index;
+        if (first_prefix_index == null and std.mem.startsWith(u8, item.value, prefix)) {
+            first_prefix_index = index;
+        }
+    }
+    return first_prefix_index;
+}
+
+fn isSymbolAutocompleteContext(text_before_cursor: []const u8) bool {
+    const token = trailingToken(text_before_cursor);
+    return token.len > 0 and (token[0] == '@' or token[0] == '#');
+}
+
+fn isSymbolAtTokenBoundary(text_before_cursor: []const u8) bool {
+    if (text_before_cursor.len == 0) return false;
+    const symbol_index = text_before_cursor.len - 1;
+    const symbol = text_before_cursor[symbol_index];
+    if (symbol != '@' and symbol != '#') return false;
+    return symbol_index == 0 or isWhitespaceByte(text_before_cursor[symbol_index - 1]);
+}
+
+fn trailingToken(text: []const u8) []const u8 {
+    var start = text.len;
+    while (start > 0) {
+        if (isWhitespaceByte(text[start - 1])) break;
+        start -= 1;
+    }
+    return text[start..];
+}
+
+fn isAutocompleteWordText(text: []const u8) bool {
+    if (text.len != 1) return false;
+    const byte = text[0];
+    return (byte >= 'a' and byte <= 'z') or
+        (byte >= 'A' and byte <= 'Z') or
+        (byte >= '0' and byte <= '9') or
+        byte == '.' or
+        byte == '-' or
+        byte == '_';
+}
+
 const CodepointClass = enum { whitespace, ascii_punctuation, word, punctuation };
 
 fn classifyCodepoint(cp: u21) CodepointClass {
@@ -1908,6 +2265,222 @@ fn strippedContains(line: []const u8, needle: []const u8) bool {
         index += 1;
     }
     return std.mem.indexOf(u8, stripped.items, needle) != null;
+}
+
+const TestAutocompleteScenario = enum {
+    work,
+    src,
+    force_files,
+    slash_commands,
+    argtest_filtered,
+    argtest_unfiltered,
+    model,
+};
+
+const TestAutocompleteProvider = struct {
+    scenario: TestAutocompleteScenario,
+    arg_items: []const autocomplete.AutocompleteItem = &.{},
+
+    fn provider(self: *TestAutocompleteProvider) autocomplete.AutocompleteProvider {
+        return .{
+            .context = self,
+            .get_suggestions_fn = getSuggestions,
+            .apply_completion_fn = applyCompletion,
+        };
+    }
+
+    fn getSuggestions(
+        context: ?*anyopaque,
+        allocator: std.mem.Allocator,
+        lines: []const []const u8,
+        cursor_line: usize,
+        cursor_col: usize,
+        options: autocomplete.SuggestionOptions,
+    ) !?autocomplete.AutocompleteSuggestions {
+        const self: *TestAutocompleteProvider = @ptrCast(@alignCast(context.?));
+        const line = if (cursor_line < lines.len) lines[cursor_line] else "";
+        const prefix = line[0..@min(cursor_col, line.len)];
+
+        switch (self.scenario) {
+            .work => {
+                if (!options.force or !std.mem.eql(u8, prefix, "Work")) return null;
+                return try makeSuggestions(allocator, "Work", &.{.{ .value = "Workspace/", .label = "Workspace/" }});
+            },
+            .src => {
+                if (!options.force or !std.mem.eql(u8, prefix, "src")) return null;
+                return try makeSuggestions(allocator, "src", &.{
+                    .{ .value = "src/", .label = "src/" },
+                    .{ .value = "src.txt", .label = "src.txt" },
+                });
+            },
+            .force_files => {
+                const should_match = options.force or std.mem.indexOfScalar(u8, prefix, '/') != null or std.mem.startsWith(u8, prefix, ".");
+                if (!should_match) return null;
+                const files = [_]autocomplete.AutocompleteItem{
+                    .{ .value = "readme.md", .label = "readme.md" },
+                    .{ .value = "package.json", .label = "package.json" },
+                    .{ .value = "src/", .label = "src/" },
+                    .{ .value = "dist/", .label = "dist/" },
+                };
+                return makeFilteredSuggestions(allocator, prefix, &files);
+            },
+            .slash_commands => {
+                if (!std.mem.startsWith(u8, prefix, "/")) return null;
+                const commands = [_]autocomplete.AutocompleteItem{
+                    .{ .value = "/model", .label = "model", .description = "Change model" },
+                    .{ .value = "/help", .label = "help", .description = "Show help" },
+                };
+                const query = prefix[1..];
+                var filtered: std.ArrayList(autocomplete.AutocompleteItem) = .empty;
+                defer filtered.deinit(allocator);
+                for (commands) |command| {
+                    if (std.mem.startsWith(u8, command.value, query)) {
+                        try filtered.append(allocator, command);
+                    }
+                }
+                if (filtered.items.len == 0) return null;
+                return try makeSuggestions(allocator, prefix, filtered.items);
+            },
+            .argtest_filtered, .argtest_unfiltered => {
+                const argument = slashArgumentPrefix(prefix, "/argtest ") orelse return null;
+                if (self.scenario == .argtest_unfiltered) {
+                    return try makeSuggestions(allocator, argument, self.arg_items);
+                }
+                return makeFilteredSuggestions(allocator, argument, self.arg_items);
+            },
+            .model => {
+                const argument = slashArgumentPrefix(prefix, "/model ") orelse return null;
+                const models = [_]autocomplete.AutocompleteItem{
+                    .{ .value = "gpt-4o", .label = "gpt-4o" },
+                    .{ .value = "gpt-4o-mini", .label = "gpt-4o-mini" },
+                    .{ .value = "claude-sonnet", .label = "claude-sonnet" },
+                };
+                return makeFilteredSuggestions(allocator, argument, &models);
+            },
+        }
+    }
+
+    fn applyCompletion(
+        _: ?*anyopaque,
+        allocator: std.mem.Allocator,
+        lines: []const []const u8,
+        cursor_line: usize,
+        cursor_col: usize,
+        item: autocomplete.AutocompleteItem,
+        prefix: []const u8,
+    ) !autocomplete.CompletionApplication {
+        const line_count = @max(lines.len, cursor_line + 1);
+        var new_lines = try allocator.alloc([]u8, line_count);
+        errdefer allocator.free(new_lines);
+        var initialized: usize = 0;
+        errdefer {
+            for (new_lines[0..initialized]) |line| allocator.free(line);
+        }
+
+        for (0..line_count) |index| {
+            const source = if (index < lines.len) lines[index] else "";
+            new_lines[index] = try allocator.dupe(u8, source);
+            initialized += 1;
+        }
+
+        const line = new_lines[cursor_line];
+        const clamped_col = @min(cursor_col, line.len);
+        const prefix_len = @min(prefix.len, clamped_col);
+        const before = line[0 .. clamped_col - prefix_len];
+        const after = line[clamped_col..];
+        const replacement = try std.mem.concat(allocator, u8, &.{ before, item.value, after });
+        allocator.free(new_lines[cursor_line]);
+        new_lines[cursor_line] = replacement;
+
+        return .{
+            .lines = new_lines,
+            .cursor_line = cursor_line,
+            .cursor_col = clamped_col - prefix_len + item.value.len,
+        };
+    }
+};
+
+fn makeSuggestions(
+    allocator: std.mem.Allocator,
+    prefix: []const u8,
+    items: []const autocomplete.AutocompleteItem,
+) !autocomplete.AutocompleteSuggestions {
+    const owned_items = try cloneAutocompleteItems(allocator, items);
+    return .{
+        .items = owned_items,
+        .prefix = try allocator.dupe(u8, prefix),
+    };
+}
+
+fn cloneAutocompleteItems(
+    allocator: std.mem.Allocator,
+    items: []const autocomplete.AutocompleteItem,
+) ![]autocomplete.AutocompleteItem {
+    var owned_items = try allocator.alloc(autocomplete.AutocompleteItem, items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (owned_items[0..initialized]) |item| item.deinit(allocator);
+        allocator.free(owned_items);
+    }
+    for (items, 0..) |item, index| {
+        owned_items[index] = try autocomplete.AutocompleteItem.clone(allocator, item);
+        initialized += 1;
+    }
+    return owned_items;
+}
+
+fn makeFilteredSuggestions(
+    allocator: std.mem.Allocator,
+    prefix: []const u8,
+    items: []const autocomplete.AutocompleteItem,
+) !?autocomplete.AutocompleteSuggestions {
+    var filtered: std.ArrayList(autocomplete.AutocompleteItem) = .empty;
+    defer filtered.deinit(allocator);
+    for (items) |item| {
+        if (startsWithIgnoreCaseAsciiLocal(item.value, prefix)) {
+            try filtered.append(allocator, item);
+        }
+    }
+    if (filtered.items.len == 0) return null;
+    return try makeSuggestions(allocator, prefix, filtered.items);
+}
+
+fn slashArgumentPrefix(text: []const u8, command_prefix: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, text, command_prefix)) return null;
+    const argument = text[command_prefix.len..];
+    if (argument.len == 0 or std.mem.indexOfAny(u8, argument, " \t\r\n") != null) return null;
+    return argument;
+}
+
+fn startsWithIgnoreCaseAsciiLocal(text: []const u8, prefix: []const u8) bool {
+    if (prefix.len > text.len) return false;
+    for (prefix, 0..) |byte, index| {
+        if (std.ascii.toLower(text[index]) != std.ascii.toLower(byte)) return false;
+    }
+    return true;
+}
+
+fn typeText(editor: *Editor, text: []const u8) !void {
+    for (text) |byte| {
+        try editor.handleInput(&.{byte});
+    }
+}
+
+fn loadSkillsArgumentCompletions(
+    _: ?*anyopaque,
+    allocator: std.mem.Allocator,
+    argument_prefix: []const u8,
+) !?[]autocomplete.AutocompleteItem {
+    if (!std.mem.startsWith(u8, argument_prefix, "s")) return null;
+    return try cloneAutocompleteItems(allocator, &.{.{ .value = "skill-a", .label = "skill-a" }});
+}
+
+fn modelArgumentCompletions(
+    _: ?*anyopaque,
+    allocator: std.mem.Allocator,
+    _: []const u8,
+) !?[]autocomplete.AutocompleteItem {
+    return try cloneAutocompleteItems(allocator, &.{.{ .value = "claude-opus", .label = "claude-opus" }});
 }
 
 test "Editor prompt history navigation" {
@@ -2230,6 +2803,212 @@ test "Editor kill ring and undo basics" {
     try expectText(&editor, "abc");
     try editor.handleInput("\x1b[45;5u");
     try expectText(&editor, "");
+}
+
+test "Editor autocomplete integration" {
+    const allocator = std.testing.allocator;
+    defer keybindings.resetGlobalKeybindings(allocator);
+
+    {
+        var editor = try Editor.init(allocator, .{});
+        defer editor.deinit();
+        var provider = TestAutocompleteProvider{ .scenario = .work };
+        editor.setAutocompleteProvider(provider.provider());
+
+        try typeText(&editor, "Work");
+        try expectText(&editor, "Work");
+        try editor.handleInput("\t");
+        try editor.flushAutocomplete();
+        try expectText(&editor, "Workspace/");
+        try std.testing.expect(!editor.isShowingAutocomplete());
+
+        try editor.handleInput("\x1b[45;5u");
+        try expectText(&editor, "Work");
+    }
+    {
+        var editor = try Editor.init(allocator, .{});
+        defer editor.deinit();
+        var provider = TestAutocompleteProvider{ .scenario = .src };
+        editor.setAutocompleteProvider(provider.provider());
+
+        try typeText(&editor, "src");
+        try editor.handleInput("\t");
+        try editor.flushAutocomplete();
+        try expectText(&editor, "src");
+        try std.testing.expect(editor.isShowingAutocomplete());
+
+        try editor.handleInput("\t");
+        try expectText(&editor, "src/");
+        try std.testing.expect(!editor.isShowingAutocomplete());
+    }
+    {
+        var editor = try Editor.init(allocator, .{});
+        defer editor.deinit();
+        var provider = TestAutocompleteProvider{ .scenario = .force_files };
+        editor.setAutocompleteProvider(provider.provider());
+
+        try editor.handleInput("\t");
+        try editor.flushAutocomplete();
+        try std.testing.expect(editor.isShowingAutocomplete());
+
+        try editor.handleInput("r");
+        try editor.flushAutocomplete();
+        try expectText(&editor, "r");
+        try std.testing.expect(editor.isShowingAutocomplete());
+
+        try editor.handleInput("e");
+        try editor.flushAutocomplete();
+        try expectText(&editor, "re");
+        try std.testing.expect(editor.isShowingAutocomplete());
+
+        try editor.handleInput("\t");
+        try expectText(&editor, "readme.md");
+        try std.testing.expect(!editor.isShowingAutocomplete());
+    }
+    {
+        var editor = try Editor.init(allocator, .{});
+        defer editor.deinit();
+        var provider = TestAutocompleteProvider{ .scenario = .slash_commands };
+        editor.setAutocompleteProvider(provider.provider());
+
+        try editor.handleInput("/");
+        try editor.flushAutocomplete();
+        try expectText(&editor, "/");
+        try std.testing.expect(editor.isShowingAutocomplete());
+
+        try editor.handleInput("\x7f");
+        try editor.flushAutocomplete();
+        try expectText(&editor, "");
+        try std.testing.expect(!editor.isShowingAutocomplete());
+    }
+    {
+        const items = [_]autocomplete.AutocompleteItem{
+            .{ .value = "one", .label = "one" },
+            .{ .value = "two", .label = "two" },
+            .{ .value = "three", .label = "three" },
+        };
+        var editor = try Editor.init(allocator, .{});
+        defer editor.deinit();
+        var provider = TestAutocompleteProvider{ .scenario = .argtest_filtered, .arg_items = &items };
+        editor.setAutocompleteProvider(provider.provider());
+
+        try typeText(&editor, "/argtest two");
+        try editor.flushAutocomplete();
+        try std.testing.expect(editor.isShowingAutocomplete());
+        try editor.handleInput("\r");
+        try expectText(&editor, "/argtest two");
+    }
+    {
+        const items = [_]autocomplete.AutocompleteItem{
+            .{ .value = "two", .label = "two" },
+            .{ .value = "three", .label = "three" },
+            .{ .value = "twelve", .label = "twelve" },
+        };
+        var editor = try Editor.init(allocator, .{});
+        defer editor.deinit();
+        var provider = TestAutocompleteProvider{ .scenario = .argtest_filtered, .arg_items = &items };
+        editor.setAutocompleteProvider(provider.provider());
+
+        try typeText(&editor, "/argtest t");
+        try editor.flushAutocomplete();
+        try std.testing.expect(editor.isShowingAutocomplete());
+        try editor.handleInput("\r");
+        try expectText(&editor, "/argtest two");
+    }
+    {
+        const items = [_]autocomplete.AutocompleteItem{
+            .{ .value = "one", .label = "one" },
+            .{ .value = "two", .label = "two" },
+            .{ .value = "three", .label = "three" },
+        };
+        var editor = try Editor.init(allocator, .{});
+        defer editor.deinit();
+        var provider = TestAutocompleteProvider{ .scenario = .argtest_unfiltered, .arg_items = &items };
+        editor.setAutocompleteProvider(provider.provider());
+
+        try typeText(&editor, "/argtest tw");
+        try editor.flushAutocomplete();
+        try std.testing.expect(editor.isShowingAutocomplete());
+        try editor.handleInput("\r");
+        try expectText(&editor, "/argtest two");
+    }
+    {
+        const items = [_]autocomplete.AutocompleteItem{
+            .{ .value = "one", .label = "one" },
+            .{ .value = "two", .label = "two" },
+            .{ .value = "three", .label = "three" },
+        };
+        var editor = try Editor.init(allocator, .{});
+        defer editor.deinit();
+        var provider = TestAutocompleteProvider{ .scenario = .argtest_unfiltered, .arg_items = &items };
+        editor.setAutocompleteProvider(provider.provider());
+
+        try typeText(&editor, "/argtest t");
+        try editor.flushAutocomplete();
+        try std.testing.expect(editor.isShowingAutocomplete());
+        try editor.handleInput("\r");
+        try expectText(&editor, "/argtest two");
+    }
+    {
+        var editor = try Editor.init(allocator, .{});
+        defer editor.deinit();
+        var provider = TestAutocompleteProvider{ .scenario = .model };
+        editor.setAutocompleteProvider(provider.provider());
+
+        try typeText(&editor, "/model gpt-4o-mini");
+        try editor.flushAutocomplete();
+        try std.testing.expect(editor.isShowingAutocomplete());
+        try editor.handleInput("\r");
+        try expectText(&editor, "/model gpt-4o-mini");
+    }
+    {
+        const commands = [_]autocomplete.SlashCommand{
+            .{
+                .name = "load-skills",
+                .description = "Load skills",
+                .get_argument_completions = .{ .call_fn = loadSkillsArgumentCompletions },
+            },
+        };
+        var provider = try autocomplete.CombinedAutocompleteProvider.init(allocator, &commands, ".", null);
+        defer provider.deinit();
+        var editor = try Editor.init(allocator, .{});
+        defer editor.deinit();
+        editor.setAutocompleteProvider(provider.provider());
+
+        try editor.setText("/load-skills ");
+        try editor.handleInput("s");
+        try editor.flushAutocomplete();
+        try std.testing.expect(editor.isShowingAutocomplete());
+
+        try editor.handleInput("\t");
+        try expectText(&editor, "/load-skills skill-a");
+        try std.testing.expect(!editor.isShowingAutocomplete());
+    }
+    {
+        const commands = [_]autocomplete.SlashCommand{
+            .{ .name = "help", .description = "Show help" },
+            .{
+                .name = "model",
+                .description = "Switch model",
+                .get_argument_completions = .{ .call_fn = modelArgumentCompletions },
+            },
+        };
+        var provider = try autocomplete.CombinedAutocompleteProvider.init(allocator, &commands, ".", null);
+        defer provider.deinit();
+        var editor = try Editor.init(allocator, .{});
+        defer editor.deinit();
+        editor.setAutocompleteProvider(provider.provider());
+
+        try editor.handleInput("/");
+        try editor.handleInput("h");
+        try editor.handleInput("e");
+        try editor.flushAutocomplete();
+        try std.testing.expect(editor.isShowingAutocomplete());
+
+        try editor.handleInput("\t");
+        try expectText(&editor, "/help ");
+        try std.testing.expect(!editor.isShowingAutocomplete());
+    }
 }
 
 test "Editor character jump Ctrl bracket" {
