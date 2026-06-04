@@ -446,7 +446,7 @@ packages/coding-agent/src/core/model-registry.ts	bulb_coding_agent	source	in_pro
 packages/coding-agent/src/core/model-resolver.ts	bulb_coding_agent	source	implemented	src/bulb_coding_agent/model_resolver.zig	Default provider model table, exact provider/model reference matching, alias/date fuzzy selection, colon-aware thinking-level parsing, CLI provider inference, custom provider fallback IDs, registry-backed initial-model selection, structured session restore fallback, duplicate suppression, slash-aware glob/globstar scoping, minimatch brace/extglob scoped matching, and CLI stdout/stderr presentation ported
 packages/coding-agent/src/core/output-guard.ts	bulb_coding_agent	source	implemented	src/bulb_coding_agent/output_guard.zig	Native stdout takeover guard ported with raw stdout preservation, guarded stdout-to-stderr routing, idempotent restore, retryable raw stdout backpressure handling, and flush/backpressure hooks
 packages/coding-agent/src/core/package-manager.ts	bulb_coding_agent	source	pending		
-packages/coding-agent/src/core/prompt-templates.ts	bulb_coding_agent	source	pending		
+packages/coding-agent/src/core/prompt-templates.ts	bulb_coding_agent	source	in_progress	src/bulb_coding_agent/prompt_templates.zig	Native owned prompt loading from global, project, and explicit paths; symlink-aware Markdown discovery; source scopes; frontmatter metadata; quoted argument parsing; ordered placeholder substitution; and slash expansion ported; full nested YAML tolerance remains with the frontmatter parser
 packages/coding-agent/src/core/provider-display-names.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/core/resolve-config-value.ts	bulb_coding_agent	source	implemented	src/bulb_coding_agent/resolve_config_value.zig	Literal, environment-template, escape, shell-command, trimmed-output, failure, command-cache, uncached required resolution, Pi-compatible failure diagnostics, missing-variable/configured checks, legacy-variable handling, header resolution helpers, and Windows configured-shell fallback ported.
 packages/coding-agent/src/core/resource-loader.ts	bulb_coding_agent	source	pending		
@@ -456,7 +456,7 @@ packages/coding-agent/src/core/session-manager.ts	bulb_coding_agent	source	pendi
 packages/coding-agent/src/core/settings-manager.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/core/skills.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/core/slash-commands.ts	bulb_coding_agent	source	pending		
-packages/coding-agent/src/core/source-info.ts	bulb_coding_agent	source	pending		
+packages/coding-agent/src/core/source-info.ts	bulb_coding_agent	source	implemented	src/bulb_coding_agent/source_info.zig	Source scope and origin metadata plus regular and synthetic constructors ported
 packages/coding-agent/src/core/system-prompt.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/core/telemetry.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/core/timings.ts	bulb_coding_agent	source	pending		
@@ -643,7 +643,7 @@ packages/coding-agent/test/paths.test.ts	bulb_coding_agent	test	implemented	src/
 packages/coding-agent/test/pi-user-agent.test.ts	bulb_coding_agent	test	implemented	src/bulb_coding_agent/user_agent.zig	Upstream user-agent formatting test translated to Bulb product name and Zig-native runtime string
 packages/coding-agent/test/plan-mode-utils.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/print-mode.test.ts	bulb_coding_agent	test	pending		
-packages/coding-agent/test/prompt-templates.test.ts	bulb_coding_agent	test	pending		
+packages/coding-agent/test/prompt-templates.test.ts	bulb_coding_agent	test	implemented	src/bulb_coding_agent/prompt_templates.zig	Upstream positional, wildcard, non-recursive, slice, quote, whitespace, Unicode, multiline expansion, and argument-hint frontmatter regressions ported
 packages/coding-agent/test/resource-loader.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/restore-sandbox-env.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/rpc-client-clone.test.ts	bulb_coding_agent	test	pending		
