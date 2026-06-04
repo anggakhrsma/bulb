@@ -1154,6 +1154,8 @@ pub const VirtualTerminal = struct {
     cursor_x: usize = 0,
     cursor_y: usize = 0,
     kitty_active: bool = true,
+    active_italic: bool = false,
+    active_underline: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, column_count: usize, row_count: usize) VirtualTerminal {
         return .{
@@ -1204,25 +1206,43 @@ pub const VirtualTerminal = struct {
         return self.kitty_active;
     }
 
-    pub fn moveBy(_: *VirtualTerminal, _: isize) !void {}
+    pub fn moveBy(self: *VirtualTerminal, lines: isize) !void {
+        if (lines > 0) {
+            const sequence = try std.fmt.allocPrint(self.allocator, "\x1b[{d}B", .{lines});
+            defer self.allocator.free(sequence);
+            try self.write(sequence);
+        } else if (lines < 0) {
+            const sequence = try std.fmt.allocPrint(self.allocator, "\x1b[{d}A", .{-lines});
+            defer self.allocator.free(sequence);
+            try self.write(sequence);
+        }
+    }
 
     pub fn hideCursor(self: *VirtualTerminal) !void {
-        try self.writes.appendSlice(self.allocator, "\x1b[?25l");
+        try self.write("\x1b[?25l");
     }
 
     pub fn showCursor(self: *VirtualTerminal) !void {
-        try self.writes.appendSlice(self.allocator, "\x1b[?25h");
+        try self.write("\x1b[?25h");
     }
 
-    pub fn clearLine(_: *VirtualTerminal) !void {}
+    pub fn clearLine(self: *VirtualTerminal) !void {
+        try self.write("\x1b[K");
+    }
 
-    pub fn clearFromCursor(_: *VirtualTerminal) !void {}
+    pub fn clearFromCursor(self: *VirtualTerminal) !void {
+        try self.write("\x1b[J");
+    }
 
     pub fn clearScreen(self: *VirtualTerminal) !void {
-        self.clearScreenCells();
+        try self.write("\x1b[2J\x1b[H");
     }
 
-    pub fn setTitle(_: *VirtualTerminal, _: []const u8) !void {}
+    pub fn setTitle(self: *VirtualTerminal, title: []const u8) !void {
+        const sequence = try std.fmt.allocPrint(self.allocator, "\x1b]0;{s}\x07", .{title});
+        defer self.allocator.free(sequence);
+        try self.write(sequence);
+    }
 
     pub fn setProgress(_: *VirtualTerminal, _: bool) !void {}
 
@@ -1265,6 +1285,21 @@ pub const VirtualTerminal = struct {
         return result;
     }
 
+    pub fn getScrollBuffer(self: *VirtualTerminal, allocator: std.mem.Allocator) ![][]u8 {
+        var result = try allocator.alloc([]u8, self.screen.items.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (result[0..initialized]) |line| allocator.free(line);
+            allocator.free(result);
+        }
+
+        for (self.screen.items, 0..) |line, index| {
+            result[index] = try allocator.dupe(u8, line.text);
+            initialized += 1;
+        }
+        return result;
+    }
+
     pub fn getCellItalic(self: *VirtualTerminal, row: usize, col: usize) bool {
         const viewport_start = if (self.screen.items.len > self.height) self.screen.items.len - self.height else 0;
         const source_index = viewport_start + row;
@@ -1284,7 +1319,23 @@ pub const VirtualTerminal = struct {
     }
 
     pub fn getCursorPosition(self: *const VirtualTerminal) struct { x: usize, y: usize } {
-        return .{ .x = self.cursor_x, .y = self.cursor_y };
+        const viewport_start = if (self.screen.items.len > self.height) self.screen.items.len - self.height else 0;
+        const viewport_y = if (self.cursor_y > viewport_start) self.cursor_y - viewport_start else 0;
+        return .{ .x = self.cursor_x, .y = viewport_y };
+    }
+
+    pub fn flush(_: *VirtualTerminal) !void {}
+
+    pub fn waitForRender(_: *VirtualTerminal) !void {}
+
+    pub fn clear(self: *VirtualTerminal) void {
+        self.clearScreenCells();
+    }
+
+    pub fn reset(self: *VirtualTerminal) void {
+        self.clearScreenCells();
+        self.active_italic = false;
+        self.active_underline = false;
     }
 
     fn captureRenderedPayload(self: *VirtualTerminal, data: []const u8) !void {
@@ -1298,11 +1349,13 @@ pub const VirtualTerminal = struct {
             return;
         }
 
-        if (std.mem.indexOf(u8, data, "\x1b[2J") != null) self.clearScreenCells();
+        try self.applyTerminalWrite(data);
     }
 
     fn replaceScreenFromPayload(self: *VirtualTerminal, payload: []const u8) !void {
         self.clearScreenCells();
+        self.active_italic = false;
+        self.active_underline = false;
 
         var line_start: usize = 0;
         while (line_start <= payload.len) {
@@ -1325,13 +1378,278 @@ pub const VirtualTerminal = struct {
         self.cursor_x = if (self.screen.items.len == 0) 0 else self.screen.items[self.cursor_y].text.len;
     }
 
+    fn applyTerminalWrite(self: *VirtualTerminal, data: []const u8) !void {
+        var index: usize = 0;
+        while (index < data.len) {
+            if (extractAnsiCode(data, index)) |ansi| {
+                try self.applyAnsiCode(ansi.code);
+                index += ansi.length;
+                continue;
+            }
+
+            switch (data[index]) {
+                '\r' => {
+                    self.cursor_x = 0;
+                    index += 1;
+                },
+                '\n' => {
+                    try self.moveCursorDown(1);
+                    index += 1;
+                },
+                else => {
+                    const end = nextUtf8SliceEnd(data, index);
+                    try self.writeGrapheme(data[index..end]);
+                    index = end;
+                },
+            }
+        }
+    }
+
+    fn applyAnsiCode(self: *VirtualTerminal, code: []const u8) !void {
+        if (code.len < 2) return;
+        if (code[1] == '[') {
+            try self.applyCsi(code);
+        }
+    }
+
+    fn applyCsi(self: *VirtualTerminal, code: []const u8) !void {
+        if (code.len < 3) return;
+        const final = code[code.len - 1];
+        const body = code[2 .. code.len - 1];
+        const private = std.mem.startsWith(u8, body, "?");
+        const params = if (private) body[1..] else body;
+
+        switch (final) {
+            'A' => self.moveCursorUp(parseFirstCsiParam(params, 1)),
+            'B' => try self.moveCursorDown(parseFirstCsiParam(params, 1)),
+            'H', 'f' => try self.moveCursorTo(params),
+            'J' => try self.clearScreenMode(parseFirstCsiParam(params, 0)),
+            'K' => try self.clearLineMode(parseFirstCsiParam(params, 0)),
+            'm' => self.applySgr(params),
+            else => {},
+        }
+    }
+
+    fn applySgr(self: *VirtualTerminal, params: []const u8) void {
+        if (params.len == 0) {
+            self.active_italic = false;
+            self.active_underline = false;
+            return;
+        }
+
+        var iter = std.mem.splitScalar(u8, params, ';');
+        while (iter.next()) |part| {
+            const code = parseSgrCode(part) orelse continue;
+            switch (code) {
+                0 => {
+                    self.active_italic = false;
+                    self.active_underline = false;
+                },
+                3 => self.active_italic = true,
+                4 => self.active_underline = true,
+                23 => self.active_italic = false,
+                24 => self.active_underline = false,
+                else => {},
+            }
+        }
+    }
+
+    fn moveCursorUp(self: *VirtualTerminal, amount: usize) void {
+        self.cursor_y = self.cursor_y -| amount;
+    }
+
+    fn moveCursorDown(self: *VirtualTerminal, amount: usize) !void {
+        self.cursor_y += amount;
+        try self.ensureLine(self.cursor_y);
+    }
+
+    fn moveCursorTo(self: *VirtualTerminal, params: []const u8) !void {
+        var row: usize = 1;
+        var col: usize = 1;
+        if (params.len > 0) {
+            var iter = std.mem.splitScalar(u8, params, ';');
+            if (iter.next()) |row_part| row = parseCsiNumber(row_part, 1);
+            if (iter.next()) |col_part| col = parseCsiNumber(col_part, 1);
+        }
+        self.cursor_y = row -| 1;
+        self.cursor_x = col -| 1;
+        try self.ensureLine(self.cursor_y);
+    }
+
+    fn clearScreenMode(self: *VirtualTerminal, mode: usize) !void {
+        switch (mode) {
+            0 => {
+                try self.ensureLine(self.cursor_y);
+                try self.truncateLineFromCursor(self.cursor_y, self.cursor_x);
+                var row = self.cursor_y + 1;
+                while (row < self.screen.items.len) : (row += 1) {
+                    self.screen.items[row].deinit(self.allocator);
+                }
+                self.screen.shrinkRetainingCapacity(self.cursor_y + 1);
+            },
+            2, 3 => self.clearScreenCells(),
+            else => {},
+        }
+    }
+
+    fn clearLineMode(self: *VirtualTerminal, mode: usize) !void {
+        try self.ensureLine(self.cursor_y);
+        switch (mode) {
+            0 => try self.truncateLineFromCursor(self.cursor_y, self.cursor_x),
+            2 => try self.replaceLineWithEmpty(self.cursor_y),
+            else => {},
+        }
+    }
+
+    fn writeGrapheme(self: *VirtualTerminal, grapheme: []const u8) !void {
+        try self.ensureLine(self.cursor_y);
+        const width = @max(@as(usize, 1), visibleWidth(grapheme));
+        try self.replaceLineCells(self.cursor_y, self.cursor_x, width, grapheme, self.active_italic, self.active_underline);
+        self.cursor_x += width;
+    }
+
+    fn ensureLine(self: *VirtualTerminal, index: usize) !void {
+        while (self.screen.items.len <= index) {
+            try self.screen.append(self.allocator, try makeVirtualCell(self.allocator, ""));
+        }
+    }
+
+    fn truncateLineFromCursor(self: *VirtualTerminal, row: usize, col: usize) !void {
+        if (row >= self.screen.items.len) return;
+        var line = &self.screen.items[row];
+        const byte_index = byteIndexForCell(line.text, col);
+        const flag_index = @min(col, line.italic.len);
+        const new_text = try self.allocator.dupe(u8, line.text[0..byte_index]);
+        errdefer self.allocator.free(new_text);
+        const new_italic = try self.allocator.dupe(bool, line.italic[0..flag_index]);
+        errdefer self.allocator.free(new_italic);
+        const new_underline = try self.allocator.dupe(bool, line.underline[0..flag_index]);
+        line.deinit(self.allocator);
+        line.* = .{ .text = new_text, .italic = new_italic, .underline = new_underline };
+    }
+
+    fn replaceLineWithEmpty(self: *VirtualTerminal, row: usize) !void {
+        if (row >= self.screen.items.len) return;
+        const empty = try makeVirtualCell(self.allocator, "");
+        self.screen.items[row].deinit(self.allocator);
+        self.screen.items[row] = empty;
+    }
+
+    fn replaceLineCells(
+        self: *VirtualTerminal,
+        row: usize,
+        col: usize,
+        width: usize,
+        grapheme: []const u8,
+        italic: bool,
+        underline: bool,
+    ) !void {
+        var line = &self.screen.items[row];
+        if (col > line.italic.len) try self.padLineToCell(line, col);
+
+        const start_byte = byteIndexForCell(line.text, col);
+        const end_byte = byteIndexForCell(line.text, col + width);
+        const old_cell_end = @min(col + width, line.italic.len);
+
+        const next_text_len = start_byte + grapheme.len + (line.text.len - end_byte);
+        const next_text = try self.allocator.alloc(u8, next_text_len);
+        errdefer self.allocator.free(next_text);
+        @memcpy(next_text[0..start_byte], line.text[0..start_byte]);
+        @memcpy(next_text[start_byte .. start_byte + grapheme.len], grapheme);
+        @memcpy(next_text[start_byte + grapheme.len ..], line.text[end_byte..]);
+
+        const suffix_flags = line.italic.len - old_cell_end;
+        const next_flags_len = col + width + suffix_flags;
+        const next_italic = try self.allocator.alloc(bool, next_flags_len);
+        errdefer self.allocator.free(next_italic);
+        const next_underline = try self.allocator.alloc(bool, next_flags_len);
+        errdefer self.allocator.free(next_underline);
+
+        @memcpy(next_italic[0..col], line.italic[0..col]);
+        @memcpy(next_underline[0..col], line.underline[0..col]);
+        @memset(next_italic[col .. col + width], italic);
+        @memset(next_underline[col .. col + width], underline);
+        @memcpy(next_italic[col + width ..], line.italic[old_cell_end..]);
+        @memcpy(next_underline[col + width ..], line.underline[old_cell_end..]);
+
+        line.deinit(self.allocator);
+        line.* = .{ .text = next_text, .italic = next_italic, .underline = next_underline };
+    }
+
+    fn padLineToCell(self: *VirtualTerminal, line: *VirtualCell, target_col: usize) !void {
+        if (target_col <= line.italic.len) return;
+        const pad_count = target_col - line.italic.len;
+        const next_text_len = line.text.len + pad_count;
+        const next_text = try self.allocator.alloc(u8, next_text_len);
+        @memcpy(next_text[0..line.text.len], line.text);
+        @memset(next_text[line.text.len..], ' ');
+
+        const next_italic = try self.allocator.alloc(bool, target_col);
+        errdefer self.allocator.free(next_italic);
+        const next_underline = try self.allocator.alloc(bool, target_col);
+        errdefer self.allocator.free(next_underline);
+        @memcpy(next_italic[0..line.italic.len], line.italic);
+        @memcpy(next_underline[0..line.underline.len], line.underline);
+        @memset(next_italic[line.italic.len..], false);
+        @memset(next_underline[line.underline.len..], false);
+
+        line.deinit(self.allocator);
+        line.* = .{ .text = next_text, .italic = next_italic, .underline = next_underline };
+    }
+
     fn clearScreenCells(self: *VirtualTerminal) void {
         for (self.screen.items) |*line| line.deinit(self.allocator);
         self.screen.clearRetainingCapacity();
         self.cursor_x = 0;
         self.cursor_y = 0;
+        self.active_italic = false;
+        self.active_underline = false;
     }
 };
+
+fn makeVirtualCell(allocator: std.mem.Allocator, line: []const u8) !VirtualCell {
+    const text = try allocator.dupe(u8, line);
+    errdefer allocator.free(text);
+    const width = visibleWidth(line);
+    const italic = try allocator.alloc(bool, width);
+    errdefer allocator.free(italic);
+    const underline = try allocator.alloc(bool, width);
+    errdefer allocator.free(underline);
+    @memset(italic, false);
+    @memset(underline, false);
+    return .{
+        .text = text,
+        .italic = italic,
+        .underline = underline,
+    };
+}
+
+fn parseFirstCsiParam(params: []const u8, default: usize) usize {
+    if (params.len == 0) return default;
+    const semicolon = std.mem.indexOfScalar(u8, params, ';') orelse params.len;
+    return parseCsiNumber(params[0..semicolon], default);
+}
+
+fn parseCsiNumber(input: []const u8, default: usize) usize {
+    if (input.len == 0) return default;
+    return std.fmt.parseInt(usize, input, 10) catch default;
+}
+
+fn byteIndexForCell(text: []const u8, target_col: usize) usize {
+    if (target_col == 0) return 0;
+    var index: usize = 0;
+    var col: usize = 0;
+    while (index < text.len and col < target_col) {
+        if (extractAnsiCode(text, index)) |ansi| {
+            index += ansi.length;
+            continue;
+        }
+        const end = nextUtf8SliceEnd(text, index);
+        col += @max(@as(usize, 1), visibleWidth(text[index..end]));
+        index = end;
+    }
+    return index;
+}
 
 fn stripKnownTuiControls(payload: []const u8) []const u8 {
     var start: usize = 0;
@@ -5364,6 +5682,81 @@ fn removeTableNoise(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
         }
     }
     return output.toOwnedSlice(allocator);
+}
+
+test "VirtualTerminal direct writes expose viewport scrollback and cursor state" {
+    const allocator = std.testing.allocator;
+    var virtual_terminal = VirtualTerminal.init(allocator, 8, 3);
+    defer virtual_terminal.deinit();
+
+    try virtual_terminal.write("one\r\ntwo\r\nthree\r\nfour");
+
+    const viewport = try virtual_terminal.getViewport(allocator);
+    defer freeOwnedLines(allocator, viewport);
+    try std.testing.expectEqualStrings("two", viewport[0]);
+    try std.testing.expectEqualStrings("three", viewport[1]);
+    try std.testing.expectEqualStrings("four", viewport[2]);
+
+    const scroll_buffer = try virtual_terminal.getScrollBuffer(allocator);
+    defer freeOwnedLines(allocator, scroll_buffer);
+    try std.testing.expectEqual(@as(usize, 4), scroll_buffer.len);
+    try std.testing.expectEqualStrings("one", scroll_buffer[0]);
+    try std.testing.expectEqualStrings("four", scroll_buffer[3]);
+
+    const cursor = virtual_terminal.getCursorPosition();
+    try std.testing.expectEqual(@as(usize, 4), cursor.x);
+    try std.testing.expectEqual(@as(usize, 2), cursor.y);
+}
+
+test "VirtualTerminal terminal controls mirror xterm helper behavior" {
+    const allocator = std.testing.allocator;
+    var virtual_terminal = VirtualTerminal.init(allocator, 12, 4);
+    defer virtual_terminal.deinit();
+
+    try virtual_terminal.write("alpha\r\nbeta\r\ngamma");
+    try virtual_terminal.write("\x1b[2;3H");
+    try virtual_terminal.clearLine();
+
+    const viewport = try virtual_terminal.getViewport(allocator);
+    defer freeOwnedLines(allocator, viewport);
+    try std.testing.expectEqualStrings("alpha", viewport[0]);
+    try std.testing.expectEqualStrings("be", viewport[1]);
+    try std.testing.expectEqualStrings("gamma", viewport[2]);
+
+    try virtual_terminal.write("\x1b[1;3H");
+    try virtual_terminal.clearFromCursor();
+
+    const cleared = try virtual_terminal.getViewport(allocator);
+    defer freeOwnedLines(allocator, cleared);
+    try std.testing.expectEqualStrings("al", cleared[0]);
+    try std.testing.expectEqualStrings("", cleared[1]);
+    try std.testing.expectEqualStrings("", cleared[2]);
+
+    try virtual_terminal.write("\x1b[3mI\x1b[23mU\x1b[4mN\x1b[24m");
+    try std.testing.expect(virtual_terminal.getCellItalic(0, 2));
+    try std.testing.expect(!virtual_terminal.getCellItalic(0, 3));
+    try std.testing.expect(virtual_terminal.getCellUnderline(0, 4));
+
+    try virtual_terminal.setTitle("Bulb");
+    try std.testing.expect(std.mem.indexOf(u8, virtual_terminal.getWrites(), "\x1b]0;Bulb\x07") != null);
+
+    try virtual_terminal.write("\x1b[2;1Hxy");
+    try virtual_terminal.moveBy(-1);
+    try virtual_terminal.write("ZZ");
+    const moved = try virtual_terminal.getViewport(allocator);
+    defer freeOwnedLines(allocator, moved);
+    try std.testing.expectEqualStrings("alZZN", moved[0]);
+
+    try virtual_terminal.clearScreen();
+    const empty = try virtual_terminal.getViewport(allocator);
+    defer freeOwnedLines(allocator, empty);
+    for (empty) |line| try std.testing.expectEqualStrings("", line);
+    try std.testing.expect(std.mem.indexOf(u8, virtual_terminal.getWrites(), "\x1b[2J\x1b[H") != null);
+
+    try virtual_terminal.write("\x1b[3mA");
+    virtual_terminal.reset();
+    try virtual_terminal.write("B");
+    try std.testing.expect(!virtual_terminal.getCellItalic(0, 0));
 }
 
 test "TUI virtual terminal renders lines and resets styles after each row" {
