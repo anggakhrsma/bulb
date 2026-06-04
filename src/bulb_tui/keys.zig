@@ -26,7 +26,146 @@ const CP_PAGE_DOWN: i32 = -13;
 const CP_HOME: i32 = -14;
 const CP_END: i32 = -15;
 
-const KeyEventType = enum { press, repeat, release };
+pub const KeyId = []const u8;
+
+pub const KeyEventType = enum { press, repeat, release };
+
+pub const Key = struct {
+    pub const escape: KeyId = "escape";
+    pub const esc: KeyId = "esc";
+    pub const enter: KeyId = "enter";
+    pub const @"return": KeyId = "return";
+    pub const tab: KeyId = "tab";
+    pub const space: KeyId = "space";
+    pub const backspace: KeyId = "backspace";
+    pub const delete: KeyId = "delete";
+    pub const insert: KeyId = "insert";
+    pub const clear: KeyId = "clear";
+    pub const home: KeyId = "home";
+    pub const end: KeyId = "end";
+    pub const pageUp: KeyId = "pageUp";
+    pub const pageDown: KeyId = "pageDown";
+    pub const up: KeyId = "up";
+    pub const down: KeyId = "down";
+    pub const left: KeyId = "left";
+    pub const right: KeyId = "right";
+    pub const f1: KeyId = "f1";
+    pub const f2: KeyId = "f2";
+    pub const f3: KeyId = "f3";
+    pub const f4: KeyId = "f4";
+    pub const f5: KeyId = "f5";
+    pub const f6: KeyId = "f6";
+    pub const f7: KeyId = "f7";
+    pub const f8: KeyId = "f8";
+    pub const f9: KeyId = "f9";
+    pub const f10: KeyId = "f10";
+    pub const f11: KeyId = "f11";
+    pub const f12: KeyId = "f12";
+
+    pub const backtick: KeyId = "`";
+    pub const hyphen: KeyId = "-";
+    pub const equals: KeyId = "=";
+    pub const leftbracket: KeyId = "[";
+    pub const rightbracket: KeyId = "]";
+    pub const backslash: KeyId = "\\";
+    pub const semicolon: KeyId = ";";
+    pub const quote: KeyId = "'";
+    pub const comma: KeyId = ",";
+    pub const period: KeyId = ".";
+    pub const slash: KeyId = "/";
+    pub const exclamation: KeyId = "!";
+    pub const at: KeyId = "@";
+    pub const hash: KeyId = "#";
+    pub const dollar: KeyId = "$";
+    pub const percent: KeyId = "%";
+    pub const caret: KeyId = "^";
+    pub const ampersand: KeyId = "&";
+    pub const asterisk: KeyId = "*";
+    pub const leftparen: KeyId = "(";
+    pub const rightparen: KeyId = ")";
+    pub const underscore: KeyId = "_";
+    pub const plus: KeyId = "+";
+    pub const pipe: KeyId = "|";
+    pub const tilde: KeyId = "~";
+    pub const leftbrace: KeyId = "{";
+    pub const rightbrace: KeyId = "}";
+    pub const colon: KeyId = ":";
+    pub const lessthan: KeyId = "<";
+    pub const greaterthan: KeyId = ">";
+    pub const question: KeyId = "?";
+
+    pub fn ctrl(comptime key: KeyId) KeyId {
+        return "ctrl+" ++ key;
+    }
+
+    pub fn shift(comptime key: KeyId) KeyId {
+        return "shift+" ++ key;
+    }
+
+    pub fn alt(comptime key: KeyId) KeyId {
+        return "alt+" ++ key;
+    }
+
+    pub fn super(comptime key: KeyId) KeyId {
+        return "super+" ++ key;
+    }
+
+    pub fn ctrlShift(comptime key: KeyId) KeyId {
+        return "ctrl+shift+" ++ key;
+    }
+
+    pub fn shiftCtrl(comptime key: KeyId) KeyId {
+        return "shift+ctrl+" ++ key;
+    }
+
+    pub fn ctrlAlt(comptime key: KeyId) KeyId {
+        return "ctrl+alt+" ++ key;
+    }
+
+    pub fn altCtrl(comptime key: KeyId) KeyId {
+        return "alt+ctrl+" ++ key;
+    }
+
+    pub fn shiftAlt(comptime key: KeyId) KeyId {
+        return "shift+alt+" ++ key;
+    }
+
+    pub fn altShift(comptime key: KeyId) KeyId {
+        return "alt+shift+" ++ key;
+    }
+
+    pub fn ctrlSuper(comptime key: KeyId) KeyId {
+        return "ctrl+super+" ++ key;
+    }
+
+    pub fn superCtrl(comptime key: KeyId) KeyId {
+        return "super+ctrl+" ++ key;
+    }
+
+    pub fn shiftSuper(comptime key: KeyId) KeyId {
+        return "shift+super+" ++ key;
+    }
+
+    pub fn superShift(comptime key: KeyId) KeyId {
+        return "super+shift+" ++ key;
+    }
+
+    pub fn altSuper(comptime key: KeyId) KeyId {
+        return "alt+super+" ++ key;
+    }
+
+    pub fn superAlt(comptime key: KeyId) KeyId {
+        return "super+alt+" ++ key;
+    }
+
+    pub fn ctrlShiftAlt(comptime key: KeyId) KeyId {
+        return "ctrl+shift+alt+" ++ key;
+    }
+
+    pub fn ctrlShiftSuper(comptime key: KeyId) KeyId {
+        return "ctrl+shift+super+" ++ key;
+    }
+};
 
 const ParsedKittySequence = struct {
     codepoint: i32,

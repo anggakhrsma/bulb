@@ -14,6 +14,61 @@ pub const terminal = @import("terminal.zig");
 pub const input_component = @import("input.zig");
 pub const editor_component = @import("editor.zig");
 
+pub const AutocompleteItem = autocomplete.AutocompleteItem;
+pub const AutocompleteProvider = autocomplete.AutocompleteProvider;
+pub const AutocompleteSuggestions = autocomplete.AutocompleteSuggestions;
+pub const CombinedAutocompleteProvider = autocomplete.CombinedAutocompleteProvider;
+pub const SlashCommand = autocomplete.SlashCommand;
+pub const FuzzyMatch = fuzzy.FuzzyMatch;
+pub const fuzzyFilter = fuzzy.fuzzyFilter;
+pub const fuzzyMatch = fuzzy.fuzzyMatch;
+pub const Key = keys.Key;
+pub const KeyEventType = keys.KeyEventType;
+pub const KeyId = keys.KeyId;
+pub const decodeKittyPrintable = keys.decodeKittyPrintable;
+pub const isKeyRelease = keys.isKeyRelease;
+pub const isKeyRepeat = keys.isKeyRepeat;
+pub const isKittyProtocolActive = keys.isKittyProtocolActive;
+pub const matchesKey = keys.matchesKey;
+pub const parseKey = keys.parseKey;
+pub const setKittyProtocolActive = keys.setKittyProtocolActive;
+pub const Keybinding = keybindings.Keybinding;
+pub const KeybindingConflict = keybindings.KeybindingConflict;
+pub const KeybindingDefinition = keybindings.KeybindingDefinition;
+pub const KeybindingDefinitions = keybindings.KeybindingDefinitions;
+pub const Keybindings = keybindings.Keybindings;
+pub const KeybindingsConfig = keybindings.KeybindingsConfig;
+pub const KeybindingsManager = keybindings.KeybindingsManager;
+pub const TUI_KEYBINDINGS = keybindings.TUI_KEYBINDINGS;
+pub const getKeybindings = keybindings.getKeybindings;
+pub const setKeybindings = keybindings.setKeybindings;
+pub const StdinBuffer = stdin_buffer.StdinBuffer;
+pub const StdinBufferOptions = stdin_buffer.StdinBufferOptions;
+pub const CellDimensions = terminal_image.CellDimensions;
+pub const ImageDimensions = terminal_image.ImageDimensions;
+pub const ImageProtocol = terminal_image.ImageProtocol;
+pub const ImageRenderOptions = terminal_image.ImageRenderOptions;
+pub const TerminalCapabilities = terminal_image.TerminalCapabilities;
+pub const allocateImageId = terminal_image.allocateImageId;
+pub const calculateImageRows = terminal_image.calculateImageRows;
+pub const deleteAllKittyImages = terminal_image.deleteAllKittyImages;
+pub const deleteKittyImage = terminal_image.deleteKittyImage;
+pub const detectCapabilities = terminal_image.detectCapabilities;
+pub const encodeITerm2 = terminal_image.encodeITerm2;
+pub const encodeKitty = terminal_image.encodeKitty;
+pub const getCapabilities = terminal_image.getCapabilities;
+pub const getCellDimensions = terminal_image.getCellDimensions;
+pub const getGifDimensions = terminal_image.getGifDimensions;
+pub const getImageDimensions = terminal_image.getImageDimensions;
+pub const getJpegDimensions = terminal_image.getJpegDimensions;
+pub const getPngDimensions = terminal_image.getPngDimensions;
+pub const getWebpDimensions = terminal_image.getWebpDimensions;
+pub const hyperlink = terminal_image.hyperlink;
+pub const imageFallback = terminal_image.imageFallback;
+pub const renderImage = terminal_image.renderImage;
+pub const resetCapabilitiesCache = terminal_image.resetCapabilitiesCache;
+pub const setCapabilities = terminal_image.setCapabilities;
+pub const setCellDimensions = terminal_image.setCellDimensions;
 pub const Terminal = terminal.Terminal;
 pub const ProcessTerminal = terminal.ProcessTerminal;
 pub const KeyboardProtocolNegotiationSequence = terminal.KeyboardProtocolNegotiationSequence;
@@ -22,6 +77,14 @@ pub const normalizeAppleTerminalInput = terminal.normalizeAppleTerminalInput;
 pub const Input = input_component.Input;
 pub const Editor = editor_component.Editor;
 pub const EditorComponent = editor_component.EditorComponent;
+pub const EditorOptions = editor_component.EditorOptions;
+
+pub const EditorTheme = struct {
+    border_color: TextStyle = .{},
+    select_list: SelectListTheme = .{},
+};
+
+pub const Focusable = Component;
 
 const ESC: u8 = 0x1b;
 const BEL: u8 = 0x07;
@@ -231,7 +294,7 @@ const AnsiCodeTracker = struct {
         if (self.bg_color.slice()) |color| try appendSgrParam(allocator, output, &wrote_sgr, color);
 
         if (wrote_sgr) try output.append(allocator, 'm');
-        if (self.active_hyperlink) |hyperlink| try appendOsc8Hyperlink(allocator, output, hyperlink);
+        if (self.active_hyperlink) |active_link| try appendOsc8Hyperlink(allocator, output, active_link);
     }
 
     fn activeCodesAlloc(self: *const AnsiCodeTracker, allocator: std.mem.Allocator) ![]u8 {
@@ -243,7 +306,7 @@ const AnsiCodeTracker = struct {
 
     fn appendLineEndReset(self: *const AnsiCodeTracker, allocator: std.mem.Allocator, output: *std.ArrayList(u8)) !void {
         if (self.underline) try output.appendSlice(allocator, "\x1b[24m");
-        if (self.active_hyperlink) |hyperlink| try appendOsc8Close(allocator, output, hyperlink.terminator);
+        if (self.active_hyperlink) |active_link| try appendOsc8Close(allocator, output, active_link.terminator);
     }
 };
 
@@ -257,12 +320,12 @@ fn appendSgrParam(allocator: std.mem.Allocator, output: *std.ArrayList(u8), wrot
     try output.appendSlice(allocator, param);
 }
 
-fn appendOsc8Hyperlink(allocator: std.mem.Allocator, output: *std.ArrayList(u8), hyperlink: ActiveHyperlink) !void {
+fn appendOsc8Hyperlink(allocator: std.mem.Allocator, output: *std.ArrayList(u8), active_link: ActiveHyperlink) !void {
     try output.appendSlice(allocator, "\x1b]8;");
-    try output.appendSlice(allocator, hyperlink.params);
+    try output.appendSlice(allocator, active_link.params);
     try output.append(allocator, ';');
-    try output.appendSlice(allocator, hyperlink.url);
-    try appendOscTerminator(allocator, output, hyperlink.terminator);
+    try output.appendSlice(allocator, active_link.url);
+    try appendOscTerminator(allocator, output, active_link.terminator);
 }
 
 fn appendOsc8Close(allocator: std.mem.Allocator, output: *std.ArrayList(u8), terminator: OscTerminator) !void {
@@ -1078,6 +1141,11 @@ pub const Component = struct {
         return false;
     }
 };
+
+pub fn isFocusable(component: ?Component) bool {
+    if (component) |resolved| return resolved.isFocusable();
+    return false;
+}
 
 pub const CURSOR_MARKER = "\x1b_pi:c\x07";
 const TUI_SEGMENT_RESET = "\x1b[0m\x1b]8;;\x07";
@@ -10054,6 +10122,114 @@ test "SelectList filters, wraps selection input, and reports no matches" {
     defer freeRenderedLines(allocator, rendered);
     try std.testing.expectEqual(@as(usize, 1), rendered.len);
     try std.testing.expectEqualStrings("  No matching commands", rendered[0]);
+}
+
+test "public TUI index export surface mirrors Pi barrel" {
+    _ = AutocompleteItem;
+    _ = AutocompleteProvider;
+    _ = AutocompleteSuggestions;
+    _ = CombinedAutocompleteProvider;
+    _ = SlashCommand;
+    _ = Box;
+    _ = CancellableLoader;
+    _ = Editor;
+    _ = EditorComponent;
+    _ = EditorOptions;
+    _ = EditorTheme;
+    _ = Image;
+    _ = ImageOptions;
+    _ = ImageTheme;
+    _ = Input;
+    _ = Loader;
+    _ = LoaderIndicatorOptions;
+    _ = DefaultTextStyle;
+    _ = Markdown;
+    _ = MarkdownOptions;
+    _ = MarkdownTheme;
+    _ = SelectItem;
+    _ = SelectList;
+    _ = SelectListLayoutOptions;
+    _ = SelectListTheme;
+    _ = SelectListTruncatePrimaryContext;
+    _ = SettingItem;
+    _ = SettingsList;
+    _ = SettingsListTheme;
+    _ = Spacer;
+    _ = Text;
+    _ = TruncatedText;
+    _ = FuzzyMatch;
+    _ = fuzzyFilter;
+    _ = fuzzyMatch;
+    _ = Keybinding;
+    _ = KeybindingConflict;
+    _ = KeybindingDefinition;
+    _ = KeybindingDefinitions;
+    _ = Keybindings;
+    _ = KeybindingsConfig;
+    _ = KeybindingsManager;
+    _ = getKeybindings;
+    _ = setKeybindings;
+    _ = TUI_KEYBINDINGS;
+    _ = decodeKittyPrintable;
+    _ = isKeyRelease;
+    _ = isKeyRepeat;
+    _ = isKittyProtocolActive;
+    _ = KeyEventType;
+    _ = KeyId;
+    _ = matchesKey;
+    _ = parseKey;
+    _ = setKittyProtocolActive;
+    _ = StdinBuffer;
+    _ = StdinBufferOptions;
+    _ = ProcessTerminal;
+    _ = Terminal;
+    _ = allocateImageId;
+    _ = CellDimensions;
+    _ = calculateImageRows;
+    _ = deleteAllKittyImages;
+    _ = deleteKittyImage;
+    _ = detectCapabilities;
+    _ = encodeITerm2;
+    _ = encodeKitty;
+    _ = getCapabilities;
+    _ = getCellDimensions;
+    _ = getGifDimensions;
+    _ = getImageDimensions;
+    _ = getJpegDimensions;
+    _ = getPngDimensions;
+    _ = getWebpDimensions;
+    _ = hyperlink;
+    _ = ImageDimensions;
+    _ = ImageProtocol;
+    _ = ImageRenderOptions;
+    _ = imageFallback;
+    _ = renderImage;
+    _ = resetCapabilitiesCache;
+    _ = setCapabilities;
+    _ = setCellDimensions;
+    _ = TerminalCapabilities;
+    _ = Component;
+    _ = Container;
+    _ = CURSOR_MARKER;
+    _ = Focusable;
+    _ = isFocusable;
+    _ = OverlayAnchor;
+    _ = OverlayHandle;
+    _ = OverlayMargin;
+    _ = OverlayOptions;
+    _ = OverlayUnfocusOptions;
+    _ = SizeValue;
+    _ = TUI;
+    _ = truncateToWidth;
+    _ = visibleWidth;
+    _ = wrapTextWithAnsi;
+
+    try std.testing.expectEqualStrings(Key.enter, parseKey("\r").?);
+    try std.testing.expect(matchesKey("\r", Key.enter));
+    try std.testing.expectEqualStrings("ctrl+shift+p", Key.ctrlShift("p"));
+
+    const dims = CellDimensions{ .width_px = 9, .height_px = 18 };
+    try std.testing.expectEqual(@as(usize, 1), calculateImageRows(.{ .width_px = 9, .height_px = 18 }, 1, dims));
 }
 
 test {

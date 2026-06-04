@@ -1,6 +1,10 @@
 const std = @import("std");
 const keys = @import("keys.zig");
 
+pub const Keybinding = []const u8;
+pub const Keybindings = []const KeybindingDefinition;
+pub const KeybindingDefinitions = []const KeybindingDefinition;
+
 pub const KeybindingDefinition = struct {
     id: []const u8,
     default_keys: []const []const u8,
