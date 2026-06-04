@@ -1,6 +1,7 @@
 const std = @import("std");
 const agent = @import("bulb_agent");
 const config = @import("config.zig");
+const messages_mod = @import("messages.zig");
 const paths = @import("paths.zig");
 const session_cwd = @import("session_cwd.zig");
 
@@ -22,6 +23,29 @@ pub const FileEntry = struct {
     raw_json: []const u8,
     entry_type: ?[]const u8,
     id: ?[]const u8,
+};
+
+pub const SessionInfo = struct {
+    path: []const u8,
+    id: []const u8,
+    cwd: []const u8,
+    name: ?[]const u8,
+    parent_session_path: ?[]const u8,
+    created_ms: i64,
+    modified_ms: i64,
+    message_count: usize,
+    first_message: []const u8,
+    all_messages_text: []const u8,
+};
+
+pub const SessionInfoList = struct {
+    arena: std.heap.ArenaAllocator,
+    sessions: []SessionInfo,
+
+    pub fn deinit(self: *SessionInfoList) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
 };
 
 pub const LoadedEntries = struct {
@@ -55,6 +79,7 @@ pub const SessionManager = struct {
     cwd: []const u8,
     file_entries: []const FileEntry,
     header: SessionHeader,
+    leaf_id: ?[]const u8,
 
     pub fn create(
         allocator: std.mem.Allocator,
@@ -212,6 +237,7 @@ pub const SessionManager = struct {
             .cwd = manager_cwd,
             .file_entries = loaded.entries,
             .header = header,
+            .leaf_id = findLeafId(loaded.entries),
         };
         loaded_released = true;
         return manager;
@@ -262,6 +288,8 @@ pub const SessionManager = struct {
         self.header = header;
         self.file_entries = entries;
         self.session_file = session_file;
+        self.leaf_id = null;
+        self.flushed = false;
         return self.session_file;
     }
 
@@ -324,6 +352,158 @@ pub const SessionManager = struct {
         return self.file_entries[1..];
     }
 
+    pub fn appendMessageJson(
+        self: *SessionManager,
+        io: std.Io,
+        message_json: []const u8,
+    ) ![]const u8 {
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.arena.child_allocator, message_json, .{});
+        defer parsed.deinit();
+
+        const arena_allocator = self.arena.allocator();
+        const entry_id = try generateEntryIdAlloc(arena_allocator, io, self.file_entries);
+        errdefer arena_allocator.free(entry_id);
+        const timestamp = try isoTimestampAlloc(
+            arena_allocator,
+            std.Io.Clock.real.now(io).toMilliseconds(),
+        );
+        errdefer arena_allocator.free(timestamp);
+        const raw_json = try messageEntryJsonAlloc(arena_allocator, entry_id, self.leaf_id, timestamp, message_json);
+        errdefer arena_allocator.free(raw_json);
+        const grown = try arena_allocator.alloc(FileEntry, self.file_entries.len + 1);
+        @memcpy(grown[0..self.file_entries.len], self.file_entries);
+        grown[self.file_entries.len] = .{
+            .raw_json = raw_json,
+            .entry_type = "message",
+            .id = entry_id,
+        };
+        self.file_entries = grown;
+        self.leaf_id = entry_id;
+        try self.persistEntry(io, raw_json);
+        return entry_id;
+    }
+
+    pub fn appendSessionInfo(self: *SessionManager, io: std.Io, name: []const u8) ![]const u8 {
+        const arena_allocator = self.arena.allocator();
+        const entry_id = try generateEntryIdAlloc(arena_allocator, io, self.file_entries);
+        errdefer arena_allocator.free(entry_id);
+        const timestamp = try isoTimestampAlloc(
+            arena_allocator,
+            std.Io.Clock.real.now(io).toMilliseconds(),
+        );
+        errdefer arena_allocator.free(timestamp);
+        const trimmed = std.mem.trim(u8, name, " \t\r\n");
+        const raw_json = try sessionInfoEntryJsonAlloc(arena_allocator, entry_id, self.leaf_id, timestamp, trimmed);
+        errdefer arena_allocator.free(raw_json);
+        const grown = try arena_allocator.alloc(FileEntry, self.file_entries.len + 1);
+        @memcpy(grown[0..self.file_entries.len], self.file_entries);
+        grown[self.file_entries.len] = .{
+            .raw_json = raw_json,
+            .entry_type = "session_info",
+            .id = entry_id,
+        };
+        self.file_entries = grown;
+        self.leaf_id = entry_id;
+        try self.persistEntry(io, raw_json);
+        return entry_id;
+    }
+
+    pub fn getSessionName(
+        self: *const SessionManager,
+        allocator: std.mem.Allocator,
+    ) !?[]u8 {
+        var index = self.file_entries.len;
+        while (index > 1) {
+            index -= 1;
+            const entry = self.file_entries[index];
+            if (entry.entry_type == null or !std.mem.eql(u8, entry.entry_type.?, "session_info")) continue;
+            var parsed = std.json.parseFromSlice(std.json.Value, allocator, entry.raw_json, .{}) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return null,
+            };
+            defer parsed.deinit();
+            if (parsed.value != .object) return null;
+            const name = optionalString(parsed.value.object, "name") orelse return null;
+            const trimmed = std.mem.trim(u8, name, " \t\r\n");
+            if (trimmed.len == 0) return null;
+            return try allocator.dupe(u8, trimmed);
+        }
+        return null;
+    }
+
+    pub fn list(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        cwd: []const u8,
+        session_dir: ?[]const u8,
+        agent_dir: []const u8,
+    ) !SessionInfoList {
+        const dir = if (session_dir) |custom_dir|
+            try paths.normalizePathAlloc(allocator, custom_dir, .{})
+        else
+            try getDefaultSessionDirAlloc(allocator, io, cwd, agent_dir);
+        defer allocator.free(dir);
+
+        const default_path = try getDefaultSessionDirPathAlloc(allocator, io, cwd, agent_dir);
+        defer allocator.free(default_path);
+        const filter_cwd = session_dir != null and !std.mem.eql(u8, dir, default_path);
+        const process_cwd = try std.process.currentPathAlloc(io, allocator);
+        defer allocator.free(process_cwd);
+        const resolved_cwd = try paths.resolvePathAlloc(allocator, cwd, process_cwd, .{});
+        defer allocator.free(resolved_cwd);
+
+        var list_result = try listSessionsFromDir(allocator, io, dir);
+        errdefer list_result.deinit();
+        if (filter_cwd) {
+            filterSessionInfosByCwd(&list_result, resolved_cwd, process_cwd);
+        }
+        sortSessionInfos(list_result.sessions);
+        return list_result;
+    }
+
+    pub fn listAll(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        session_dir: ?[]const u8,
+        agent_dir: []const u8,
+    ) !SessionInfoList {
+        if (session_dir) |custom_dir| {
+            const normalized = try paths.normalizePathAlloc(allocator, custom_dir, .{});
+            defer allocator.free(normalized);
+            const sessions = try listSessionsFromDir(allocator, io, normalized);
+            sortSessionInfos(sessions.sessions);
+            return sessions;
+        }
+
+        const sessions_root = try std.fs.path.join(allocator, &.{ agent_dir, "sessions" });
+        defer allocator.free(sessions_root);
+        var directory = openDirPath(io, sessions_root, .{ .iterate = true }) catch {
+            return emptySessionInfoList(allocator);
+        };
+        defer directory.close(io);
+
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+        const arena_allocator = arena.allocator();
+        var all: std.ArrayList(SessionInfo) = .empty;
+        var iterator = directory.iterate();
+        while (true) {
+            const maybe_entry = iterator.next(io) catch break;
+            const entry = maybe_entry orelse break;
+            if (entry.kind != .directory) continue;
+            const child_dir = try std.fs.path.join(allocator, &.{ sessions_root, entry.name });
+            defer allocator.free(child_dir);
+            var child = try listSessionsFromDir(allocator, io, child_dir);
+            defer child.deinit();
+            for (child.sessions) |info| {
+                try all.append(arena_allocator, try cloneSessionInfo(arena_allocator, info));
+            }
+        }
+        const sessions = try all.toOwnedSlice(arena_allocator);
+        sortSessionInfos(sessions);
+        return .{ .arena = arena, .sessions = sessions };
+    }
+
     pub fn cwdSource(self: *const SessionManager) session_cwd.SessionCwdSource {
         return .{
             .ptr = self,
@@ -376,6 +556,7 @@ pub const SessionManager = struct {
                 .cwd = null,
                 .parent_session = null,
             },
+            .leaf_id = null,
         };
         errdefer manager.deinit();
         const arena_allocator = manager.arena.allocator();
@@ -395,6 +576,51 @@ pub const SessionManager = struct {
             try output.writer.writeByte('\n');
         }
         try writeAbsoluteFile(io, session_file, output.written());
+    }
+
+    fn persistEntry(self: *SessionManager, io: std.Io, raw_json: []const u8) !void {
+        if (!self.persist) return;
+        const session_file = self.session_file orelse return;
+        if (!self.hasAssistantMessage()) {
+            if (self.flushed) {
+                try appendJsonLine(io, session_file, raw_json);
+            } else {
+                self.flushed = false;
+            }
+            return;
+        }
+
+        if (!self.flushed) {
+            try self.writeFileExclusive(io);
+            self.flushed = true;
+        } else {
+            try appendJsonLine(io, session_file, raw_json);
+        }
+    }
+
+    fn writeFileExclusive(self: *const SessionManager, io: std.Io) !void {
+        const session_file = self.session_file orelse return;
+        var file = try std.Io.Dir.cwd().createFile(io, session_file, .{
+            .read = false,
+            .truncate = false,
+            .exclusive = true,
+        });
+        defer file.close(io);
+        var output: std.Io.Writer.Allocating = .init(self.arena.child_allocator);
+        defer output.deinit();
+        for (self.file_entries) |entry| {
+            try output.writer.writeAll(entry.raw_json);
+            try output.writer.writeByte('\n');
+        }
+        try file.writeStreamingAll(io, output.written());
+    }
+
+    fn hasAssistantMessage(self: *const SessionManager) bool {
+        for (self.file_entries) |entry| {
+            if (entry.entry_type == null or !std.mem.eql(u8, entry.entry_type.?, "message")) continue;
+            if (messageRoleEquals(self.arena.child_allocator, entry.raw_json, "assistant")) return true;
+        }
+        return false;
     }
 };
 
@@ -560,6 +786,400 @@ fn sessionHeaderMatchesCwd(
 fn openDirPath(io: std.Io, path: []const u8, options: std.Io.Dir.OpenOptions) !std.Io.Dir {
     if (std.fs.path.isAbsolute(path)) return std.Io.Dir.openDirAbsolute(io, path, options);
     return std.Io.Dir.cwd().openDir(io, path, options);
+}
+
+fn emptySessionInfoList(allocator: std.mem.Allocator) !SessionInfoList {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const sessions = try arena.allocator().alloc(SessionInfo, 0);
+    return .{ .arena = arena, .sessions = sessions };
+}
+
+fn listSessionsFromDir(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: []const u8,
+) !SessionInfoList {
+    var directory = openDirPath(io, dir, .{ .iterate = true }) catch {
+        return emptySessionInfoList(allocator);
+    };
+    defer directory.close(io);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const arena_allocator = arena.allocator();
+    var sessions: std.ArrayList(SessionInfo) = .empty;
+    var iterator = directory.iterate();
+    while (true) {
+        const maybe_entry = iterator.next(io) catch break;
+        const entry = maybe_entry orelse break;
+        if (!std.mem.endsWith(u8, entry.name, ".jsonl")) continue;
+        const path = try std.fs.path.join(allocator, &.{ dir, entry.name });
+        defer allocator.free(path);
+        const info = try buildSessionInfo(arena_allocator, allocator, io, path) orelse continue;
+        try sessions.append(arena_allocator, info);
+    }
+    return .{
+        .arena = arena,
+        .sessions = try sessions.toOwnedSlice(arena_allocator),
+    };
+}
+
+fn buildSessionInfo(
+    output_allocator: std.mem.Allocator,
+    scratch_allocator: std.mem.Allocator,
+    io: std.Io,
+    file_path: []const u8,
+) !?SessionInfo {
+    const stats = std.Io.Dir.cwd().statFile(io, file_path, .{ .follow_symlinks = true }) catch return null;
+    if (stats.kind != .file) return null;
+
+    var loaded = loadEntriesFromFile(scratch_allocator, io, file_path) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return null,
+    };
+    defer loaded.deinit();
+    const header = loaded.header orelse return null;
+
+    var message_count: usize = 0;
+    var first_message: ?[]const u8 = null;
+    var all_messages_text: std.ArrayList(u8) = .empty;
+    var name: ?[]const u8 = null;
+    var last_activity_ms: ?i64 = null;
+
+    for (loaded.entries[1..]) |entry| {
+        if (entry.entry_type) |entry_type| {
+            if (std.mem.eql(u8, entry_type, "session_info")) {
+                name = try sessionInfoNameAlloc(output_allocator, scratch_allocator, entry.raw_json);
+                continue;
+            }
+            if (!std.mem.eql(u8, entry_type, "message")) continue;
+        } else {
+            continue;
+        }
+
+        message_count += 1;
+        const inspected = try inspectMessageEntry(output_allocator, scratch_allocator, entry.raw_json);
+        if (inspected.activity_ms) |activity_ms| {
+            const previous = last_activity_ms orelse 0;
+            last_activity_ms = @max(previous, activity_ms);
+        }
+        const text = inspected.text orelse continue;
+        if (text.len == 0) continue;
+        if (all_messages_text.items.len > 0) try all_messages_text.append(output_allocator, ' ');
+        try all_messages_text.appendSlice(output_allocator, text);
+        if (first_message == null and inspected.role == .user) {
+            first_message = text;
+        }
+    }
+
+    const header_ms = if (header.timestamp) |timestamp|
+        messages_mod.parseTimestampMs(timestamp) catch null
+    else
+        null;
+    const modified_ms = if (last_activity_ms != null and last_activity_ms.? > 0)
+        last_activity_ms.?
+    else
+        header_ms orelse stats.mtime.toMilliseconds();
+    const cwd = if (header.cwd) |cwd_value| cwd_value else "";
+
+    return .{
+        .path = try output_allocator.dupe(u8, file_path),
+        .id = try output_allocator.dupe(u8, header.id),
+        .cwd = try output_allocator.dupe(u8, cwd),
+        .name = name,
+        .parent_session_path = if (header.parent_session) |parent|
+            try output_allocator.dupe(u8, parent)
+        else
+            null,
+        .created_ms = header_ms orelse 0,
+        .modified_ms = modified_ms,
+        .message_count = message_count,
+        .first_message = if (first_message) |message|
+            message
+        else
+            try output_allocator.dupe(u8, "(no messages)"),
+        .all_messages_text = try all_messages_text.toOwnedSlice(output_allocator),
+    };
+}
+
+const MessageRole = enum { user, assistant, other };
+
+const MessageInspection = struct {
+    role: MessageRole = .other,
+    text: ?[]const u8 = null,
+    activity_ms: ?i64 = null,
+};
+
+fn inspectMessageEntry(
+    output_allocator: std.mem.Allocator,
+    scratch_allocator: std.mem.Allocator,
+    raw_json: []const u8,
+) !MessageInspection {
+    var parsed = std.json.parseFromSlice(std.json.Value, scratch_allocator, raw_json, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return .{},
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return .{};
+    const entry_object = parsed.value.object;
+    const message_value = entry_object.get("message") orelse return .{};
+    if (message_value != .object) return .{};
+    const message_object = message_value.object;
+    const role = roleFromString(optionalString(message_object, "role"));
+    if (role == .other) return .{ .role = role };
+
+    const content_value = message_object.get("content") orelse return .{ .role = role };
+    const activity_ms = valueToI64(message_object.get("timestamp")) orelse blk: {
+        const entry_timestamp = optionalString(entry_object, "timestamp") orelse break :blk null;
+        break :blk messages_mod.parseTimestampMs(entry_timestamp) catch null;
+    };
+    return .{
+        .role = role,
+        .text = try extractTextContentAlloc(output_allocator, content_value),
+        .activity_ms = activity_ms,
+    };
+}
+
+fn roleFromString(role: ?[]const u8) MessageRole {
+    const value = role orelse return .other;
+    if (std.mem.eql(u8, value, "user")) return .user;
+    if (std.mem.eql(u8, value, "assistant")) return .assistant;
+    return .other;
+}
+
+fn valueToI64(value: ?std.json.Value) ?i64 {
+    const v = value orelse return null;
+    return switch (v) {
+        .integer => |integer| std.math.cast(i64, integer),
+        .float => |float| {
+            if (!std.math.isFinite(float)) return null;
+            if (float < @as(f64, @floatFromInt(std.math.minInt(i64))) or
+                float > @as(f64, @floatFromInt(std.math.maxInt(i64))))
+            {
+                return null;
+            }
+            return @intFromFloat(float);
+        },
+        else => null,
+    };
+}
+
+fn extractTextContentAlloc(
+    allocator: std.mem.Allocator,
+    content_value: std.json.Value,
+) !?[]const u8 {
+    switch (content_value) {
+        .string => |text| {
+            if (text.len == 0) return null;
+            return try allocator.dupe(u8, text);
+        },
+        .array => |array| {
+            var joined: std.ArrayList(u8) = .empty;
+            for (array.items) |block| {
+                if (block != .object) continue;
+                const block_object = block.object;
+                const block_type = optionalString(block_object, "type") orelse continue;
+                if (!std.mem.eql(u8, block_type, "text")) continue;
+                const text = optionalString(block_object, "text") orelse continue;
+                if (text.len == 0) continue;
+                if (joined.items.len > 0) try joined.append(allocator, ' ');
+                try joined.appendSlice(allocator, text);
+            }
+            if (joined.items.len == 0) return null;
+            return try joined.toOwnedSlice(allocator);
+        },
+        else => return null,
+    }
+}
+
+fn sessionInfoNameAlloc(
+    output_allocator: std.mem.Allocator,
+    scratch_allocator: std.mem.Allocator,
+    raw_json: []const u8,
+) !?[]const u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, scratch_allocator, raw_json, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return null,
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const name = optionalString(parsed.value.object, "name") orelse return null;
+    const trimmed = std.mem.trim(u8, name, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    return try output_allocator.dupe(u8, trimmed);
+}
+
+fn filterSessionInfosByCwd(
+    list: *SessionInfoList,
+    resolved_cwd: []const u8,
+    process_cwd: []const u8,
+) void {
+    var write_index: usize = 0;
+    const scratch_allocator = list.arena.child_allocator;
+    for (list.sessions) |info| {
+        if (sessionCwdMatchesAlloc(scratch_allocator, info.cwd, resolved_cwd, process_cwd)) {
+            list.sessions[write_index] = info;
+            write_index += 1;
+        }
+    }
+    list.sessions = list.sessions[0..write_index];
+}
+
+fn sessionCwdMatchesAlloc(
+    scratch_allocator: std.mem.Allocator,
+    cwd: []const u8,
+    resolved_cwd: []const u8,
+    process_cwd: []const u8,
+) bool {
+    if (cwd.len == 0) return false;
+    const resolved = paths.resolvePathAlloc(scratch_allocator, cwd, process_cwd, .{}) catch return false;
+    defer scratch_allocator.free(resolved);
+    return std.mem.eql(u8, resolved, resolved_cwd);
+}
+
+fn sortSessionInfos(sessions: []SessionInfo) void {
+    std.mem.sort(SessionInfo, sessions, {}, struct {
+        fn lessThan(_: void, lhs: SessionInfo, rhs: SessionInfo) bool {
+            return lhs.modified_ms > rhs.modified_ms;
+        }
+    }.lessThan);
+}
+
+fn cloneSessionInfo(allocator: std.mem.Allocator, info: SessionInfo) !SessionInfo {
+    return .{
+        .path = try allocator.dupe(u8, info.path),
+        .id = try allocator.dupe(u8, info.id),
+        .cwd = try allocator.dupe(u8, info.cwd),
+        .name = if (info.name) |name| try allocator.dupe(u8, name) else null,
+        .parent_session_path = if (info.parent_session_path) |parent| try allocator.dupe(u8, parent) else null,
+        .created_ms = info.created_ms,
+        .modified_ms = info.modified_ms,
+        .message_count = info.message_count,
+        .first_message = try allocator.dupe(u8, info.first_message),
+        .all_messages_text = try allocator.dupe(u8, info.all_messages_text),
+    };
+}
+
+fn findLeafId(entries: []const FileEntry) ?[]const u8 {
+    var index = entries.len;
+    while (index > 1) {
+        index -= 1;
+        const entry = entries[index];
+        if (entry.entry_type) |entry_type| {
+            if (!std.mem.eql(u8, entry_type, "session")) {
+                return entry.id;
+            }
+        }
+    }
+    return null;
+}
+
+fn entryIdExists(entries: []const FileEntry, id: []const u8) bool {
+    for (entries) |entry| {
+        if (entry.id) |entry_id| {
+            if (std.mem.eql(u8, entry_id, id)) return true;
+        }
+    }
+    return false;
+}
+
+fn generateEntryIdAlloc(allocator: std.mem.Allocator, io: std.Io, entries: []const FileEntry) ![]u8 {
+    for (0..100) |_| {
+        const uuid = agent.uuid.uuidv7(io);
+        const encoded = uuid[24..32];
+        if (!entryIdExists(entries, encoded)) return allocator.dupe(u8, encoded);
+    }
+    return error.EntryIdCollision;
+}
+
+fn messageEntryJsonAlloc(
+    allocator: std.mem.Allocator,
+    id: []const u8,
+    parent_id: ?[]const u8,
+    timestamp: []const u8,
+    message_json: []const u8,
+) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    var json: std.json.Stringify = .{ .writer = &output.writer };
+    try json.beginObject();
+    try json.objectField("type");
+    try json.write("message");
+    try json.objectField("id");
+    try json.write(id);
+    try json.objectField("parentId");
+    if (parent_id) |parent| {
+        try json.write(parent);
+    } else {
+        try json.write(null);
+    }
+    try json.objectField("timestamp");
+    try json.write(timestamp);
+    try json.objectField("message");
+    try json.beginWriteRaw();
+    try output.writer.writeAll(message_json);
+    json.endWriteRaw();
+    try json.endObject();
+    return output.toOwnedSlice();
+}
+
+fn sessionInfoEntryJsonAlloc(
+    allocator: std.mem.Allocator,
+    id: []const u8,
+    parent_id: ?[]const u8,
+    timestamp: []const u8,
+    name: []const u8,
+) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    var json: std.json.Stringify = .{ .writer = &output.writer };
+    try json.beginObject();
+    try json.objectField("type");
+    try json.write("session_info");
+    try json.objectField("id");
+    try json.write(id);
+    try json.objectField("parentId");
+    if (parent_id) |parent| {
+        try json.write(parent);
+    } else {
+        try json.write(null);
+    }
+    try json.objectField("timestamp");
+    try json.write(timestamp);
+    try json.objectField("name");
+    try json.write(name);
+    try json.endObject();
+    return output.toOwnedSlice();
+}
+
+fn appendJsonLine(io: std.Io, path: []const u8, raw_json: []const u8) !void {
+    var file = try std.Io.Dir.cwd().openFile(io, path, .{
+        .mode = .write_only,
+        .allow_directory = false,
+    });
+    defer file.close(io);
+    const stats = try file.stat(io);
+    var buffer: [4096]u8 = undefined;
+    var writer = std.Io.File.Writer.init(file, io, &buffer);
+    try writer.seekTo(stats.size);
+    try writer.interface.writeAll(raw_json);
+    try writer.interface.writeByte('\n');
+    try writer.flush();
+}
+
+fn messageRoleEquals(
+    scratch_allocator: std.mem.Allocator,
+    raw_json: []const u8,
+    expected: []const u8,
+) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, scratch_allocator, raw_json, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const message_value = parsed.value.object.get("message") orelse return false;
+    if (message_value != .object) return false;
+    const role = optionalString(message_value.object, "role") orelse return false;
+    return std.mem.eql(u8, role, expected);
 }
 
 pub fn isValidSessionId(id: []const u8) bool {
@@ -864,6 +1484,74 @@ fn expectTimestampedSessionBasename(path: []const u8, id: []const u8) !void {
     try std.testing.expectEqual(@as(u8, '_'), basename[24]);
     try std.testing.expectEqualStrings(id, basename[25 .. 25 + id.len]);
     try std.testing.expectEqualStrings(".jsonl", basename[25 + id.len ..]);
+}
+
+fn testUserMessageJsonAlloc(allocator: std.mem.Allocator, content: []const u8, timestamp_ms: i64) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    var json: std.json.Stringify = .{ .writer = &output.writer };
+    try json.beginObject();
+    try json.objectField("role");
+    try json.write("user");
+    try json.objectField("content");
+    try json.write(content);
+    try json.objectField("timestamp");
+    try json.write(timestamp_ms);
+    try json.endObject();
+    return output.toOwnedSlice();
+}
+
+fn testAssistantMessageJsonAlloc(allocator: std.mem.Allocator, content: []const u8, timestamp_ms: i64) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    var json: std.json.Stringify = .{ .writer = &output.writer };
+    try json.beginObject();
+    try json.objectField("role");
+    try json.write("assistant");
+    try json.objectField("content");
+    try json.beginArray();
+    try json.beginObject();
+    try json.objectField("type");
+    try json.write("text");
+    try json.objectField("text");
+    try json.write(content);
+    try json.endObject();
+    try json.endArray();
+    try json.objectField("timestamp");
+    try json.write(timestamp_ms);
+    try json.endObject();
+    return output.toOwnedSlice();
+}
+
+fn createPersistedTestSession(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    session_dir: []const u8,
+    cwd: []const u8,
+    label: []const u8,
+    name: ?[]const u8,
+) ![]u8 {
+    var session = try SessionManager.create(allocator, io, cwd, session_dir, .{});
+    defer session.deinit();
+
+    const started = std.Io.Clock.real.now(io).toMilliseconds();
+    const user_json = try testUserMessageJsonAlloc(allocator, label, started);
+    defer allocator.free(user_json);
+    _ = try session.appendMessageJson(io, user_json);
+
+    if (name) |session_name| {
+        _ = try session.appendSessionInfo(io, session_name);
+    }
+
+    const reply = try std.fmt.allocPrint(allocator, "reply to {s}", .{label});
+    defer allocator.free(reply);
+    const assistant_json = try testAssistantMessageJsonAlloc(allocator, reply, started + 1);
+    defer allocator.free(assistant_json);
+    _ = try session.appendMessageJson(io, assistant_json);
+
+    const session_file = session.getSessionFile().?;
+    try std.Io.Dir.cwd().access(io, session_file, .{});
+    return allocator.dupe(u8, session_file);
 }
 
 // Ported from packages/coding-agent/src/core/session-manager.ts default directory helpers.
@@ -1353,6 +2041,82 @@ test "SessionManager continueRecentDefault uses encoded default session director
     ));
     try std.testing.expectEqualStrings(default_dir, session.getSessionDir());
     try std.testing.expectEqualStrings(default_dir, std.fs.path.dirname(session.getSessionFile().?).?);
+}
+
+test "SessionManager custom flat session directory scopes current-folder APIs while listing all flat sessions" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tempDirPathAlloc(allocator, &tmp);
+    defer allocator.free(tmp_path);
+    const project_a = try std.fs.path.join(allocator, &.{ tmp_path, "project-a" });
+    defer allocator.free(project_a);
+    const project_b = try std.fs.path.join(allocator, &.{ tmp_path, "project-b" });
+    defer allocator.free(project_b);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, project_a);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, project_b);
+
+    const session_a = try createPersistedTestSession(
+        allocator,
+        std.testing.io,
+        tmp_path,
+        project_a,
+        "from A",
+        "  A session  ",
+    );
+    defer allocator.free(session_a);
+    try std.Io.sleep(std.testing.io, .fromMilliseconds(20), .awake);
+    const session_b = try createPersistedTestSession(
+        allocator,
+        std.testing.io,
+        tmp_path,
+        project_b,
+        "from B",
+        null,
+    );
+    defer allocator.free(session_b);
+
+    var current_a = try SessionManager.list(
+        allocator,
+        std.testing.io,
+        project_a,
+        tmp_path,
+        tmp_path,
+    );
+    defer current_a.deinit();
+    try std.testing.expectEqual(@as(usize, 1), current_a.sessions.len);
+    try std.testing.expectEqualStrings(session_a, current_a.sessions[0].path);
+    try std.testing.expectEqualStrings(project_a, current_a.sessions[0].cwd);
+    try std.testing.expectEqualStrings("A session", current_a.sessions[0].name.?);
+    try std.testing.expectEqual(@as(usize, 2), current_a.sessions[0].message_count);
+    try std.testing.expectEqualStrings("from A", current_a.sessions[0].first_message);
+    try std.testing.expectEqualStrings("from A reply to from A", current_a.sessions[0].all_messages_text);
+
+    var all = try SessionManager.listAll(
+        allocator,
+        std.testing.io,
+        tmp_path,
+        tmp_path,
+    );
+    defer all.deinit();
+    try std.testing.expectEqual(@as(usize, 2), all.sessions.len);
+    var saw_a = false;
+    var saw_b = false;
+    for (all.sessions) |info| {
+        if (std.mem.eql(u8, info.path, session_a)) saw_a = true;
+        if (std.mem.eql(u8, info.path, session_b)) saw_b = true;
+    }
+    try std.testing.expect(saw_a);
+    try std.testing.expect(saw_b);
+
+    var continued_a = try SessionManager.continueRecent(
+        allocator,
+        std.testing.io,
+        project_a,
+        tmp_path,
+    );
+    defer continued_a.deinit();
+    try std.testing.expectEqualStrings(session_a, continued_a.getSessionFile().?);
 }
 
 test "SessionManager opens persisted sessions and exposes header and entries" {
