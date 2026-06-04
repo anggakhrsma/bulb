@@ -126,6 +126,11 @@ const VisualLine = struct {
     length: usize,
 };
 
+const PasteEntry = struct {
+    id: usize,
+    content: []u8,
+};
+
 pub const Editor = struct {
     allocator: std.mem.Allocator,
     lines: std.ArrayList([]u8) = .empty,
@@ -144,10 +149,13 @@ pub const Editor = struct {
     kill_ring: kill_ring.KillRing,
     last_action: ?LastAction = null,
     undo_stack: undo_stack.UndoStack(EditorState),
+    pastes: std.ArrayList(PasteEntry) = .empty,
+    paste_counter: usize = 0,
     paste_buffer: std.ArrayList(u8) = .empty,
     is_in_paste: bool = false,
     jump_mode: ?JumpMode = null,
     preferred_visual_col: ?usize = null,
+    snapped_from_cursor_col: ?usize = null,
     autocomplete_provider: ?autocomplete.AutocompleteProvider = null,
     autocomplete_state: ?AutocompleteState = null,
     autocomplete_items: []autocomplete.AutocompleteItem = &.{},
@@ -177,6 +185,8 @@ pub const Editor = struct {
         self.history.deinit(self.allocator);
         self.kill_ring.deinit();
         self.undo_stack.deinit();
+        self.freePastes();
+        self.pastes.deinit(self.allocator);
         self.paste_buffer.deinit(self.allocator);
     }
 
@@ -210,7 +220,9 @@ pub const Editor = struct {
     }
 
     pub fn getExpandedText(self: *const Editor, allocator: std.mem.Allocator) ![]u8 {
-        return self.getText(allocator);
+        const text = try self.getText(allocator);
+        defer allocator.free(text);
+        return self.expandPasteMarkers(allocator, text);
     }
 
     pub fn getLines(self: *const Editor, allocator: std.mem.Allocator) ![][]u8 {
@@ -729,6 +741,39 @@ pub const Editor = struct {
             pos += decoded_cp.len;
         }
 
+        if (filtered.items.len > 0 and isPathLikePasteStart(filtered.items[0])) {
+            const line = self.currentLine();
+            if (self.cursor_col > 0 and isAsciiWordByte(line[self.cursor_col - 1])) {
+                try filtered.insert(self.allocator, 0, ' ');
+            }
+        }
+
+        const pasted_line_count = countSplitLines(filtered.items);
+        if (pasted_line_count > 10 or filtered.items.len > 1000) {
+            self.paste_counter += 1;
+            const paste_id = self.paste_counter;
+            const owned_content = try self.allocator.dupe(u8, filtered.items);
+            errdefer self.allocator.free(owned_content);
+
+            try self.pastes.append(self.allocator, .{ .id = paste_id, .content = owned_content });
+            var entry_owned = true;
+            errdefer if (entry_owned) {
+                const removed = self.pastes.pop().?;
+                self.allocator.free(removed.content);
+                self.paste_counter -= 1;
+            };
+
+            const marker = if (pasted_line_count > 10)
+                try std.fmt.allocPrint(self.allocator, "[paste #{d} +{d} lines]", .{ paste_id, pasted_line_count })
+            else
+                try std.fmt.allocPrint(self.allocator, "[paste #{d} {d} chars]", .{ paste_id, filtered.items.len });
+            defer self.allocator.free(marker);
+
+            try self.insertTextAtCursorInternal(marker);
+            entry_owned = false;
+            return;
+        }
+
         try self.insertTextAtCursorInternal(filtered.items);
     }
 
@@ -820,6 +865,8 @@ pub const Editor = struct {
         self.scroll_offset = 0;
         self.undo_stack.clear();
         self.last_action = null;
+        self.freePastes();
+        self.paste_counter = 0;
 
         try self.emitChange();
         if (self.on_submit) |callback| callback.call(trimmed);
@@ -832,7 +879,7 @@ pub const Editor = struct {
         if (self.cursor_col > 0) {
             try self.pushUndoSnapshot();
             const line = self.currentLine();
-            const start = prevGraphemeStart(line, self.cursor_col);
+            const start = self.prevSegmentStart(line, self.cursor_col);
             const replacement = try std.mem.concat(self.allocator, u8, &.{ line[0..start], line[self.cursor_col..] });
             self.allocator.free(self.currentLineMut().*);
             self.currentLineMut().* = replacement;
@@ -863,7 +910,7 @@ pub const Editor = struct {
         const line = self.currentLine();
         if (self.cursor_col < line.len) {
             try self.pushUndoSnapshot();
-            const end = nextGraphemeEnd(line, self.cursor_col);
+            const end = self.nextSegmentEnd(line, self.cursor_col);
             const replacement = try std.mem.concat(self.allocator, u8, &.{ line[0..self.cursor_col], line[end..] });
             self.allocator.free(self.currentLineMut().*);
             self.currentLineMut().* = replacement;
@@ -962,7 +1009,7 @@ pub const Editor = struct {
         } else {
             try self.pushUndoSnapshot();
             const was_kill = self.last_action == .kill;
-            const delete_from = findWordBackwardEditor(current_line, self.cursor_col);
+            const delete_from = self.findWordBackward(current_line, self.cursor_col);
             try self.kill_ring.push(current_line[delete_from..self.cursor_col], .{ .prepend = true, .accumulate = was_kill });
             self.last_action = .kill;
 
@@ -991,7 +1038,7 @@ pub const Editor = struct {
         } else {
             try self.pushUndoSnapshot();
             const was_kill = self.last_action == .kill;
-            const delete_to = findWordForwardEditor(current_line, self.cursor_col);
+            const delete_to = self.findWordForward(current_line, self.cursor_col);
             try self.kill_ring.push(current_line[self.cursor_col..delete_to], .{ .prepend = false, .accumulate = was_kill });
             self.last_action = .kill;
 
@@ -1103,7 +1150,7 @@ pub const Editor = struct {
             }
             return;
         }
-        self.setCursorCol(findWordBackwardEditor(self.currentLine(), self.cursor_col));
+        self.setCursorCol(self.findWordBackward(self.currentLine(), self.cursor_col));
     }
 
     fn moveWordForwards(self: *Editor) void {
@@ -1115,7 +1162,7 @@ pub const Editor = struct {
             }
             return;
         }
-        self.setCursorCol(findWordForwardEditor(self.currentLine(), self.cursor_col));
+        self.setCursorCol(self.findWordForward(self.currentLine(), self.cursor_col));
     }
 
     fn jumpToChar(self: *Editor, char: []const u8, direction: JumpMode) void {
@@ -1367,7 +1414,7 @@ pub const Editor = struct {
         const line = self.currentLine();
         if (direction > 0) {
             if (self.cursor_col < line.len) {
-                self.setCursorCol(nextGraphemeEnd(line, self.cursor_col));
+                self.setCursorCol(self.nextSegmentEnd(line, self.cursor_col));
             } else if (self.cursor_line + 1 < self.lines.items.len) {
                 self.cursor_line += 1;
                 self.setCursorCol(0);
@@ -1380,7 +1427,7 @@ pub const Editor = struct {
             }
         } else {
             if (self.cursor_col > 0) {
-                self.setCursorCol(prevGraphemeStart(line, self.cursor_col));
+                self.setCursorCol(self.prevSegmentStart(line, self.cursor_col));
             } else if (self.cursor_line > 0) {
                 self.cursor_line -= 1;
                 self.setCursorCol(self.currentLine().len);
@@ -1420,7 +1467,10 @@ pub const Editor = struct {
         if (current >= visual_lines.len or target_index >= visual_lines.len) return;
         const current_vl = visual_lines[current];
         const target_vl = visual_lines[target_index];
-        const current_visual_col = self.cursor_col -| current_vl.start_col;
+        const current_visual_col = if (self.snapped_from_cursor_col) |snapped_col| blk: {
+            const snapped_visual_line = self.findVisualLineAt(visual_lines, current_vl.logical_line, snapped_col);
+            break :blk snapped_col -| visual_lines[snapped_visual_line].start_col;
+        } else self.cursor_col -| current_vl.start_col;
 
         const source_is_last_segment = current + 1 >= visual_lines.len or visual_lines[current + 1].logical_line != current_vl.logical_line;
         const source_max_visual_col = if (source_is_last_segment) current_vl.length else current_vl.length -| 1;
@@ -1432,6 +1482,36 @@ pub const Editor = struct {
         self.cursor_line = target_vl.logical_line;
         const target_line = self.currentLine();
         self.cursor_col = clampToUtf8Boundary(target_line, @min(target_col, target_line.len));
+
+        const segments = self.segmentLineWithPasteMarkers(self.allocator, target_line) catch return;
+        defer self.allocator.free(segments);
+        for (segments) |segment| {
+            if (segment.index > self.cursor_col) break;
+            if (segment.segment.len <= 1) continue;
+
+            const segment_end = segment.index + segment.segment.len;
+            if (self.cursor_col < segment_end) {
+                const is_continuation = segment.index < target_vl.start_col;
+                const is_moving_down = target_index > current;
+                if (is_continuation and is_moving_down) {
+                    var next_index = target_index + 1;
+                    while (next_index < visual_lines.len and
+                        visual_lines[next_index].logical_line == target_vl.logical_line and
+                        visual_lines[next_index].start_col < segment_end) : (next_index += 1)
+                    {}
+                    if (next_index < visual_lines.len) {
+                        self.moveToVisualLine(visual_lines, current, next_index);
+                        return;
+                    }
+                }
+
+                self.snapped_from_cursor_col = self.cursor_col;
+                self.cursor_col = segment.index;
+                return;
+            }
+        }
+
+        self.snapped_from_cursor_col = null;
     }
 
     fn computeVerticalMoveColumn(
@@ -1467,6 +1547,7 @@ pub const Editor = struct {
         const line = self.currentLine();
         self.cursor_col = clampToUtf8Boundary(line, @min(col, line.len));
         self.preferred_visual_col = null;
+        self.snapped_from_cursor_col = null;
     }
 
     fn buildVisualLineMap(self: *Editor, allocator: std.mem.Allocator, width: usize) ![]VisualLine {
@@ -1479,7 +1560,9 @@ pub const Editor = struct {
             } else if (visibleWidth(line) <= width) {
                 try visual_lines.append(allocator, .{ .logical_line = logical_line, .start_col = 0, .length = line.len });
             } else {
-                const chunks = try wordWrapLine(allocator, line, width, null);
+                const segments = try self.segmentLineWithPasteMarkers(allocator, line);
+                defer allocator.free(segments);
+                const chunks = try wordWrapLine(allocator, line, width, segments);
                 defer allocator.free(chunks);
                 for (chunks) |chunk| {
                     try visual_lines.append(allocator, .{
@@ -1530,7 +1613,9 @@ pub const Editor = struct {
                 continue;
             }
 
-            const chunks = try wordWrapLine(allocator, line, content_width, null);
+            const segments = try self.segmentLineWithPasteMarkers(allocator, line);
+            defer allocator.free(segments);
+            const chunks = try wordWrapLine(allocator, line, content_width, segments);
             defer allocator.free(chunks);
             for (chunks, 0..) |chunk, chunk_index| {
                 const is_last_chunk = chunk_index + 1 == chunks.len;
@@ -1576,7 +1661,7 @@ pub const Editor = struct {
             try with_cursor.appendSlice(allocator, display.items[0..cursor_pos]);
             if (self.focused) try with_cursor.appendSlice(allocator, CURSOR_MARKER);
             if (cursor_pos < display.items.len) {
-                const cursor_end = nextGraphemeEnd(display.items, cursor_pos);
+                const cursor_end = self.nextSegmentEnd(display.items, cursor_pos);
                 try with_cursor.appendSlice(allocator, "\x1b[7m");
                 try with_cursor.appendSlice(allocator, display.items[cursor_pos..cursor_end]);
                 try with_cursor.appendSlice(allocator, RESET);
@@ -1596,6 +1681,138 @@ pub const Editor = struct {
         try appendSpaces(allocator, &output, content_width -| line_visible_width);
         try output.appendSlice(allocator, right_padding);
         return output.toOwnedSlice(allocator);
+    }
+
+    fn expandPasteMarkers(self: *const Editor, allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+        var expanded: std.ArrayList(u8) = .empty;
+        errdefer expanded.deinit(allocator);
+
+        var index: usize = 0;
+        while (index < text.len) {
+            if (parsePasteMarkerAt(text, index)) |marker| {
+                if (self.pasteContent(marker.id)) |content| {
+                    try expanded.appendSlice(allocator, content);
+                    index += marker.len;
+                    continue;
+                }
+            }
+
+            try expanded.append(allocator, text[index]);
+            index += 1;
+        }
+
+        return expanded.toOwnedSlice(allocator);
+    }
+
+    fn freePastes(self: *Editor) void {
+        for (self.pastes.items) |entry| self.allocator.free(entry.content);
+        self.pastes.clearRetainingCapacity();
+    }
+
+    fn pasteContent(self: *const Editor, id: usize) ?[]const u8 {
+        for (self.pastes.items) |entry| {
+            if (entry.id == id) return entry.content;
+        }
+        return null;
+    }
+
+    fn hasPasteId(self: *const Editor, id: usize) bool {
+        return self.pasteContent(id) != null;
+    }
+
+    fn segmentLineWithPasteMarkers(self: *const Editor, allocator: std.mem.Allocator, line: []const u8) ![]SegmentData {
+        if (self.pastes.items.len == 0 or std.mem.indexOf(u8, line, "[paste #") == null) {
+            return segmentGraphemes(allocator, line);
+        }
+
+        var segments: std.ArrayList(SegmentData) = .empty;
+        errdefer segments.deinit(allocator);
+
+        var index: usize = 0;
+        while (index < line.len) {
+            if (parsePasteMarkerAt(line, index)) |marker| {
+                if (self.hasPasteId(marker.id)) {
+                    const end = index + marker.len;
+                    try segments.append(allocator, .{ .segment = line[index..end], .index = index });
+                    index = end;
+                    continue;
+                }
+            }
+
+            const end = nextGraphemeEnd(line, index);
+            if (end <= index) {
+                index += 1;
+                continue;
+            }
+            try segments.append(allocator, .{ .segment = line[index..end], .index = index });
+            index = end;
+        }
+
+        return segments.toOwnedSlice(allocator);
+    }
+
+    fn nextSegmentEnd(self: *const Editor, line: []const u8, cursor: usize) usize {
+        const start = @min(cursor, line.len);
+        if (parsePasteMarkerAt(line, start)) |marker| {
+            if (self.hasPasteId(marker.id)) return start + marker.len;
+        }
+        return nextGraphemeEnd(line, start);
+    }
+
+    fn prevSegmentStart(self: *const Editor, line: []const u8, cursor: usize) usize {
+        const target = @min(cursor, line.len);
+        if (self.pasteMarkerSpanContaining(line, target)) |span| return span.start;
+        return prevGraphemeStart(line, target);
+    }
+
+    fn pasteMarkerSpanContaining(self: *const Editor, line: []const u8, cursor: usize) ?struct { start: usize, end: usize } {
+        if (self.pastes.items.len == 0 or cursor == 0 or std.mem.indexOf(u8, line, "[paste #") == null) return null;
+
+        var index: usize = 0;
+        while (index < line.len and index < cursor) {
+            if (parsePasteMarkerAt(line, index)) |marker| {
+                const end = index + marker.len;
+                if (self.hasPasteId(marker.id)) {
+                    if (cursor > index and cursor <= end) return .{ .start = index, .end = end };
+                    index = end;
+                    continue;
+                }
+            }
+            const next = nextGraphemeEnd(line, index);
+            index = if (next > index) next else index + 1;
+        }
+        return null;
+    }
+
+    fn findWordForward(self: *const Editor, text: []const u8, cursor: usize) usize {
+        var index = @min(cursor, text.len);
+        while (index < text.len) {
+            const end = self.nextSegmentEnd(text, index);
+            const segment = text[index..end];
+            if (isPasteMarker(segment) or !isWhitespaceText(segment)) break;
+            index = end;
+        }
+        if (index >= text.len) return text.len;
+
+        if (parsePasteMarkerAt(text, index)) |marker| {
+            if (self.hasPasteId(marker.id)) return index + marker.len;
+        }
+
+        return findWordForwardEditor(text, index);
+    }
+
+    fn findWordBackward(self: *const Editor, text: []const u8, cursor: usize) usize {
+        var index = @min(cursor, text.len);
+        while (index > 0) {
+            const start = self.prevSegmentStart(text, index);
+            const segment = text[start..index];
+            if (isPasteMarker(segment) or !isWhitespaceText(segment)) break;
+            index = start;
+        }
+        if (index == 0) return 0;
+
+        if (self.pasteMarkerSpanContaining(text, index)) |span| return span.start;
+        return findWordBackwardEditor(text, index);
     }
 
     fn emitChange(self: *Editor) !void {
@@ -1762,6 +1979,25 @@ fn normalizeText(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
     return normalized.toOwnedSlice(allocator);
 }
 
+fn countSplitLines(text: []const u8) usize {
+    var count: usize = 1;
+    for (text) |byte| {
+        if (byte == '\n') count += 1;
+    }
+    return count;
+}
+
+fn isPathLikePasteStart(byte: u8) bool {
+    return byte == '/' or byte == '~' or byte == '.';
+}
+
+fn isAsciiWordByte(byte: u8) bool {
+    return (byte >= 'a' and byte <= 'z') or
+        (byte >= 'A' and byte <= 'Z') or
+        (byte >= '0' and byte <= '9') or
+        byte == '_';
+}
+
 fn segmentGraphemes(allocator: std.mem.Allocator, text: []const u8) ![]SegmentData {
     var segments: std.ArrayList(SegmentData) = .empty;
     errdefer segments.deinit(allocator);
@@ -1778,9 +2014,52 @@ fn segmentGraphemes(allocator: std.mem.Allocator, text: []const u8) ![]SegmentDa
     return segments.toOwnedSlice(allocator);
 }
 
+const PasteMarkerMatch = struct {
+    id: usize,
+    len: usize,
+};
+
+fn parsePasteMarkerAt(text: []const u8, start: usize) ?PasteMarkerMatch {
+    const prefix = "[paste #";
+    if (start >= text.len or !std.mem.startsWith(u8, text[start..], prefix)) return null;
+
+    var index = start + prefix.len;
+    const id_start = index;
+    while (index < text.len and std.ascii.isDigit(text[index])) : (index += 1) {}
+    if (index == id_start) return null;
+
+    const id = std.fmt.parseInt(usize, text[id_start..index], 10) catch return null;
+    if (index >= text.len) return null;
+
+    if (text[index] == ']') {
+        return .{ .id = id, .len = index + 1 - start };
+    }
+
+    if (text[index] != ' ') return null;
+    index += 1;
+    if (index >= text.len) return null;
+
+    if (text[index] == '+') {
+        index += 1;
+        const count_start = index;
+        while (index < text.len and std.ascii.isDigit(text[index])) : (index += 1) {}
+        if (index == count_start) return null;
+        if (!std.mem.startsWith(u8, text[index..], " lines]")) return null;
+        index += " lines]".len;
+        return .{ .id = id, .len = index - start };
+    }
+
+    const count_start = index;
+    while (index < text.len and std.ascii.isDigit(text[index])) : (index += 1) {}
+    if (index == count_start) return null;
+    if (!std.mem.startsWith(u8, text[index..], " chars]")) return null;
+    index += " chars]".len;
+    return .{ .id = id, .len = index - start };
+}
+
 fn isPasteMarker(segment: []const u8) bool {
-    if (!std.mem.startsWith(u8, segment, "[paste #") or !std.mem.endsWith(u8, segment, "]")) return false;
-    return std.mem.indexOfScalar(u8, segment, '#') != null;
+    const marker = parsePasteMarkerAt(segment, 0) orelse return false;
+    return marker.len == segment.len;
 }
 
 fn extractAnsiCode(input: []const u8, pos: usize) ?struct { code: []const u8, length: usize } {
@@ -2482,6 +2761,66 @@ fn modelArgumentCompletions(
 ) !?[]autocomplete.AutocompleteItem {
     return try cloneAutocompleteItems(allocator, &.{.{ .value = "claude-opus", .label = "claude-opus" }});
 }
+
+const PasteMarkerSpan = struct {
+    start: usize,
+    len: usize,
+};
+
+fn firstPasteMarkerSpan(text: []const u8) ?PasteMarkerSpan {
+    var index: usize = 0;
+    while (index < text.len) : (index += 1) {
+        if (parsePasteMarkerAt(text, index)) |marker| {
+            return .{ .start = index, .len = marker.len };
+        }
+    }
+    return null;
+}
+
+fn pasteBracketed(editor: *Editor, allocator: std.mem.Allocator, text: []const u8) !void {
+    const input = try std.mem.concat(allocator, u8, &.{ BRACKETED_PASTE_START, text, BRACKETED_PASTE_END });
+    defer allocator.free(input);
+    try editor.handleInput(input);
+}
+
+fn linePaste(allocator: std.mem.Allocator, count: usize) ![]u8 {
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(allocator);
+    var index: usize = 0;
+    while (index < count) : (index += 1) {
+        if (index > 0) try output.append(allocator, '\n');
+        try output.appendSlice(allocator, "line");
+    }
+    return output.toOwnedSlice(allocator);
+}
+
+fn repeatedByte(allocator: std.mem.Allocator, byte: u8, count: usize) ![]u8 {
+    const output = try allocator.alloc(u8, count);
+    @memset(output, byte);
+    return output;
+}
+
+fn expectRenderedWithinWidth(editor: *Editor, allocator: std.mem.Allocator, width: usize) !void {
+    const rendered = try editor.render(allocator, width);
+    defer allocator.free(rendered);
+    defer freeRenderedLines(allocator, rendered);
+    for (rendered) |line| try std.testing.expect(visibleWidth(line) <= width);
+}
+
+const SubmitCapture = struct {
+    allocator: std.mem.Allocator,
+    submitted: ?[]u8 = null,
+
+    fn deinit(self: *SubmitCapture) void {
+        if (self.submitted) |submitted| self.allocator.free(submitted);
+    }
+
+    fn submit(raw: ?*anyopaque, value: []const u8) void {
+        const self: *SubmitCapture = @ptrCast(@alignCast(raw.?));
+        if (self.submitted) |previous| self.allocator.free(previous);
+        self.submitted = self.allocator.dupe(u8, value) catch unreachable;
+    }
+};
 
 test "Editor prompt history navigation" {
     const allocator = std.testing.allocator;
@@ -3503,5 +3842,352 @@ test "Editor sticky column" {
         try std.testing.expectEqual(Cursor{ .line = 2, .col = 2 }, editor.getCursor());
         try editor.handleInput("\x1b[A");
         try std.testing.expectEqual(Cursor{ .line = 1, .col = 8 }, editor.getCursor());
+    }
+}
+
+test "Editor paste marker atomic behavior" {
+    const allocator = std.testing.allocator;
+    defer keybindings.resetGlobalKeybindings(allocator);
+
+    {
+        var editor = try Editor.init(allocator, .{});
+        defer editor.deinit();
+        const big = try linePaste(allocator, 20);
+        defer allocator.free(big);
+        try pasteBracketed(&editor, allocator, big);
+
+        const text = try editor.getText(allocator);
+        defer allocator.free(text);
+        const marker = firstPasteMarkerSpan(text) orelse return error.TestExpectedEqual;
+        try std.testing.expectEqualStrings("[paste #1 +20 lines]", text[marker.start .. marker.start + marker.len]);
+    }
+    {
+        var editor = try Editor.init(allocator, .{});
+        defer editor.deinit();
+        const big = try linePaste(allocator, 20);
+        defer allocator.free(big);
+        try editor.handleInput("A");
+        try pasteBracketed(&editor, allocator, big);
+        try editor.handleInput("B");
+
+        const text = try editor.getText(allocator);
+        defer allocator.free(text);
+        const marker = firstPasteMarkerSpan(text) orelse return error.TestExpectedEqual;
+
+        try editor.handleInput("\x01");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = 0 }, editor.getCursor());
+        try editor.handleInput("\x1b[C");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = 1 }, editor.getCursor());
+        try editor.handleInput("\x1b[C");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = 1 + marker.len }, editor.getCursor());
+        try editor.handleInput("\x1b[C");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = 1 + marker.len + 1 }, editor.getCursor());
+    }
+    {
+        var editor = try Editor.init(allocator, .{});
+        defer editor.deinit();
+        const big = try linePaste(allocator, 20);
+        defer allocator.free(big);
+        try editor.handleInput("A");
+        try pasteBracketed(&editor, allocator, big);
+        try editor.handleInput("B");
+
+        const text = try editor.getText(allocator);
+        defer allocator.free(text);
+        const marker = firstPasteMarkerSpan(text) orelse return error.TestExpectedEqual;
+
+        try editor.handleInput("\x1b[D");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = 1 + marker.len }, editor.getCursor());
+        try editor.handleInput("\x1b[D");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = 1 }, editor.getCursor());
+        try editor.handleInput("\x1b[D");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = 0 }, editor.getCursor());
+    }
+    {
+        var editor = try Editor.init(allocator, .{});
+        defer editor.deinit();
+        const big = try linePaste(allocator, 20);
+        defer allocator.free(big);
+        try editor.handleInput("A");
+        try pasteBracketed(&editor, allocator, big);
+        try editor.handleInput("B");
+
+        const text = try editor.getText(allocator);
+        defer allocator.free(text);
+        const marker = firstPasteMarkerSpan(text) orelse return error.TestExpectedEqual;
+
+        try editor.handleInput("\x01");
+        try editor.handleInput("\x1b[C");
+        try editor.handleInput("\x1b[C");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = 1 + marker.len }, editor.getCursor());
+        try editor.handleInput("\x7f");
+        try expectText(&editor, "AB");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = 1 }, editor.getCursor());
+    }
+    {
+        var editor = try Editor.init(allocator, .{});
+        defer editor.deinit();
+        const big = try linePaste(allocator, 20);
+        defer allocator.free(big);
+        try editor.handleInput("A");
+        try pasteBracketed(&editor, allocator, big);
+        try editor.handleInput("B");
+
+        try editor.handleInput("\x01");
+        try editor.handleInput("\x1b[C");
+        try editor.handleInput("\x1b[3~");
+        try expectText(&editor, "AB");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = 1 }, editor.getCursor());
+    }
+    {
+        var editor = try Editor.init(allocator, .{});
+        defer editor.deinit();
+        const big = try linePaste(allocator, 20);
+        defer allocator.free(big);
+        try editor.handleInput("X");
+        try editor.handleInput(" ");
+        try pasteBracketed(&editor, allocator, big);
+        try editor.handleInput(" ");
+        try editor.handleInput("Y");
+
+        const text = try editor.getText(allocator);
+        defer allocator.free(text);
+        const marker = firstPasteMarkerSpan(text) orelse return error.TestExpectedEqual;
+
+        try editor.handleInput("\x01");
+        try editor.handleInput("\x1b[1;5C");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = 1 }, editor.getCursor());
+        try editor.handleInput("\x1b[1;5C");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = 2 + marker.len }, editor.getCursor());
+    }
+    {
+        var editor = try Editor.init(allocator, .{});
+        defer editor.deinit();
+        const big = try linePaste(allocator, 20);
+        defer allocator.free(big);
+        try editor.handleInput("A");
+        try pasteBracketed(&editor, allocator, big);
+        try editor.handleInput("B");
+
+        const before = try editor.getText(allocator);
+        defer allocator.free(before);
+        try editor.handleInput("\x01");
+        try editor.handleInput("\x1b[C");
+        try editor.handleInput("\x1b[C");
+        try editor.handleInput("\x7f");
+        try expectText(&editor, "AB");
+        try editor.handleInput("\x1b[45;5u");
+        try expectText(&editor, before);
+    }
+    {
+        var editor = try Editor.init(allocator, .{});
+        defer editor.deinit();
+        const big = try linePaste(allocator, 20);
+        defer allocator.free(big);
+        try pasteBracketed(&editor, allocator, big);
+        try editor.handleInput(" ");
+        try pasteBracketed(&editor, allocator, big);
+
+        const text = try editor.getText(allocator);
+        defer allocator.free(text);
+        const first = firstPasteMarkerSpan(text) orelse return error.TestExpectedEqual;
+        const second_start = first.start + first.len + 1;
+        const second = parsePasteMarkerAt(text, second_start) orelse return error.TestExpectedEqual;
+
+        try editor.handleInput("\x01");
+        try editor.handleInput("\x1b[C");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = first.len }, editor.getCursor());
+        try editor.handleInput("\x1b[C");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = first.len + 1 }, editor.getCursor());
+        try editor.handleInput("\x1b[C");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = first.len + 1 + second.len }, editor.getCursor());
+    }
+    {
+        var editor = try Editor.init(allocator, .{});
+        defer editor.deinit();
+        try typeText(&editor, "[paste #99 +5 lines]");
+        try expectText(&editor, "[paste #99 +5 lines]");
+        try editor.handleInput("\x01");
+        try editor.handleInput("\x1b[C");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = 1 }, editor.getCursor());
+    }
+    {
+        var editor = try Editor.init(allocator, .{});
+        defer editor.deinit();
+        const big = try linePaste(allocator, 47);
+        defer allocator.free(big);
+        try pasteBracketed(&editor, allocator, big);
+
+        const text = try editor.getText(allocator);
+        defer allocator.free(text);
+        const marker = firstPasteMarkerSpan(text) orelse return error.TestExpectedEqual;
+        try std.testing.expect(visibleWidth(text[marker.start .. marker.start + marker.len]) > 8);
+        try expectRenderedWithinWidth(&editor, allocator, 8);
+    }
+    {
+        var editor = try Editor.init(allocator, .{});
+        defer editor.deinit();
+        var index: usize = 0;
+        while (index < 35) : (index += 1) try editor.handleInput("b");
+        const big = try linePaste(allocator, 27);
+        defer allocator.free(big);
+        try pasteBracketed(&editor, allocator, big);
+        index = 0;
+        while (index < 4) : (index += 1) try editor.handleInput("b");
+        index = 0;
+        while (index < 5) : (index += 1) try editor.handleInput("\x1b[D");
+        try expectRenderedWithinWidth(&editor, allocator, 54);
+    }
+    {
+        var editor = try Editor.init(allocator, .{});
+        defer editor.deinit();
+        try editor.handleInput(" ");
+        var index: usize = 0;
+        while (index < 35) : (index += 1) try editor.handleInput("b");
+        const big = try linePaste(allocator, 27);
+        defer allocator.free(big);
+        try pasteBracketed(&editor, allocator, big);
+        index = 0;
+        while (index < 4) : (index += 1) try editor.handleInput("b");
+        try expectRenderedWithinWidth(&editor, allocator, 54);
+    }
+    {
+        var editor = try Editor.init(allocator, .{});
+        defer editor.deinit();
+        const pasted_text =
+            "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9\nline 10\n" ++
+            "tokens $1 $2 $& $$ $` $' end";
+        try pasteBracketed(&editor, allocator, pasted_text);
+        {
+            const text = try editor.getText(allocator);
+            defer allocator.free(text);
+            try std.testing.expect(firstPasteMarkerSpan(text) != null);
+        }
+        const expanded = try editor.getExpandedText(allocator);
+        defer allocator.free(expanded);
+        try std.testing.expectEqualStrings(pasted_text, expanded);
+    }
+    {
+        var editor = try Editor.init(allocator, .{});
+        defer editor.deinit();
+        try editor.setText("12345678901234567890\n\nhello ");
+        const big = try repeatedByte(allocator, 'x', 2000);
+        defer allocator.free(big);
+        try pasteBracketed(&editor, allocator, big);
+        try expectRenderedWithinWidth(&editor, allocator, 80);
+
+        try editor.handleInput("\x1b[A");
+        try editor.handleInput("\x1b[A");
+        try editor.handleInput("\x01");
+        var index: usize = 0;
+        while (index < 10) : (index += 1) try editor.handleInput("\x1b[C");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = 10 }, editor.getCursor());
+        try editor.handleInput("\x1b[B");
+        try std.testing.expectEqual(Cursor{ .line = 1, .col = 0 }, editor.getCursor());
+        try editor.handleInput("\x1b[B");
+        try std.testing.expectEqual(Cursor{ .line = 2, .col = 6 }, editor.getCursor());
+    }
+    {
+        var editor = try Editor.init(allocator, .{ .terminal_rows = 24 });
+        defer editor.deinit();
+        try typeText(&editor, "1234567890123456");
+        try editor.handleInput("\n");
+        try editor.handleInput("\n");
+        const big = try repeatedByte(allocator, 'x', 2000);
+        defer allocator.free(big);
+        try pasteBracketed(&editor, allocator, big);
+        try editor.handleInput("\n");
+        try editor.handleInput("\n");
+        try typeText(&editor, "abcdefghijklmnop");
+        try expectRenderedWithinWidth(&editor, allocator, 30);
+
+        var index: usize = 0;
+        while (index < 4) : (index += 1) try editor.handleInput("\x1b[A");
+        try editor.handleInput("\x01");
+        index = 0;
+        while (index < 10) : (index += 1) try editor.handleInput("\x1b[C");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = 10 }, editor.getCursor());
+        try editor.handleInput("\x1b[B");
+        try std.testing.expectEqual(Cursor{ .line = 1, .col = 0 }, editor.getCursor());
+        try editor.handleInput("\x1b[B");
+        try std.testing.expectEqual(Cursor{ .line = 2, .col = 0 }, editor.getCursor());
+        try editor.handleInput("\x1b[B");
+        try std.testing.expectEqual(Cursor{ .line = 3, .col = 0 }, editor.getCursor());
+        try editor.handleInput("\x1b[B");
+        try std.testing.expectEqual(Cursor{ .line = 4, .col = 10 }, editor.getCursor());
+    }
+    {
+        var editor = try Editor.init(allocator, .{ .terminal_rows = 24 });
+        defer editor.deinit();
+        try typeText(&editor, "abcdefgh");
+        const big = try linePaste(allocator, 100);
+        defer allocator.free(big);
+        try pasteBracketed(&editor, allocator, big);
+        try typeText(&editor, "ijklmnopqr");
+        try editor.handleInput("\n");
+        try typeText(&editor, "123456789012345678");
+        try expectRenderedWithinWidth(&editor, allocator, 20);
+
+        const text = try editor.getText(allocator);
+        defer allocator.free(text);
+        const marker = firstPasteMarkerSpan(text) orelse return error.TestExpectedEqual;
+        const marker_start: usize = 8;
+        const marker_end = marker_start + marker.len;
+
+        try editor.handleInput("\x1b[A");
+        try editor.handleInput("\x01");
+        var index: usize = 0;
+        while (index < 6) : (index += 1) try editor.handleInput("\x1b[C");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = 6 }, editor.getCursor());
+        try editor.handleInput("\x1b[B");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = marker_start }, editor.getCursor());
+        try editor.handleInput("\x1b[B");
+        try std.testing.expectEqual(@as(usize, 0), editor.getCursor().line);
+        try std.testing.expectEqual(marker_end, editor.getCursor().col);
+        try editor.handleInput("\x1b[A");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = marker_start }, editor.getCursor());
+        try editor.handleInput("\x1b[A");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = 6 }, editor.getCursor());
+    }
+    {
+        var editor = try Editor.init(allocator, .{ .terminal_rows = 24 });
+        defer editor.deinit();
+        try typeText(&editor, "abcdefgh");
+        const big = try linePaste(allocator, 100);
+        defer allocator.free(big);
+        try pasteBracketed(&editor, allocator, big);
+        try typeText(&editor, "ijklmnopqr");
+        try editor.handleInput("\n");
+        try typeText(&editor, "123456789012345678");
+        try expectRenderedWithinWidth(&editor, allocator, 20);
+
+        try editor.handleInput("\x1b[A");
+        try editor.handleInput("\x01");
+        var index: usize = 0;
+        while (index < 3) : (index += 1) try editor.handleInput("\x1b[C");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = 3 }, editor.getCursor());
+        try editor.handleInput("\x1b[B");
+        try std.testing.expectEqual(@as(usize, 8), editor.getCursor().col);
+        try editor.handleInput("\x1b[B");
+        try std.testing.expectEqual(Cursor{ .line = 1, .col = 3 }, editor.getCursor());
+        try editor.handleInput("\x1b[A");
+        try std.testing.expectEqual(@as(usize, 8), editor.getCursor().col);
+        try editor.handleInput("\x1b[A");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = 3 }, editor.getCursor());
+    }
+    {
+        var editor = try Editor.init(allocator, .{});
+        defer editor.deinit();
+        const pasted_text =
+            "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9\nline 10\n" ++
+            "tokens $1 $2 $& $$ $` $' end";
+        var capture = SubmitCapture{ .allocator = allocator };
+        defer capture.deinit();
+        editor.on_submit = .{ .context = &capture, .call_fn = SubmitCapture.submit };
+
+        try pasteBracketed(&editor, allocator, pasted_text);
+        try editor.handleInput("\r");
+        try std.testing.expect(capture.submitted != null);
+        try std.testing.expectEqualStrings(pasted_text, capture.submitted.?);
     }
 }
