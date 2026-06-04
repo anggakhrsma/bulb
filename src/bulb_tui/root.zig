@@ -4434,6 +4434,451 @@ pub const CancellableLoader = struct {
     }
 };
 
+pub const SettingItem = struct {
+    id: []const u8,
+    label: []const u8,
+    description: ?[]const u8 = null,
+    current_value: []const u8,
+    values: []const []const u8 = &.{},
+    submenu: ?SettingsSubmenuFactory = null,
+};
+
+const OwnedSettingItem = struct {
+    id: []u8,
+    label: []u8,
+    description: ?[]u8 = null,
+    current_value: []u8,
+    values: [][]u8,
+    submenu: ?SettingsSubmenuFactory = null,
+
+    fn clone(allocator: std.mem.Allocator, item: SettingItem) !OwnedSettingItem {
+        var values = try allocator.alloc([]u8, item.values.len);
+        errdefer allocator.free(values);
+        var initialized: usize = 0;
+        errdefer {
+            for (values[0..initialized]) |value| allocator.free(value);
+        }
+        for (item.values, 0..) |value, index| {
+            values[index] = try allocator.dupe(u8, value);
+            initialized += 1;
+        }
+
+        return .{
+            .id = try allocator.dupe(u8, item.id),
+            .label = try allocator.dupe(u8, item.label),
+            .description = if (item.description) |description| try allocator.dupe(u8, description) else null,
+            .current_value = try allocator.dupe(u8, item.current_value),
+            .values = values,
+            .submenu = item.submenu,
+        };
+    }
+
+    fn deinit(self: *OwnedSettingItem, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+        allocator.free(self.label);
+        if (self.description) |description| allocator.free(description);
+        allocator.free(self.current_value);
+        for (self.values) |value| allocator.free(value);
+        allocator.free(self.values);
+    }
+
+    fn setValue(self: *OwnedSettingItem, allocator: std.mem.Allocator, value: []const u8) !void {
+        const owned = try allocator.dupe(u8, value);
+        allocator.free(self.current_value);
+        self.current_value = owned;
+    }
+};
+
+pub const SettingsListSelectableStyle = struct {
+    ptr: ?*anyopaque = null,
+    apply_fn: *const fn (?*anyopaque, std.mem.Allocator, []const u8, bool) anyerror![]u8 = identitySettingsSelectableStyle,
+
+    pub fn apply(self: SettingsListSelectableStyle, allocator: std.mem.Allocator, text: []const u8, selected: bool) ![]u8 {
+        return self.apply_fn(self.ptr, allocator, text, selected);
+    }
+};
+
+pub const SettingsListTheme = struct {
+    label: SettingsListSelectableStyle = .{},
+    value: SettingsListSelectableStyle = .{},
+    description: TextStyle = .{},
+    cursor: []const u8 = "\u{2192} ",
+    hint: TextStyle = .{},
+};
+
+pub const SettingsListOptions = struct {
+    enable_search: bool = false,
+};
+
+pub const SettingChangeCallback = struct {
+    ptr: ?*anyopaque = null,
+    call_fn: *const fn (?*anyopaque, []const u8, []const u8) void,
+
+    pub fn call(self: SettingChangeCallback, id: []const u8, new_value: []const u8) void {
+        self.call_fn(self.ptr, id, new_value);
+    }
+};
+
+pub const SettingsListDoneCallback = struct {
+    ptr: ?*anyopaque = null,
+    call_fn: *const fn (?*anyopaque, ?[]const u8) anyerror!void,
+
+    pub fn call(self: SettingsListDoneCallback, selected_value: ?[]const u8) !void {
+        try self.call_fn(self.ptr, selected_value);
+    }
+};
+
+pub const SettingsSubmenuFactory = struct {
+    ptr: ?*anyopaque = null,
+    call_fn: *const fn (?*anyopaque, []const u8, SettingsListDoneCallback) anyerror!Component,
+
+    pub fn call(self: SettingsSubmenuFactory, current_value: []const u8, done: SettingsListDoneCallback) !Component {
+        return self.call_fn(self.ptr, current_value, done);
+    }
+};
+
+pub const SettingsList = struct {
+    allocator: std.mem.Allocator,
+    items: []OwnedSettingItem,
+    filtered_indices: std.ArrayList(usize) = .empty,
+    selected_index: usize = 0,
+    max_visible: usize,
+    theme: SettingsListTheme,
+    on_change: SettingChangeCallback,
+    on_cancel: VoidCallback,
+    search_enabled: bool,
+    search_input: ?input_component.Input = null,
+    submenu_component: ?Component = null,
+    submenu_item_index: ?usize = null,
+    submenu_source_index: ?usize = null,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        items: []const SettingItem,
+        max_visible: usize,
+        theme: SettingsListTheme,
+        on_change: SettingChangeCallback,
+        on_cancel: VoidCallback,
+        options: SettingsListOptions,
+    ) !SettingsList {
+        var owned_items = try allocator.alloc(OwnedSettingItem, items.len);
+        errdefer allocator.free(owned_items);
+        var initialized: usize = 0;
+        errdefer {
+            for (owned_items[0..initialized]) |*item| item.deinit(allocator);
+        }
+        for (items, 0..) |item, index| {
+            owned_items[index] = try OwnedSettingItem.clone(allocator, item);
+            initialized += 1;
+        }
+
+        var filtered_indices: std.ArrayList(usize) = .empty;
+        errdefer filtered_indices.deinit(allocator);
+        for (items, 0..) |_, index| try filtered_indices.append(allocator, index);
+
+        return .{
+            .allocator = allocator,
+            .items = owned_items,
+            .filtered_indices = filtered_indices,
+            .max_visible = max_visible,
+            .theme = theme,
+            .on_change = on_change,
+            .on_cancel = on_cancel,
+            .search_enabled = options.enable_search,
+            .search_input = if (options.enable_search) try input_component.Input.init(allocator) else null,
+        };
+    }
+
+    pub fn deinit(self: *SettingsList) void {
+        for (self.items) |*item| item.deinit(self.allocator);
+        self.allocator.free(self.items);
+        self.filtered_indices.deinit(self.allocator);
+        if (self.search_input) |*input| input.deinit();
+    }
+
+    pub fn updateValue(self: *SettingsList, id: []const u8, new_value: []const u8) !void {
+        for (self.items) |*item| {
+            if (std.mem.eql(u8, item.id, id)) {
+                try item.setValue(self.allocator, new_value);
+                return;
+            }
+        }
+    }
+
+    pub fn invalidate(self: *SettingsList) void {
+        if (self.submenu_component) |component| component.invalidate();
+    }
+
+    pub fn render(self: *SettingsList, allocator: std.mem.Allocator, width: usize) ![][]u8 {
+        if (self.submenu_component) |component| return component.render(allocator, width);
+        return self.renderMainList(allocator, width);
+    }
+
+    pub fn handleInput(self: *SettingsList, allocator: std.mem.Allocator, data: []const u8) !void {
+        if (self.submenu_component) |component| {
+            try component.handleInput(allocator, data);
+            return;
+        }
+
+        const manager = try keybindings.getKeybindings(allocator);
+        const display_count = self.displayItemCount();
+        if (manager.matches(data, "tui.select.up")) {
+            if (display_count == 0) return;
+            self.selected_index = if (self.selected_index == 0) display_count - 1 else self.selected_index - 1;
+        } else if (manager.matches(data, "tui.select.down")) {
+            if (display_count == 0) return;
+            self.selected_index = if (self.selected_index + 1 == display_count) 0 else self.selected_index + 1;
+        } else if (manager.matches(data, "tui.select.confirm") or std.mem.eql(u8, data, " ")) {
+            try self.activateItem();
+        } else if (manager.matches(data, "tui.select.cancel")) {
+            self.on_cancel.call();
+        } else if (self.search_enabled) {
+            var sanitized: std.ArrayList(u8) = .empty;
+            defer sanitized.deinit(allocator);
+            for (data) |byte| {
+                if (byte != ' ') try sanitized.append(allocator, byte);
+            }
+            if (sanitized.items.len == 0) return;
+            if (self.search_input) |*input| {
+                try input.handleInput(allocator, sanitized.items);
+                try self.applyFilter(input.getValue());
+            }
+        }
+    }
+
+    fn renderMainList(self: *SettingsList, allocator: std.mem.Allocator, width: usize) ![][]u8 {
+        var lines: std.ArrayList([]u8) = .empty;
+        errdefer {
+            for (lines.items) |line| allocator.free(line);
+            lines.deinit(allocator);
+        }
+
+        if (self.search_enabled) {
+            if (self.search_input) |*input| {
+                {
+                    const rendered_input = try input.render(allocator, width);
+                    errdefer freeOwnedLines(allocator, rendered_input);
+                    try lines.appendSlice(allocator, rendered_input);
+                    allocator.free(rendered_input);
+                }
+                try lines.append(allocator, try allocator.dupe(u8, ""));
+            }
+        }
+
+        if (self.items.len == 0) {
+            try lines.append(allocator, try self.theme.hint.apply(allocator, "  No settings available"));
+            if (self.search_enabled) try self.addHintLine(allocator, &lines, width);
+            return lines.toOwnedSlice(allocator);
+        }
+
+        const display_count = self.displayItemCount();
+        if (display_count == 0) {
+            const hinted = try self.theme.hint.apply(allocator, "  No matching settings");
+            defer allocator.free(hinted);
+            try lines.append(allocator, try truncateToWidth(allocator, hinted, width, "", false));
+            try self.addHintLine(allocator, &lines, width);
+            return lines.toOwnedSlice(allocator);
+        }
+
+        const selected = @min(self.selected_index, display_count - 1);
+        self.selected_index = selected;
+        const visible_count = @min(self.max_visible, display_count);
+        const half_visible = visible_count / 2;
+        const max_start = display_count - visible_count;
+        const centered_start = if (selected > half_visible) selected - half_visible else 0;
+        const start_index = @min(centered_start, max_start);
+        const end_index = start_index + visible_count;
+        const max_label_width = self.maxLabelWidth();
+
+        var display_index = start_index;
+        while (display_index < end_index) : (display_index += 1) {
+            const source_index = self.displayItemSourceIndex(display_index).?;
+            try lines.append(allocator, try self.renderItem(
+                allocator,
+                &self.items[source_index],
+                display_index == selected,
+                width,
+                max_label_width,
+            ));
+        }
+
+        if (start_index > 0 or end_index < display_count) {
+            const scroll_text = try std.fmt.allocPrint(allocator, "  ({d}/{d})", .{ selected + 1, display_count });
+            defer allocator.free(scroll_text);
+            const truncated = try truncateToWidth(allocator, scroll_text, width -| 2, "", false);
+            defer allocator.free(truncated);
+            try lines.append(allocator, try self.theme.hint.apply(allocator, truncated));
+        }
+
+        const selected_source_index = self.displayItemSourceIndex(selected).?;
+        if (self.items[selected_source_index].description) |description| {
+            try lines.append(allocator, try allocator.dupe(u8, ""));
+            const wrapped = try wrapTextWithAnsi(allocator, description, width -| 4);
+            defer freeOwnedLines(allocator, wrapped);
+            for (wrapped) |line| {
+                const prefixed = try std.mem.concat(allocator, u8, &.{ "  ", line });
+                defer allocator.free(prefixed);
+                try lines.append(allocator, try self.theme.description.apply(allocator, prefixed));
+            }
+        }
+
+        try self.addHintLine(allocator, &lines, width);
+        return lines.toOwnedSlice(allocator);
+    }
+
+    fn renderItem(
+        self: *const SettingsList,
+        allocator: std.mem.Allocator,
+        item: *const OwnedSettingItem,
+        selected: bool,
+        width: usize,
+        max_label_width: usize,
+    ) ![]u8 {
+        const prefix = if (selected) self.theme.cursor else "  ";
+        const prefix_width = visibleWidth(prefix);
+
+        var label_padded: std.ArrayList(u8) = .empty;
+        defer label_padded.deinit(allocator);
+        try label_padded.appendSlice(allocator, item.label);
+        try appendSpaces(allocator, &label_padded, max_label_width -| visibleWidth(item.label));
+        const label_text = try self.theme.label.apply(allocator, label_padded.items, selected);
+        defer allocator.free(label_text);
+
+        const separator = "  ";
+        const used_width = prefix_width + max_label_width + visibleWidth(separator);
+        const value_max_width = if (width > used_width + 2) width - used_width - 2 else 0;
+        const truncated_value = try truncateToWidth(allocator, item.current_value, value_max_width, "", false);
+        defer allocator.free(truncated_value);
+        const value_text = try self.theme.value.apply(allocator, truncated_value, selected);
+        defer allocator.free(value_text);
+
+        const line = try std.mem.concat(allocator, u8, &.{ prefix, label_text, separator, value_text });
+        defer allocator.free(line);
+        return truncateToWidth(allocator, line, width, "", false);
+    }
+
+    fn activateItem(self: *SettingsList) !void {
+        const source_index = self.displayItemSourceIndex(self.selected_index) orelse return;
+        var item = &self.items[source_index];
+
+        if (item.submenu) |submenu| {
+            self.submenu_item_index = self.selected_index;
+            self.submenu_source_index = source_index;
+            self.submenu_component = try submenu.call(item.current_value, .{
+                .ptr = self,
+                .call_fn = submenuDone,
+            });
+        } else if (item.values.len > 0) {
+            const next_index = self.nextValueIndex(item);
+            try item.setValue(self.allocator, item.values[next_index]);
+            self.on_change.call(item.id, item.current_value);
+        }
+    }
+
+    fn submenuDone(ptr: ?*anyopaque, selected_value: ?[]const u8) !void {
+        const self: *SettingsList = @ptrCast(@alignCast(ptr.?));
+        if (selected_value) |value| {
+            if (self.submenu_source_index) |source_index| {
+                var item = &self.items[source_index];
+                try item.setValue(self.allocator, value);
+                self.on_change.call(item.id, item.current_value);
+            }
+        }
+        self.closeSubmenu();
+    }
+
+    fn closeSubmenu(self: *SettingsList) void {
+        self.submenu_component = null;
+        if (self.submenu_item_index) |index| {
+            self.selected_index = index;
+            self.submenu_item_index = null;
+        }
+        self.submenu_source_index = null;
+    }
+
+    fn nextValueIndex(_: *const SettingsList, item: *const OwnedSettingItem) usize {
+        for (item.values, 0..) |value, index| {
+            if (std.mem.eql(u8, value, item.current_value)) return (index + 1) % item.values.len;
+        }
+        return 0;
+    }
+
+    fn applyFilter(self: *SettingsList, query: []const u8) !void {
+        self.filtered_indices.clearRetainingCapacity();
+        if (std.mem.trim(u8, query, " \t\r\n").len == 0) {
+            for (self.items, 0..) |_, index| try self.filtered_indices.append(self.allocator, index);
+            self.selected_index = 0;
+            return;
+        }
+
+        var tokens = std.mem.tokenizeAny(u8, query, " \t\r\n");
+        var token_list: std.ArrayList([]const u8) = .empty;
+        defer token_list.deinit(self.allocator);
+        while (tokens.next()) |token| try token_list.append(self.allocator, token);
+
+        const ScoredIndex = struct {
+            index: usize,
+            score: f64,
+
+            fn lessThan(_: void, lhs: @This(), rhs: @This()) bool {
+                if (lhs.score < rhs.score) return true;
+                if (lhs.score > rhs.score) return false;
+                return lhs.index < rhs.index;
+            }
+        };
+
+        var scored: std.ArrayList(ScoredIndex) = .empty;
+        defer scored.deinit(self.allocator);
+        for (self.items, 0..) |item, index| {
+            var total_score: f64 = 0;
+            var all_match = true;
+            for (token_list.items) |token| {
+                const matched = try fuzzy.fuzzyMatch(self.allocator, token, item.label);
+                if (!matched.matches) {
+                    all_match = false;
+                    break;
+                }
+                total_score += matched.score;
+            }
+            if (all_match) try scored.append(self.allocator, .{ .index = index, .score = total_score });
+        }
+
+        std.mem.sort(ScoredIndex, scored.items, {}, ScoredIndex.lessThan);
+        for (scored.items) |entry| try self.filtered_indices.append(self.allocator, entry.index);
+        self.selected_index = 0;
+    }
+
+    fn addHintLine(self: *const SettingsList, allocator: std.mem.Allocator, lines: *std.ArrayList([]u8), width: usize) !void {
+        try lines.append(allocator, try allocator.dupe(u8, ""));
+        const text = if (self.search_enabled)
+            "  Type to search \u{00b7} Enter/Space to change \u{00b7} Esc to cancel"
+        else
+            "  Enter/Space to change \u{00b7} Esc to cancel";
+        const hinted = try self.theme.hint.apply(allocator, text);
+        defer allocator.free(hinted);
+        try lines.append(allocator, try truncateToWidth(allocator, hinted, width, "", false));
+    }
+
+    fn displayItemCount(self: *const SettingsList) usize {
+        return if (self.search_enabled) self.filtered_indices.items.len else self.items.len;
+    }
+
+    fn displayItemSourceIndex(self: *const SettingsList, display_index: usize) ?usize {
+        if (self.search_enabled) {
+            if (display_index >= self.filtered_indices.items.len) return null;
+            return self.filtered_indices.items[display_index];
+        }
+        if (display_index >= self.items.len) return null;
+        return display_index;
+    }
+
+    fn maxLabelWidth(self: *const SettingsList) usize {
+        var max_width: usize = 0;
+        for (self.items) |item| max_width = @max(max_width, visibleWidth(item.label));
+        return @min(@as(usize, 30), max_width);
+    }
+};
+
 pub const SelectList = struct {
     allocator: std.mem.Allocator,
     items: []OwnedSelectItem,
@@ -4737,6 +5182,10 @@ const OwnedSelectItem = struct {
 };
 
 fn identityTextStyle(_: ?*anyopaque, allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    return allocator.dupe(u8, text);
+}
+
+fn identitySettingsSelectableStyle(_: ?*anyopaque, allocator: std.mem.Allocator, text: []const u8, _: bool) ![]u8 {
     return allocator.dupe(u8, text);
 }
 
@@ -9276,6 +9725,209 @@ test "Markdown renders HTML-like tags as visible text and code" {
 fn visibleIndexOf(line: []const u8, text: []const u8) !usize {
     const index = std.mem.indexOf(u8, line, text) orelse return error.NotFound;
     return visibleWidth(line[0..index]);
+}
+
+const SettingsChangeRecorder = struct {
+    calls: usize = 0,
+    last_id: []const u8 = "",
+    last_value: []const u8 = "",
+};
+
+fn recordSettingsChange(ptr: ?*anyopaque, id: []const u8, new_value: []const u8) void {
+    const recorder: *SettingsChangeRecorder = @ptrCast(@alignCast(ptr.?));
+    recorder.calls += 1;
+    recorder.last_id = id;
+    recorder.last_value = new_value;
+}
+
+const SettingsCancelRecorder = struct {
+    calls: usize = 0,
+};
+
+fn recordSettingsCancel(ptr: ?*anyopaque) void {
+    const recorder: *SettingsCancelRecorder = @ptrCast(@alignCast(ptr.?));
+    recorder.calls += 1;
+}
+
+const TestSettingsSubmenu = struct {
+    done: ?SettingsListDoneCallback = null,
+    handled_inputs: usize = 0,
+    invalidated: bool = false,
+
+    fn render(_: *TestSettingsSubmenu, allocator: std.mem.Allocator, _: usize) ![][]u8 {
+        const lines = try allocator.alloc([]u8, 1);
+        errdefer allocator.free(lines);
+        lines[0] = try allocator.dupe(u8, "submenu");
+        return lines;
+    }
+
+    fn handleInput(self: *TestSettingsSubmenu, _: std.mem.Allocator, data: []const u8) !void {
+        if (std.mem.eql(u8, data, "\r")) {
+            try self.done.?.call("solarized");
+            return;
+        }
+        self.handled_inputs += 1;
+    }
+
+    fn invalidate(self: *TestSettingsSubmenu) void {
+        self.invalidated = true;
+    }
+};
+
+const TestSettingsSubmenuHarness = struct {
+    submenu: TestSettingsSubmenu = .{},
+    opened: bool = false,
+    opened_value: []const u8 = "",
+};
+
+fn openTestSettingsSubmenu(ptr: ?*anyopaque, current_value: []const u8, done: SettingsListDoneCallback) !Component {
+    const harness: *TestSettingsSubmenuHarness = @ptrCast(@alignCast(ptr.?));
+    harness.opened = true;
+    harness.opened_value = current_value;
+    harness.submenu.done = done;
+    return Component.from(TestSettingsSubmenu, &harness.submenu);
+}
+
+test "SettingsList renders values, cycles options, and reports cancel" {
+    const allocator = std.testing.allocator;
+    defer keybindings.resetGlobalKeybindings(allocator);
+
+    var changes = SettingsChangeRecorder{};
+    var cancels = SettingsCancelRecorder{};
+    const theme_values = [_][]const u8{ "light", "dark" };
+    const items = [_]SettingItem{
+        .{
+            .id = "theme",
+            .label = "Theme",
+            .description = "Controls the UI palette.",
+            .current_value = "light",
+            .values = &theme_values,
+        },
+        .{
+            .id = "model",
+            .label = "Model",
+            .current_value = "auto",
+            .values = &.{ "auto", "manual" },
+        },
+    };
+    var list = try SettingsList.init(
+        allocator,
+        &items,
+        5,
+        .{},
+        .{ .ptr = &changes, .call_fn = recordSettingsChange },
+        .{ .ptr = &cancels, .call_fn = recordSettingsCancel },
+        .{},
+    );
+    defer list.deinit();
+
+    const rendered = try list.render(allocator, 60);
+    defer freeRenderedLines(allocator, rendered);
+    try std.testing.expect(rendered.len >= 5);
+    try std.testing.expect(std.mem.indexOf(u8, rendered[0], "Theme") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered[0], "light") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered[3], "Controls the UI palette.") != null);
+
+    try list.handleInput(allocator, "\r");
+    try std.testing.expectEqual(@as(usize, 1), changes.calls);
+    try std.testing.expectEqualStrings("theme", changes.last_id);
+    try std.testing.expectEqualStrings("dark", changes.last_value);
+
+    try list.updateValue("model", "manual");
+    try list.handleInput(allocator, "\x1b[B");
+    const rerendered = try list.render(allocator, 60);
+    defer freeRenderedLines(allocator, rerendered);
+    try std.testing.expect(std.mem.indexOf(u8, rerendered[1], "Model") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rerendered[1], "manual") != null);
+
+    try list.handleInput(allocator, "\x1b");
+    try std.testing.expectEqual(@as(usize, 1), cancels.calls);
+}
+
+test "SettingsList filters with search and shows empty states" {
+    const allocator = std.testing.allocator;
+    defer keybindings.resetGlobalKeybindings(allocator);
+
+    var changes = SettingsChangeRecorder{};
+    var cancels = SettingsCancelRecorder{};
+    const items = [_]SettingItem{
+        .{ .id = "theme", .label = "Theme", .current_value = "light" },
+        .{ .id = "model", .label = "Model", .current_value = "auto" },
+        .{ .id = "verbosity", .label = "Verbosity", .current_value = "normal" },
+    };
+    var list = try SettingsList.init(
+        allocator,
+        &items,
+        5,
+        .{},
+        .{ .ptr = &changes, .call_fn = recordSettingsChange },
+        .{ .ptr = &cancels, .call_fn = recordSettingsCancel },
+        .{ .enable_search = true },
+    );
+    defer list.deinit();
+
+    try list.handleInput(allocator, "m o");
+    const filtered = try list.render(allocator, 50);
+    defer freeRenderedLines(allocator, filtered);
+    try std.testing.expect(std.mem.indexOf(u8, filtered[2], "Model") != null);
+    try std.testing.expect(std.mem.indexOf(u8, filtered[2], "Theme") == null);
+
+    try list.handleInput(allocator, "z");
+    try list.handleInput(allocator, "z");
+    const empty = try list.render(allocator, 50);
+    defer freeRenderedLines(allocator, empty);
+    var found_empty = false;
+    for (empty) |line| {
+        if (std.mem.indexOf(u8, line, "No matching settings") != null) found_empty = true;
+    }
+    try std.testing.expect(found_empty);
+}
+
+test "SettingsList delegates render input and invalidate to submenus" {
+    const allocator = std.testing.allocator;
+    defer keybindings.resetGlobalKeybindings(allocator);
+
+    var changes = SettingsChangeRecorder{};
+    var cancels = SettingsCancelRecorder{};
+    var harness = TestSettingsSubmenuHarness{};
+    const items = [_]SettingItem{.{
+        .id = "theme",
+        .label = "Theme",
+        .current_value = "light",
+        .submenu = .{ .ptr = &harness, .call_fn = openTestSettingsSubmenu },
+    }};
+    var list = try SettingsList.init(
+        allocator,
+        &items,
+        5,
+        .{},
+        .{ .ptr = &changes, .call_fn = recordSettingsChange },
+        .{ .ptr = &cancels, .call_fn = recordSettingsCancel },
+        .{},
+    );
+    defer list.deinit();
+
+    try list.handleInput(allocator, "\r");
+    try std.testing.expect(harness.opened);
+    try std.testing.expectEqualStrings("light", harness.opened_value);
+
+    const submenu_rendered = try list.render(allocator, 40);
+    defer freeRenderedLines(allocator, submenu_rendered);
+    try std.testing.expectEqualStrings("submenu", submenu_rendered[0]);
+
+    list.invalidate();
+    try std.testing.expect(harness.submenu.invalidated);
+    try list.handleInput(allocator, "x");
+    try std.testing.expectEqual(@as(usize, 1), harness.submenu.handled_inputs);
+
+    try list.handleInput(allocator, "\r");
+    try std.testing.expectEqual(@as(usize, 1), changes.calls);
+    try std.testing.expectEqualStrings("theme", changes.last_id);
+    try std.testing.expectEqualStrings("solarized", changes.last_value);
+
+    const main_rendered = try list.render(allocator, 40);
+    defer freeRenderedLines(allocator, main_rendered);
+    try std.testing.expect(std.mem.indexOf(u8, main_rendered[0], "solarized") != null);
 }
 
 test "SelectList normalizes multiline descriptions to single line" {
