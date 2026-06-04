@@ -12,6 +12,7 @@ const BRACKETED_PASTE_START = "\x1b[200~";
 const BRACKETED_PASTE_END = "\x1b[201~";
 
 const LastAction = enum { kill, yank, type_word };
+const JumpMode = enum { forward, backward };
 
 pub const Cursor = struct {
     line: usize,
@@ -139,6 +140,7 @@ pub const Editor = struct {
     undo_stack: undo_stack.UndoStack(EditorState),
     paste_buffer: std.ArrayList(u8) = .empty,
     is_in_paste: bool = false,
+    jump_mode: ?JumpMode = null,
     preferred_visual_col: ?usize = null,
 
     pub fn init(allocator: std.mem.Allocator, options: EditorOptions) !Editor {
@@ -264,6 +266,24 @@ pub const Editor = struct {
     pub fn invalidate(_: *Editor) void {}
 
     pub fn handleInput(self: *Editor, data: []const u8) !void {
+        const kb = try keybindings.getKeybindings(self.allocator);
+
+        if (self.jump_mode) |direction| {
+            if (kb.matches(data, "tui.editor.jumpForward") or kb.matches(data, "tui.editor.jumpBackward")) {
+                self.jump_mode = null;
+                return;
+            }
+
+            const printable = keys.decodePrintableKey(data) orelse firstPrintableInput(data);
+            if (printable) |char| {
+                self.jump_mode = null;
+                self.jumpToChar(char, direction);
+                return;
+            }
+
+            self.jump_mode = null;
+        }
+
         if (std.mem.indexOf(u8, data, BRACKETED_PASTE_START)) |start_index| {
             self.is_in_paste = true;
             self.paste_buffer.clearRetainingCapacity();
@@ -286,8 +306,6 @@ pub const Editor = struct {
             }
             return;
         }
-
-        const kb = try keybindings.getKeybindings(self.allocator);
 
         if (kb.matches(data, "tui.input.copy")) return;
 
@@ -344,6 +362,15 @@ pub const Editor = struct {
         }
         if (kb.matches(data, "tui.editor.cursorWordRight")) {
             self.moveWordForwards();
+            return;
+        }
+
+        if (kb.matches(data, "tui.editor.jumpForward")) {
+            self.jump_mode = .forward;
+            return;
+        }
+        if (kb.matches(data, "tui.editor.jumpBackward")) {
+            self.jump_mode = .backward;
             return;
         }
 
@@ -987,6 +1014,44 @@ pub const Editor = struct {
         self.setCursorCol(findWordForwardEditor(self.currentLine(), self.cursor_col));
     }
 
+    fn jumpToChar(self: *Editor, char: []const u8, direction: JumpMode) void {
+        self.last_action = null;
+        if (char.len == 0 or self.lines.items.len == 0) return;
+
+        switch (direction) {
+            .forward => {
+                var line_index = self.cursor_line;
+                while (line_index < self.lines.items.len) : (line_index += 1) {
+                    const line = self.lines.items[line_index];
+                    const search_from = if (line_index == self.cursor_line) @min(self.cursor_col + 1, line.len) else 0;
+                    if (std.mem.indexOfPos(u8, line, search_from, char)) |match_index| {
+                        self.cursor_line = line_index;
+                        self.setCursorCol(match_index);
+                        return;
+                    }
+                }
+            },
+            .backward => {
+                var line_index: isize = @intCast(self.cursor_line);
+                while (line_index >= 0) : (line_index -= 1) {
+                    const current_index: usize = @intCast(line_index);
+                    const line = self.lines.items[current_index];
+                    const search_from = if (current_index == self.cursor_line)
+                        if (self.cursor_col == 0) null else self.cursor_col - 1
+                    else
+                        line.len;
+                    if (search_from) |from| {
+                        if (lastIndexOfAtOrBefore(line, char, from)) |match_index| {
+                            self.cursor_line = current_index;
+                            self.setCursorCol(match_index);
+                            return;
+                        }
+                    }
+                }
+            },
+        }
+    }
+
     fn moveCursorHorizontal(self: *Editor, direction: i32) void {
         self.last_action = null;
         const line = self.currentLine();
@@ -1524,6 +1589,23 @@ fn hasControlChars(data: []const u8) bool {
         index += decoded.len;
     }
     return false;
+}
+
+fn firstPrintableInput(data: []const u8) ?[]const u8 {
+    if (data.len == 0) return null;
+    const decoded = decodeAt(data, 0) orelse return null;
+    return if (decoded.codepoint >= 32) data else null;
+}
+
+fn lastIndexOfAtOrBefore(haystack: []const u8, needle: []const u8, search_from: usize) ?usize {
+    if (needle.len == 0 or needle.len > haystack.len) return null;
+    const max_start = @min(search_from, haystack.len - needle.len);
+    var start = max_start + 1;
+    while (start > 0) {
+        start -= 1;
+        if (std.mem.eql(u8, haystack[start .. start + needle.len], needle)) return start;
+    }
+    return null;
 }
 
 fn isWhitespaceText(text: []const u8) bool {
@@ -2067,4 +2149,155 @@ test "Editor kill ring and undo basics" {
     try expectText(&editor, "abc");
     try editor.handleInput("\x1b[45;5u");
     try expectText(&editor, "");
+}
+
+test "Editor character jump Ctrl bracket" {
+    const allocator = std.testing.allocator;
+    defer keybindings.resetGlobalKeybindings(allocator);
+
+    {
+        var editor = try Editor.init(allocator, .{});
+        defer editor.deinit();
+        try editor.setText("hello world");
+        try editor.handleInput("\x01");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = 0 }, editor.getCursor());
+        try editor.handleInput("\x1d");
+        try editor.handleInput("o");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = 4 }, editor.getCursor());
+    }
+    {
+        var editor = try Editor.init(allocator, .{});
+        defer editor.deinit();
+        try editor.setText("hello world");
+        try editor.handleInput("\x01");
+        var index: usize = 0;
+        while (index < 4) : (index += 1) try editor.handleInput("\x1b[C");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = 4 }, editor.getCursor());
+        try editor.handleInput("\x1d");
+        try editor.handleInput("o");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = 7 }, editor.getCursor());
+    }
+    {
+        var editor = try Editor.init(allocator, .{});
+        defer editor.deinit();
+        try editor.setText("abc\ndef\nghi");
+        try editor.handleInput("\x1b[A");
+        try editor.handleInput("\x1b[A");
+        try editor.handleInput("\x01");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = 0 }, editor.getCursor());
+        try editor.handleInput("\x1d");
+        try editor.handleInput("g");
+        try std.testing.expectEqual(Cursor{ .line = 2, .col = 0 }, editor.getCursor());
+    }
+    {
+        var editor = try Editor.init(allocator, .{});
+        defer editor.deinit();
+        try editor.setText("hello world");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = 11 }, editor.getCursor());
+        try editor.handleInput("\x1b\x1d");
+        try editor.handleInput("o");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = 7 }, editor.getCursor());
+    }
+    {
+        var editor = try Editor.init(allocator, .{});
+        defer editor.deinit();
+        try editor.setText("abc\ndef\nghi");
+        try std.testing.expectEqual(Cursor{ .line = 2, .col = 3 }, editor.getCursor());
+        try editor.handleInput("\x1b\x1d");
+        try editor.handleInput("a");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = 0 }, editor.getCursor());
+    }
+    {
+        var editor = try Editor.init(allocator, .{});
+        defer editor.deinit();
+        try editor.setText("hello world");
+        try editor.handleInput("\x01");
+        try editor.handleInput("\x1d");
+        try editor.handleInput("z");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = 0 }, editor.getCursor());
+    }
+    {
+        var editor = try Editor.init(allocator, .{});
+        defer editor.deinit();
+        try editor.setText("hello world");
+        try editor.handleInput("\x1b\x1d");
+        try editor.handleInput("z");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = 11 }, editor.getCursor());
+    }
+    {
+        var editor = try Editor.init(allocator, .{});
+        defer editor.deinit();
+        try editor.setText("Hello World");
+        try editor.handleInput("\x01");
+        try editor.handleInput("\x1d");
+        try editor.handleInput("h");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = 0 }, editor.getCursor());
+        try editor.handleInput("\x1d");
+        try editor.handleInput("W");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = 6 }, editor.getCursor());
+    }
+    {
+        var editor = try Editor.init(allocator, .{});
+        defer editor.deinit();
+        try editor.setText("hello world");
+        try editor.handleInput("\x01");
+        try editor.handleInput("\x1d");
+        try editor.handleInput("\x1d");
+        try editor.handleInput("o");
+        try expectText(&editor, "ohello world");
+    }
+    {
+        var editor = try Editor.init(allocator, .{});
+        defer editor.deinit();
+        try editor.setText("hello world");
+        try editor.handleInput("\x01");
+        try editor.handleInput("\x1d");
+        try editor.handleInput("\x1b");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = 0 }, editor.getCursor());
+        try editor.handleInput("o");
+        try expectText(&editor, "ohello world");
+    }
+    {
+        var editor = try Editor.init(allocator, .{});
+        defer editor.deinit();
+        try editor.setText("hello world");
+        try editor.handleInput("\x1b\x1d");
+        try editor.handleInput("\x1b\x1d");
+        try editor.handleInput("o");
+        try expectText(&editor, "hello worldo");
+    }
+    {
+        var editor = try Editor.init(allocator, .{});
+        defer editor.deinit();
+        try editor.setText("foo(bar) = baz;");
+        try editor.handleInput("\x01");
+        try editor.handleInput("\x1d");
+        try editor.handleInput("(");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = 3 }, editor.getCursor());
+        try editor.handleInput("\x1d");
+        try editor.handleInput("=");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = 9 }, editor.getCursor());
+    }
+    {
+        var editor = try Editor.init(allocator, .{});
+        defer editor.deinit();
+        try editor.setText("");
+        try editor.handleInput("\x1d");
+        try editor.handleInput("x");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = 0 }, editor.getCursor());
+    }
+    {
+        var editor = try Editor.init(allocator, .{});
+        defer editor.deinit();
+        try editor.setText("hello world");
+        try editor.handleInput("\x01");
+        try editor.handleInput("x");
+        try expectText(&editor, "xhello world");
+        try editor.handleInput("\x1d");
+        try editor.handleInput("o");
+        try editor.handleInput("Y");
+        try expectText(&editor, "xhellYo world");
+        try editor.handleInput("\x1b[45;5u");
+        try expectText(&editor, "xhello world");
+    }
 }
