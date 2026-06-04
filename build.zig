@@ -36,6 +36,15 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const tui_examples = b.addModule("bulb_tui_examples", .{
+        .root_source_file = b.path("src/bulb_tui/examples.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "bulb_tui", .module = tui },
+        },
+    });
+
     const extension_sdk = b.addModule("bulb_extension_sdk", .{
         .root_source_file = b.path("src/bulb_extension_sdk/root.zig"),
         .target = target,
@@ -96,6 +105,7 @@ pub fn build(b: *std.Build) void {
     addModuleTests(b, test_step, ai);
     addModuleTests(b, test_step, agent);
     addModuleTests(b, test_step, tui);
+    addModuleTests(b, test_step, tui_examples);
     addModuleTests(b, test_step, extension_sdk);
     addModuleTests(b, test_step, coding_agent);
 
