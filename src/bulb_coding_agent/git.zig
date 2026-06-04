@@ -38,7 +38,227 @@ pub fn parseGitUrlAlloc(allocator: std.mem.Allocator, source: []const u8) !?GitS
     if (!has_git_prefix and !hasExplicitGitProtocol(url)) return null;
 
     const split = splitRef(url);
+    if (try parseHostedGitUrlAlloc(allocator, split)) |source_info| {
+        return source_info;
+    }
     return parseGenericGitUrlAlloc(allocator, split);
+}
+
+const HostedHost = struct {
+    domain: []const u8,
+    kind: Kind,
+
+    const Kind = enum {
+        github,
+        gitlab,
+        bitbucket,
+        gist,
+        sourcehut,
+    };
+};
+
+const HashSplit = struct {
+    base: []const u8,
+    ref: ?[]const u8 = null,
+};
+
+fn parseHostedGitUrlAlloc(allocator: std.mem.Allocator, split: SplitRef) !?GitSource {
+    const hash_split = splitHashRef(split.repo);
+    const repo_without_ref = hash_split.base;
+    const ref = split.ref orelse hash_split.ref;
+
+    if (parseScpLike(repo_without_ref)) |scp| {
+        const hosted = hostedHostForDomain(scp.host) orelse return null;
+        const path = normalizeHostedPath(hosted, scp.path) orelse return null;
+        return try makeGitSource(allocator, repo_without_ref, hosted.domain, path, ref);
+    }
+
+    if (protocolParts(repo_without_ref)) |parts| {
+        const hosted = hostedHostForDomain(parts.host) orelse return null;
+        const path = normalizeHostedPath(hosted, parts.path) orelse return null;
+        return try makeGitSource(allocator, repo_without_ref, hosted.domain, path, ref);
+    }
+
+    if (parseHostedShortcut(repo_without_ref)) |shortcut| {
+        const repo = try std.fmt.allocPrint(allocator, "https://{s}/{s}", .{
+            shortcut.host.domain,
+            shortcut.path,
+        });
+        errdefer allocator.free(repo);
+        return try makeGitSourceWithOwnedRepo(allocator, repo, shortcut.host.domain, shortcut.path, ref);
+    }
+
+    if (parseHostedDomainShorthand(repo_without_ref)) |shortcut| {
+        const repo = try std.fmt.allocPrint(allocator, "https://{s}/{s}", .{
+            shortcut.host.domain,
+            shortcut.path,
+        });
+        errdefer allocator.free(repo);
+        return try makeGitSourceWithOwnedRepo(allocator, repo, shortcut.host.domain, shortcut.path, ref);
+    }
+
+    if (parseGithubPathShorthand(repo_without_ref)) |path| {
+        const repo = try std.fmt.allocPrint(allocator, "https://github.com/{s}", .{path});
+        errdefer allocator.free(repo);
+        return try makeGitSourceWithOwnedRepo(allocator, repo, "github.com", path, ref);
+    }
+
+    return null;
+}
+
+fn makeGitSource(
+    allocator: std.mem.Allocator,
+    repo: []const u8,
+    host: []const u8,
+    path: []const u8,
+    ref: ?[]const u8,
+) !GitSource {
+    const owned_repo = try allocator.dupe(u8, repo);
+    errdefer allocator.free(owned_repo);
+    return try makeGitSourceWithOwnedRepo(allocator, owned_repo, host, path, ref);
+}
+
+fn makeGitSourceWithOwnedRepo(
+    allocator: std.mem.Allocator,
+    repo: []u8,
+    host: []const u8,
+    path: []const u8,
+    ref: ?[]const u8,
+) !GitSource {
+    const owned_host = try allocator.dupe(u8, host);
+    errdefer allocator.free(owned_host);
+    const owned_path = try allocator.dupe(u8, path);
+    errdefer allocator.free(owned_path);
+    const owned_ref = if (ref) |value| try allocator.dupe(u8, value) else null;
+    errdefer if (owned_ref) |value| allocator.free(value);
+
+    return .{
+        .allocator = allocator,
+        .repo = repo,
+        .host = owned_host,
+        .path = owned_path,
+        .ref = owned_ref,
+        .pinned = ref != null,
+    };
+}
+
+fn splitHashRef(value: []const u8) HashSplit {
+    const hash_index = std.mem.indexOfScalar(u8, value, '#') orelse return .{ .base = value };
+    if (hash_index == 0 or hash_index + 1 >= value.len) return .{ .base = value };
+    return .{
+        .base = value[0..hash_index],
+        .ref = value[hash_index + 1 ..],
+    };
+}
+
+fn hostedHostForDomain(raw_host: []const u8) ?HostedHost {
+    const host = stripWww(raw_host);
+    if (std.ascii.eqlIgnoreCase(host, "github.com")) {
+        return .{ .domain = "github.com", .kind = .github };
+    }
+    if (std.ascii.eqlIgnoreCase(host, "gitlab.com")) {
+        return .{ .domain = "gitlab.com", .kind = .gitlab };
+    }
+    if (std.ascii.eqlIgnoreCase(host, "bitbucket.org")) {
+        return .{ .domain = "bitbucket.org", .kind = .bitbucket };
+    }
+    if (std.ascii.eqlIgnoreCase(host, "gist.github.com")) {
+        return .{ .domain = "gist.github.com", .kind = .gist };
+    }
+    if (std.ascii.eqlIgnoreCase(host, "git.sr.ht")) {
+        return .{ .domain = "git.sr.ht", .kind = .sourcehut };
+    }
+    return null;
+}
+
+fn hostedHostForShortcut(shortcut: []const u8) ?HostedHost {
+    if (std.ascii.eqlIgnoreCase(shortcut, "github")) {
+        return .{ .domain = "github.com", .kind = .github };
+    }
+    if (std.ascii.eqlIgnoreCase(shortcut, "gitlab")) {
+        return .{ .domain = "gitlab.com", .kind = .gitlab };
+    }
+    if (std.ascii.eqlIgnoreCase(shortcut, "bitbucket")) {
+        return .{ .domain = "bitbucket.org", .kind = .bitbucket };
+    }
+    if (std.ascii.eqlIgnoreCase(shortcut, "gist")) {
+        return .{ .domain = "gist.github.com", .kind = .gist };
+    }
+    if (std.ascii.eqlIgnoreCase(shortcut, "sourcehut")) {
+        return .{ .domain = "git.sr.ht", .kind = .sourcehut };
+    }
+    return null;
+}
+
+fn stripWww(host: []const u8) []const u8 {
+    return if (startsWithIgnoreCase(host, "www.")) host["www.".len..] else host;
+}
+
+fn normalizeHostedPath(host: HostedHost, raw_path: []const u8) ?[]const u8 {
+    const normalized = normalizeRepoPath(raw_path);
+    if (normalized.len == 0) return null;
+
+    switch (host.kind) {
+        .github, .bitbucket, .sourcehut => {
+            if (std.mem.indexOfScalar(u8, normalized, '/') == null) return null;
+            return normalized;
+        },
+        .gitlab => {
+            if (std.mem.indexOfScalar(u8, normalized, '/') == null) return null;
+            return normalized;
+        },
+        .gist => return normalized,
+    }
+}
+
+const HostedShortcut = struct {
+    host: HostedHost,
+    path: []const u8,
+};
+
+fn parseHostedShortcut(value: []const u8) ?HostedShortcut {
+    if (std.mem.indexOf(u8, value, "://") != null) return null;
+    const colon_index = std.mem.indexOfScalar(u8, value, ':') orelse return null;
+    if (colon_index == 0 or colon_index + 1 >= value.len) return null;
+
+    const host = hostedHostForShortcut(value[0..colon_index]) orelse return null;
+    var path = value[colon_index + 1 ..];
+    path = std.mem.trimStart(u8, path, "/");
+    path = normalizeHostedPath(host, path) orelse return null;
+    return .{ .host = host, .path = path };
+}
+
+fn parseHostedDomainShorthand(value: []const u8) ?HostedShortcut {
+    if (std.mem.indexOf(u8, value, "://") != null) return null;
+    if (std.mem.indexOfScalar(u8, value, ':') != null) return null;
+
+    const slash_index = std.mem.indexOfScalar(u8, value, '/') orelse return null;
+    if (slash_index == 0 or slash_index + 1 >= value.len) return null;
+
+    const host = hostedHostForDomain(value[0..slash_index]) orelse return null;
+    const path = normalizeHostedPath(host, value[slash_index + 1 ..]) orelse return null;
+    return .{ .host = host, .path = path };
+}
+
+fn parseGithubPathShorthand(value: []const u8) ?[]const u8 {
+    if (value.len == 0 or value[0] == '/' or value[0] == '.' or value[0] == '@') return null;
+    if (std.mem.indexOfScalar(u8, value, ':') != null) return null;
+    if (hasWhitespace(value)) return null;
+
+    const first_slash = std.mem.indexOfScalar(u8, value, '/') orelse return null;
+    if (first_slash == 0 or first_slash + 1 >= value.len) return null;
+    if (std.mem.indexOfScalarPos(u8, value, first_slash + 1, '/') != null) return null;
+
+    const normalized = normalizeRepoPath(value);
+    if (std.mem.indexOfScalar(u8, normalized, '/') == null) return null;
+    return normalized;
+}
+
+fn hasWhitespace(value: []const u8) bool {
+    for (value) |char| {
+        if (std.ascii.isWhitespace(char)) return true;
+    }
+    return false;
 }
 
 fn parseGenericGitUrlAlloc(allocator: std.mem.Allocator, split: SplitRef) !?GitSource {
@@ -274,5 +494,77 @@ test "parseGitUrl normalizes git suffixes and trims declaration whitespace" {
         "code.example.test",
         "team/repo",
         "release",
+    );
+}
+
+test "parseGitUrl accepts hosted aliases only with git prefix" {
+    try expectGitSource(
+        "git:github:user/repo",
+        "https://github.com/user/repo",
+        "github.com",
+        "user/repo",
+        null,
+    );
+    try expectGitSource(
+        "git:user/repo#main",
+        "https://github.com/user/repo",
+        "github.com",
+        "user/repo",
+        "main",
+    );
+    try expectGitSource(
+        "git:gitlab:group/subgroup/repo#release",
+        "https://gitlab.com/group/subgroup/repo",
+        "gitlab.com",
+        "group/subgroup/repo",
+        "release",
+    );
+    try expectGitSource(
+        "git:bitbucket:user/repo#default",
+        "https://bitbucket.org/user/repo",
+        "bitbucket.org",
+        "user/repo",
+        "default",
+    );
+    try expectGitSource(
+        "git:sourcehut:~user/repo#main",
+        "https://git.sr.ht/~user/repo",
+        "git.sr.ht",
+        "~user/repo",
+        "main",
+    );
+
+    try std.testing.expect(try parseGitUrlAlloc(std.testing.allocator, "github:user/repo") == null);
+    try std.testing.expect(try parseGitUrlAlloc(std.testing.allocator, "user/repo#main") == null);
+}
+
+test "parseGitUrl extracts hosted fragment refs" {
+    try expectGitSource(
+        "https://github.com/user/repo#v1.0.0",
+        "https://github.com/user/repo",
+        "github.com",
+        "user/repo",
+        "v1.0.0",
+    );
+    try expectGitSource(
+        "https://gitlab.com/group/subgroup/repo.git#main",
+        "https://gitlab.com/group/subgroup/repo.git",
+        "gitlab.com",
+        "group/subgroup/repo",
+        "main",
+    );
+    try expectGitSource(
+        "git:github.com/user/repo#v2",
+        "https://github.com/user/repo",
+        "github.com",
+        "user/repo",
+        "v2",
+    );
+    try expectGitSource(
+        "git:git@gitlab.com:group/subgroup/repo#main",
+        "git@gitlab.com:group/subgroup/repo",
+        "gitlab.com",
+        "group/subgroup/repo",
+        "main",
     );
 }

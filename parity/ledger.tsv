@@ -537,7 +537,7 @@ packages/coding-agent/src/utils/deprecation.ts	bulb_coding_agent	source	pending
 packages/coding-agent/src/utils/exif-orientation.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/utils/frontmatter.ts	bulb_coding_agent	source	implemented	src/bulb_coding_agent/frontmatter.zig	Newline normalization, frontmatter extraction/stripping, quoted/plain scalar maps, booleans, numbers, nulls, comments, multiline block scalars, inline and indentation-based nested YAML collections, invalid-YAML diagnostics, and owned native results ported
 packages/coding-agent/src/utils/fs-watch.ts	bulb_coding_agent	source	pending		
-packages/coding-agent/src/utils/git.ts	bulb_coding_agent	source	in_progress	src/bulb_coding_agent/git.zig	Explicit HTTP/HTTPS/SSH/Git URLs, git-prefixed SCP and host/path shorthands, @ refs, pin state, suffix normalization, and owned native source records ported; hosted-git-info-specific aliases and fragment refs remain
+packages/coding-agent/src/utils/git.ts	bulb_coding_agent	source	implemented	src/bulb_coding_agent/git.zig	Explicit HTTP/HTTPS/SSH/Git URLs, git-prefixed SCP, host/path and hosted-git-info shortcut shorthands, @ and # refs, pin state, suffix normalization, clone-safe repo URLs, and owned native source records ported
 packages/coding-agent/src/utils/highlight-js-lib-index.d.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/utils/html.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/utils/image-convert.ts	bulb_coding_agent	source	pending		
@@ -618,7 +618,7 @@ packages/coding-agent/test/footer-width.test.ts	bulb_coding_agent	test	pending
 packages/coding-agent/test/format-resume-command.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/frontmatter.test.ts	bulb_coding_agent	test	implemented	src/bulb_coding_agent/frontmatter.zig	Upstream quoted keys, normalized newlines, invalid YAML line/column, multiline scalar, missing delimiter, comment-only map, strip, and plain-body regressions ported
 packages/coding-agent/test/git-merge-and-resolve-extension.test.ts	bulb_coding_agent	test	pending		
-packages/coding-agent/test/git-ssh-url.test.ts	bulb_coding_agent	test	implemented	src/bulb_coding_agent/git.zig	Upstream explicit protocol, git-prefixed shorthand, @ ref, and unsupported unprefixed shorthand regressions ported
+packages/coding-agent/test/git-ssh-url.test.ts	bulb_coding_agent	test	implemented	src/bulb_coding_agent/git.zig	Upstream explicit protocol, git-prefixed shorthand, hosted alias, @/# ref, and unsupported unprefixed shorthand regressions ported
 packages/coding-agent/test/git-update.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/image-processing.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/image-resize-callers.test.ts	bulb_coding_agent	test	pending		
