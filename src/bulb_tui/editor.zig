@@ -19,6 +19,11 @@ const AutocompleteRequest = struct {
     force: bool,
     explicit_tab: bool,
 };
+const DEFAULT_AUTOCOMPLETE_PRIMARY_COLUMN_WIDTH: usize = 32;
+const SLASH_AUTOCOMPLETE_MIN_PRIMARY_COLUMN_WIDTH: usize = 12;
+const SLASH_AUTOCOMPLETE_MAX_PRIMARY_COLUMN_WIDTH: usize = 32;
+const AUTOCOMPLETE_PRIMARY_COLUMN_GAP: usize = 2;
+const AUTOCOMPLETE_MIN_DESCRIPTION_WIDTH: usize = 10;
 
 pub const Cursor = struct {
     line: usize,
@@ -598,6 +603,21 @@ pub const Editor = struct {
         }
 
         try result.append(allocator, try repeatedText(allocator, "─", width));
+
+        if (self.autocomplete_state != null and self.autocomplete_items.len > 0) {
+            const autocomplete_rows = try self.renderAutocompleteRows(allocator, content_width);
+            defer freeLines(allocator, autocomplete_rows);
+            for (autocomplete_rows) |row| {
+                var line: std.ArrayList(u8) = .empty;
+                errdefer line.deinit(allocator);
+                try line.appendSlice(allocator, left_padding);
+                try line.appendSlice(allocator, row);
+                try appendSpaces(allocator, &line, content_width -| visibleWidth(row));
+                try line.appendSlice(allocator, right_padding);
+                try result.append(allocator, try line.toOwnedSlice(allocator));
+            }
+        }
+
         return result.toOwnedSlice(allocator);
     }
 
@@ -1659,7 +1679,7 @@ pub const Editor = struct {
             var with_cursor: std.ArrayList(u8) = .empty;
             errdefer with_cursor.deinit(allocator);
             try with_cursor.appendSlice(allocator, display.items[0..cursor_pos]);
-            if (self.focused) try with_cursor.appendSlice(allocator, CURSOR_MARKER);
+            if (self.focused and self.autocomplete_state == null) try with_cursor.appendSlice(allocator, CURSOR_MARKER);
             if (cursor_pos < display.items.len) {
                 const cursor_end = self.nextSegmentEnd(display.items, cursor_pos);
                 try with_cursor.appendSlice(allocator, "\x1b[7m");
@@ -1681,6 +1701,124 @@ pub const Editor = struct {
         try appendSpaces(allocator, &output, content_width -| line_visible_width);
         try output.appendSlice(allocator, right_padding);
         return output.toOwnedSlice(allocator);
+    }
+
+    fn renderAutocompleteRows(self: *const Editor, allocator: std.mem.Allocator, width: usize) ![][]u8 {
+        var rows: std.ArrayList([]u8) = .empty;
+        errdefer {
+            for (rows.items) |row| allocator.free(row);
+            rows.deinit(allocator);
+        }
+
+        const primary_column_width = self.getAutocompletePrimaryColumnWidth();
+        const max_visible = @min(self.autocomplete_max_visible, self.autocomplete_items.len);
+        const half_visible = max_visible / 2;
+        const selected = @min(self.autocomplete_selected_index, self.autocomplete_items.len - 1);
+        const max_start = self.autocomplete_items.len - max_visible;
+        const centered_start = if (selected > half_visible) selected - half_visible else 0;
+        const start_index = @min(centered_start, max_start);
+        const end_index = start_index + max_visible;
+
+        var index = start_index;
+        while (index < end_index) : (index += 1) {
+            try rows.append(allocator, try self.renderAutocompleteItem(
+                allocator,
+                self.autocomplete_items[index],
+                index == selected,
+                width,
+                primary_column_width,
+            ));
+        }
+
+        if (start_index > 0 or end_index < self.autocomplete_items.len) {
+            const scroll_text = try std.fmt.allocPrint(allocator, "  ({d}/{d})", .{ selected + 1, self.autocomplete_items.len });
+            defer allocator.free(scroll_text);
+            const scroll_width = if (width >= AUTOCOMPLETE_PRIMARY_COLUMN_GAP) width - AUTOCOMPLETE_PRIMARY_COLUMN_GAP else 0;
+            try rows.append(allocator, try truncateToVisibleWidth(allocator, scroll_text, scroll_width));
+        }
+
+        return rows.toOwnedSlice(allocator);
+    }
+
+    fn renderAutocompleteItem(
+        self: *const Editor,
+        allocator: std.mem.Allocator,
+        item: autocomplete.AutocompleteItem,
+        is_selected: bool,
+        width: usize,
+        primary_column_width: usize,
+    ) ![]u8 {
+        _ = self;
+        const prefix = if (is_selected) "→ " else "  ";
+        const prefix_width = visibleWidth(prefix);
+        const display_value = autocompleteDisplayValue(item);
+
+        if (item.description) |description| {
+            const description_single_line = try normalizeAutocompleteDescription(allocator, description);
+            defer allocator.free(description_single_line);
+
+            if (width > 40) {
+                const available_primary = if (width > prefix_width + 4) width - prefix_width - 4 else 0;
+                const effective_primary_column_width = @max(@as(usize, 1), @min(primary_column_width, available_primary));
+                const max_primary_width = if (effective_primary_column_width > AUTOCOMPLETE_PRIMARY_COLUMN_GAP)
+                    effective_primary_column_width - AUTOCOMPLETE_PRIMARY_COLUMN_GAP
+                else
+                    1;
+                const truncated_value = try truncateToVisibleWidth(allocator, display_value, max_primary_width);
+                defer allocator.free(truncated_value);
+
+                const truncated_value_width = visibleWidth(truncated_value);
+                const spacing_width = @max(@as(usize, 1), effective_primary_column_width -| truncated_value_width);
+                const description_start = prefix_width + truncated_value_width + spacing_width;
+                const remaining_width = if (width > description_start + AUTOCOMPLETE_PRIMARY_COLUMN_GAP)
+                    width - description_start - AUTOCOMPLETE_PRIMARY_COLUMN_GAP
+                else
+                    0;
+
+                if (remaining_width > AUTOCOMPLETE_MIN_DESCRIPTION_WIDTH) {
+                    const truncated_description = try truncateToVisibleWidth(allocator, description_single_line, remaining_width);
+                    defer allocator.free(truncated_description);
+
+                    var line: std.ArrayList(u8) = .empty;
+                    errdefer line.deinit(allocator);
+                    try line.appendSlice(allocator, prefix);
+                    try line.appendSlice(allocator, truncated_value);
+                    try appendSpaces(allocator, &line, spacing_width);
+                    try line.appendSlice(allocator, truncated_description);
+                    return line.toOwnedSlice(allocator);
+                }
+            }
+        }
+
+        const max_width = if (width > prefix_width + AUTOCOMPLETE_PRIMARY_COLUMN_GAP)
+            width - prefix_width - AUTOCOMPLETE_PRIMARY_COLUMN_GAP
+        else
+            0;
+        const truncated_value = try truncateToVisibleWidth(allocator, display_value, max_width);
+        defer allocator.free(truncated_value);
+        return std.mem.concat(allocator, u8, &.{ prefix, truncated_value });
+    }
+
+    fn getAutocompletePrimaryColumnWidth(self: *const Editor) usize {
+        const bounds = self.getAutocompletePrimaryColumnBounds();
+        var widest_primary: usize = 0;
+        for (self.autocomplete_items) |item| {
+            widest_primary = @max(widest_primary, visibleWidth(autocompleteDisplayValue(item)) + AUTOCOMPLETE_PRIMARY_COLUMN_GAP);
+        }
+        return clampUsize(widest_primary, bounds.min, bounds.max);
+    }
+
+    fn getAutocompletePrimaryColumnBounds(self: *const Editor) struct { min: usize, max: usize } {
+        if (std.mem.startsWith(u8, self.autocomplete_prefix, "/")) {
+            return .{
+                .min = SLASH_AUTOCOMPLETE_MIN_PRIMARY_COLUMN_WIDTH,
+                .max = SLASH_AUTOCOMPLETE_MAX_PRIMARY_COLUMN_WIDTH,
+            };
+        }
+        return .{
+            .min = DEFAULT_AUTOCOMPLETE_PRIMARY_COLUMN_WIDTH,
+            .max = DEFAULT_AUTOCOMPLETE_PRIMARY_COLUMN_WIDTH,
+        };
     }
 
     fn expandPasteMarkers(self: *const Editor, allocator: std.mem.Allocator, text: []const u8) ![]u8 {
@@ -2293,6 +2431,68 @@ fn getBestAutocompleteMatchIndex(items: []const autocomplete.AutocompleteItem, p
         }
     }
     return first_prefix_index;
+}
+
+fn autocompleteDisplayValue(item: autocomplete.AutocompleteItem) []const u8 {
+    if (item.label.len > 0) return item.label;
+    return item.value;
+}
+
+fn clampUsize(value: usize, min: usize, max: usize) usize {
+    return @max(min, @min(value, max));
+}
+
+fn normalizeAutocompleteDescription(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(allocator);
+
+    var in_newline_run = false;
+    for (text) |byte| {
+        if (byte == '\r' or byte == '\n') {
+            if (!in_newline_run) {
+                try output.append(allocator, ' ');
+                in_newline_run = true;
+            }
+        } else {
+            try output.append(allocator, byte);
+            in_newline_run = false;
+        }
+    }
+
+    const trimmed = std.mem.trim(u8, output.items, " \t\r\n");
+    const result = try allocator.dupe(u8, trimmed);
+    output.deinit(allocator);
+    return result;
+}
+
+fn truncateToVisibleWidth(allocator: std.mem.Allocator, text: []const u8, max_width: usize) ![]u8 {
+    if (max_width == 0) return allocator.dupe(u8, "");
+    if (visibleWidth(text) <= max_width) return allocator.dupe(u8, text);
+
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(allocator);
+    var width: usize = 0;
+    var index: usize = 0;
+    while (index < text.len) {
+        if (extractAnsiCode(text, index)) |ansi| {
+            try output.appendSlice(allocator, ansi.code);
+            index += ansi.length;
+            continue;
+        }
+
+        const end = nextGraphemeEnd(text, index);
+        if (end == index) {
+            index += 1;
+            continue;
+        }
+        const grapheme = text[index..end];
+        const grapheme_width = visibleWidth(grapheme);
+        if (width + grapheme_width > max_width) break;
+        try output.appendSlice(allocator, grapheme);
+        width += grapheme_width;
+        index = end;
+    }
+    return output.toOwnedSlice(allocator);
 }
 
 fn isSymbolAutocompleteContext(text_before_cursor: []const u8) bool {
@@ -3219,6 +3419,60 @@ test "Editor autocomplete integration" {
         try editor.flushAutocomplete();
         try expectText(&editor, "");
         try std.testing.expect(!editor.isShowingAutocomplete());
+    }
+    {
+        var editor = try Editor.init(allocator, .{});
+        defer editor.deinit();
+        editor.focused = true;
+        var provider = TestAutocompleteProvider{ .scenario = .slash_commands };
+        editor.setAutocompleteProvider(provider.provider());
+
+        try editor.handleInput("/");
+        try editor.flushAutocomplete();
+        try std.testing.expect(editor.isShowingAutocomplete());
+
+        const rendered = try editor.render(allocator, 60);
+        defer {
+            freeRenderedLines(allocator, rendered);
+            allocator.free(rendered);
+        }
+        try std.testing.expect(rendered.len >= 5);
+        try std.testing.expect(strippedContains(rendered[3], "model"));
+        try std.testing.expect(strippedContains(rendered[3], "Change model"));
+        try std.testing.expect(strippedContains(rendered[4], "help"));
+        try std.testing.expect(strippedContains(rendered[4], "Show help"));
+        try std.testing.expectEqual(@as(usize, 60), visibleWidth(rendered[3]));
+        for (rendered) |line| {
+            try std.testing.expect(std.mem.indexOf(u8, line, CURSOR_MARKER) == null);
+        }
+    }
+    {
+        var editor = try Editor.init(allocator, .{});
+        defer editor.deinit();
+        editor.setAutocompleteMaxVisible(2);
+        try std.testing.expectEqual(@as(usize, 3), editor.getAutocompleteMaxVisible());
+        var provider = TestAutocompleteProvider{ .scenario = .force_files };
+        editor.setAutocompleteProvider(provider.provider());
+
+        try editor.handleInput("\t");
+        try editor.flushAutocomplete();
+        try std.testing.expect(editor.isShowingAutocomplete());
+
+        var rendered = try editor.render(allocator, 42);
+        defer {
+            freeRenderedLines(allocator, rendered);
+            allocator.free(rendered);
+        }
+        try std.testing.expectEqual(@as(usize, 7), rendered.len);
+        try std.testing.expect(strippedContains(rendered[3], "readme.md"));
+        try std.testing.expect(strippedContains(rendered[6], "(1/4)"));
+
+        try editor.handleInput("\x1b[B");
+        freeRenderedLines(allocator, rendered);
+        allocator.free(rendered);
+        rendered = try editor.render(allocator, 42);
+        try std.testing.expect(strippedContains(rendered[4], "package.json"));
+        try std.testing.expect(strippedContains(rendered[6], "(2/4)"));
     }
     {
         const items = [_]autocomplete.AutocompleteItem{
