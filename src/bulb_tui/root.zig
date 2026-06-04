@@ -1899,6 +1899,9 @@ pub const TUI = struct {
                 last_changed = index;
             }
         }
+        if (first_changed) |changed| {
+            last_changed = self.expandLastChangedForKittyImages(changed, last_changed);
+        }
 
         if (!full_render and first_changed == null) {
             freeOwnedLines(self.allocator, new_lines);
@@ -2074,6 +2077,17 @@ pub const TUI = struct {
             defer self.allocator.free(sequence);
             try buffer.appendSlice(self.allocator, sequence);
         }
+    }
+
+    fn expandLastChangedForKittyImages(self: *TUI, first_changed: usize, last_changed: usize) usize {
+        var expanded = last_changed;
+        var line_index = first_changed;
+        while (line_index < self.previous_lines.len) : (line_index += 1) {
+            if (extractKittyImageId(self.previous_lines[line_index]) != null) {
+                expanded = @max(expanded, line_index);
+            }
+        }
+        return expanded;
     }
 
     fn appendDeleteChangedKittyImages(self: *TUI, buffer: *std.ArrayList(u8), first_changed: usize, last_changed: usize) !void {
@@ -5325,6 +5339,17 @@ fn expectViewportChar(allocator: std.mem.Allocator, virtual_terminal: *VirtualTe
     try std.testing.expectEqual(expected, viewport[row][col]);
 }
 
+fn expectLineContains(line: []const u8, needle: []const u8) !void {
+    try std.testing.expect(std.mem.indexOf(u8, line, needle) != null);
+}
+
+fn expectViewportLineContains(allocator: std.mem.Allocator, virtual_terminal: *VirtualTerminal, row: usize, needle: []const u8) !void {
+    const viewport = try virtual_terminal.getViewport(allocator);
+    defer freeOwnedLines(allocator, viewport);
+    try std.testing.expect(row < viewport.len);
+    try expectLineContains(viewport[row], needle);
+}
+
 fn removeTableNoise(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
     var output: std.ArrayList(u8) = .empty;
     errdefer output.deinit(allocator);
@@ -5484,6 +5509,130 @@ test "TUI clears stale rows when content shrinks and then appends differentially
     try std.testing.expect(std.mem.indexOf(u8, next_viewport[2], "Line 2") != null);
 }
 
+test "TUI shrink handling clears single-line and empty content" {
+    const allocator = std.testing.allocator;
+    var virtual_terminal = VirtualTerminal.init(allocator, 40, 10);
+    defer virtual_terminal.deinit();
+    var tui = TUI.init(allocator, virtual_terminal.asTerminal());
+    defer tui.deinit();
+    tui.setClearOnShrink(true);
+    var component = TestLinesComponent{ .lines = &.{ "Line 0", "Line 1", "Line 2", "Line 3" } };
+    try tui.addChild(Component.from(TestLinesComponent, &component));
+
+    try tui.start();
+    defer tui.stop() catch {};
+
+    component.lines = &.{"Only line"};
+    try tui.requestRender(false);
+    const viewport = try virtual_terminal.getViewport(allocator);
+    defer freeOwnedLines(allocator, viewport);
+    try expectLineContains(viewport[0], "Only line");
+    try std.testing.expectEqualStrings("", viewport[1]);
+
+    component.lines = &.{ "Line 0", "Line 1", "Line 2" };
+    try tui.requestRender(false);
+    component.lines = &.{};
+    try tui.requestRender(false);
+
+    const empty_viewport = try virtual_terminal.getViewport(allocator);
+    defer freeOwnedLines(allocator, empty_viewport);
+    try std.testing.expectEqualStrings("", empty_viewport[0]);
+    try std.testing.expectEqualStrings("", empty_viewport[1]);
+}
+
+test "TUI differential rendering updates unchanged-row shrink and spinner cases" {
+    const allocator = std.testing.allocator;
+    var virtual_terminal = VirtualTerminal.init(allocator, 40, 10);
+    defer virtual_terminal.deinit();
+    var tui = TUI.init(allocator, virtual_terminal.asTerminal());
+    defer tui.deinit();
+    tui.setClearOnShrink(false);
+    var component = TestLinesComponent{ .lines = &.{ "Line 0", "Line 1", "Line 2", "Line 3", "Line 4" } };
+    try tui.addChild(Component.from(TestLinesComponent, &component));
+
+    try tui.start();
+    defer tui.stop() catch {};
+
+    component.lines = &.{ "Line 0", "Line 1", "Line 2" };
+    try tui.requestRender(false);
+    component.lines = &.{ "Line 0", "CHANGED", "Line 2" };
+    try tui.requestRender(false);
+    try expectViewportLineContains(allocator, &virtual_terminal, 1, "CHANGED");
+
+    component.lines = &.{ "Header", "Working...", "Footer" };
+    try tui.requestRender(false);
+    const spinner_frames = [_][]const u8{ "|", "/", "-", "\\" };
+    for (spinner_frames) |frame| {
+        const working = try std.fmt.allocPrint(allocator, "Working {s}", .{frame});
+        defer allocator.free(working);
+        component.lines = &.{ "Header", working, "Footer" };
+        try tui.requestRender(false);
+
+        const viewport = try virtual_terminal.getViewport(allocator);
+        defer freeOwnedLines(allocator, viewport);
+        try expectLineContains(viewport[0], "Header");
+        try expectLineContains(viewport[1], working);
+        try expectLineContains(viewport[2], "Footer");
+    }
+}
+
+test "TUI differential rendering preserves rows around line-level changes" {
+    const allocator = std.testing.allocator;
+    var virtual_terminal = VirtualTerminal.init(allocator, 40, 10);
+    defer virtual_terminal.deinit();
+    var tui = TUI.init(allocator, virtual_terminal.asTerminal());
+    defer tui.deinit();
+    var component = TestLinesComponent{ .lines = &.{ "Line 0", "Line 1", "Line 2", "Line 3" } };
+    try tui.addChild(Component.from(TestLinesComponent, &component));
+
+    try tui.start();
+    defer tui.stop() catch {};
+
+    component.lines = &.{ "CHANGED", "Line 1", "Line 2", "Line 3" };
+    try tui.requestRender(false);
+    try expectViewportLineContains(allocator, &virtual_terminal, 0, "CHANGED");
+    try expectViewportLineContains(allocator, &virtual_terminal, 1, "Line 1");
+    try expectViewportLineContains(allocator, &virtual_terminal, 2, "Line 2");
+    try expectViewportLineContains(allocator, &virtual_terminal, 3, "Line 3");
+
+    component.lines = &.{ "Line 0", "Line 1", "Line 2", "CHANGED" };
+    try tui.requestRender(false);
+    try expectViewportLineContains(allocator, &virtual_terminal, 0, "Line 0");
+    try expectViewportLineContains(allocator, &virtual_terminal, 1, "Line 1");
+    try expectViewportLineContains(allocator, &virtual_terminal, 2, "Line 2");
+    try expectViewportLineContains(allocator, &virtual_terminal, 3, "CHANGED");
+
+    component.lines = &.{ "Line 0", "CHANGED 1", "Line 2", "CHANGED 3", "Line 4" };
+    try tui.requestRender(false);
+    try expectViewportLineContains(allocator, &virtual_terminal, 0, "Line 0");
+    try expectViewportLineContains(allocator, &virtual_terminal, 1, "CHANGED 1");
+    try expectViewportLineContains(allocator, &virtual_terminal, 2, "Line 2");
+    try expectViewportLineContains(allocator, &virtual_terminal, 3, "CHANGED 3");
+    try expectViewportLineContains(allocator, &virtual_terminal, 4, "Line 4");
+}
+
+test "TUI differential rendering recovers from empty content" {
+    const allocator = std.testing.allocator;
+    var virtual_terminal = VirtualTerminal.init(allocator, 40, 10);
+    defer virtual_terminal.deinit();
+    var tui = TUI.init(allocator, virtual_terminal.asTerminal());
+    defer tui.deinit();
+    var component = TestLinesComponent{ .lines = &.{ "Line 0", "Line 1", "Line 2" } };
+    try tui.addChild(Component.from(TestLinesComponent, &component));
+
+    try tui.start();
+    defer tui.stop() catch {};
+
+    try expectViewportLineContains(allocator, &virtual_terminal, 0, "Line 0");
+    component.lines = &.{};
+    try tui.requestRender(false);
+    component.lines = &.{ "New Line 0", "New Line 1" };
+    try tui.requestRender(false);
+
+    try expectViewportLineContains(allocator, &virtual_terminal, 0, "New Line 0");
+    try expectViewportLineContains(allocator, &virtual_terminal, 1, "New Line 1");
+}
+
 test "TUI full redraws when deleted lines move the viewport upward" {
     const allocator = std.testing.allocator;
     var virtual_terminal = VirtualTerminal.init(allocator, 20, 5);
@@ -5511,6 +5660,63 @@ test "TUI full redraws when deleted lines move the viewport upward" {
     defer freeOwnedLines(allocator, viewport);
     try std.testing.expectEqualStrings("Line 2", viewport[0]);
     try std.testing.expectEqualStrings("Line 6", viewport[4]);
+}
+
+test "TUI clears stale content after transient component inflates rendered height" {
+    const allocator = std.testing.allocator;
+    var virtual_terminal = VirtualTerminal.init(allocator, 40, 10);
+    defer virtual_terminal.deinit();
+    var tui = TUI.init(allocator, virtual_terminal.asTerminal());
+    defer tui.deinit();
+
+    const long_chat = [_][]const u8{
+        "Chat 0",  "Chat 1",  "Chat 2",  "Chat 3",  "Chat 4",
+        "Chat 5",  "Chat 6",  "Chat 7",  "Chat 8",  "Chat 9",
+        "Chat 10", "Chat 11", "Chat 12", "Chat 13", "Chat 14",
+    };
+    const short_chat = [_][]const u8{
+        "Chat 0", "Chat 1", "Chat 2", "Chat 3", "Chat 4",  "Chat 5",
+        "Chat 6", "Chat 7", "Chat 8", "Chat 9", "Chat 10", "Chat 11",
+    };
+    const editor_lines = [_][]const u8{ "Editor 0", "Editor 1", "Editor 2" };
+    const selector_lines = [_][]const u8{
+        "Selector 0", "Selector 1", "Selector 2", "Selector 3",
+        "Selector 4", "Selector 5", "Selector 6", "Selector 7",
+    };
+
+    var chat = TestLinesComponent{ .lines = long_chat[0..] };
+    var editor = TestLinesComponent{ .lines = editor_lines[0..] };
+    try tui.addChild(Component.from(TestLinesComponent, &chat));
+    try tui.addChild(Component.from(TestLinesComponent, &editor));
+
+    try tui.start();
+    defer tui.stop() catch {};
+
+    editor.lines = selector_lines[0..];
+    try tui.requestRender(false);
+    editor.lines = editor_lines[0..];
+    try tui.requestRender(false);
+
+    const redraws_before_switch = tui.fullRedraws();
+    chat.lines = short_chat[0..];
+    try tui.requestRender(false);
+    try std.testing.expect(tui.fullRedraws() > redraws_before_switch);
+
+    const viewport = try virtual_terminal.getViewport(allocator);
+    defer freeOwnedLines(allocator, viewport);
+    for (viewport) |line| {
+        try std.testing.expect(std.mem.indexOf(u8, line, "Chat 12") == null);
+        try std.testing.expect(std.mem.indexOf(u8, line, "Chat 13") == null);
+        try std.testing.expect(std.mem.indexOf(u8, line, "Chat 14") == null);
+    }
+
+    const expected = [_][]const u8{
+        "Chat 5",  "Chat 6",  "Chat 7",   "Chat 8",   "Chat 9",
+        "Chat 10", "Chat 11", "Editor 0", "Editor 1", "Editor 2",
+    };
+    for (expected, 0..) |line, index| {
+        try std.testing.expectEqualStrings(line, viewport[index]);
+    }
 }
 
 test "TUI deletes changed Kitty image ids before drawing moved placements" {
@@ -5541,6 +5747,65 @@ test "TUI deletes changed Kitty image ids before drawing moved placements" {
     try std.testing.expect(delete_index != std.math.maxInt(usize));
     try std.testing.expect(draw_index != std.math.maxInt(usize));
     try std.testing.expect(delete_index < draw_index);
+}
+
+test "TUI redraws image lines when an earlier reserved image row changes" {
+    const allocator = std.testing.allocator;
+    var virtual_terminal = VirtualTerminal.init(allocator, 40, 10);
+    defer virtual_terminal.deinit();
+    var tui = TUI.init(allocator, virtual_terminal.asTerminal());
+    defer tui.deinit();
+
+    const image = try terminal_image.encodeKitty(allocator, "AAAA", .{ .columns = 2, .rows = 2, .image_id = 88, .move_cursor = false });
+    defer allocator.free(image);
+
+    var component = TestLinesComponent{ .lines = &.{ "", image } };
+    try tui.addChild(Component.from(TestLinesComponent, &component));
+    try tui.start();
+    defer tui.stop() catch {};
+    virtual_terminal.clearWrites();
+
+    component.lines = &.{ "covered", image };
+    try tui.requestRender(false);
+
+    const writes = virtual_terminal.getWrites();
+    const delete_sequence = try terminal_image.deleteKittyImage(allocator, 88);
+    defer allocator.free(delete_sequence);
+    const delete_index = std.mem.indexOf(u8, writes, delete_sequence) orelse std.math.maxInt(usize);
+    const draw_index = std.mem.indexOf(u8, writes, image) orelse std.math.maxInt(usize);
+    try std.testing.expect(delete_index != std.math.maxInt(usize));
+    try std.testing.expect(draw_index != std.math.maxInt(usize));
+    try std.testing.expect(delete_index < draw_index);
+    try std.testing.expect(std.mem.indexOf(u8, writes, "\x1b[2J") == null);
+}
+
+test "TUI deletes previously rendered Kitty image ids during full redraws" {
+    const allocator = std.testing.allocator;
+    var virtual_terminal = VirtualTerminal.init(allocator, 40, 10);
+    defer virtual_terminal.deinit();
+    var tui = TUI.init(allocator, virtual_terminal.asTerminal());
+    defer tui.deinit();
+
+    const image = try terminal_image.encodeKitty(allocator, "AAAA", .{ .columns = 2, .rows = 2, .image_id = 77, .move_cursor = false });
+    defer allocator.free(image);
+
+    var component = TestLinesComponent{ .lines = &.{image} };
+    try tui.addChild(Component.from(TestLinesComponent, &component));
+    try tui.start();
+    defer tui.stop() catch {};
+    virtual_terminal.clearWrites();
+
+    component.lines = &.{"plain text"};
+    try tui.requestRender(true);
+
+    const writes = virtual_terminal.getWrites();
+    const delete_sequence = try terminal_image.deleteKittyImage(allocator, 77);
+    defer allocator.free(delete_sequence);
+    const delete_index = std.mem.indexOf(u8, writes, delete_sequence) orelse std.math.maxInt(usize);
+    const clear_index = std.mem.indexOf(u8, writes, "\x1b[2J") orelse std.math.maxInt(usize);
+    try std.testing.expect(delete_index != std.math.maxInt(usize));
+    try std.testing.expect(clear_index != std.math.maxInt(usize));
+    try std.testing.expect(delete_index < clear_index);
 }
 
 test "TUI overlays render over short content and honor percentage width" {
