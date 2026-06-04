@@ -10,6 +10,13 @@ pub const undo_stack = @import("undo_stack.zig");
 pub const stdin_buffer = @import("stdin_buffer.zig");
 pub const terminal_image = @import("terminal_image.zig");
 pub const native_modifiers = @import("native_modifiers.zig");
+pub const terminal = @import("terminal.zig");
+
+pub const Terminal = terminal.Terminal;
+pub const ProcessTerminal = terminal.ProcessTerminal;
+pub const KeyboardProtocolNegotiationSequence = terminal.KeyboardProtocolNegotiationSequence;
+pub const parseKeyboardProtocolNegotiationSequence = terminal.parseKeyboardProtocolNegotiationSequence;
+pub const normalizeAppleTerminalInput = terminal.normalizeAppleTerminalInput;
 
 const ESC: u8 = 0x1b;
 const BEL: u8 = 0x07;
@@ -951,6 +958,10 @@ pub const Component = struct {
     ptr: *anyopaque,
     render_fn: *const fn (*anyopaque, std.mem.Allocator, usize) anyerror![][]u8,
     invalidate_fn: ?*const fn (*anyopaque) void = null,
+    handle_input_fn: ?*const fn (*anyopaque, std.mem.Allocator, []const u8) anyerror!void = null,
+    wants_key_release_fn: ?*const fn (*anyopaque) bool = null,
+    set_focused_fn: ?*const fn (*anyopaque, bool) void = null,
+    get_focused_fn: ?*const fn (*anyopaque) bool = null,
 
     pub fn from(comptime T: type, ptr: *T) Component {
         const Adapter = struct {
@@ -965,12 +976,50 @@ pub const Component = struct {
                     self.invalidate();
                 }
             }
+
+            fn handleInput(raw: *anyopaque, allocator: std.mem.Allocator, data: []const u8) anyerror!void {
+                if (@hasDecl(T, "handleInput")) {
+                    const self: *T = @ptrCast(@alignCast(raw));
+                    try self.handleInput(allocator, data);
+                }
+            }
+
+            fn wantsKeyRelease(raw: *anyopaque) bool {
+                if (@hasDecl(T, "wantsKeyRelease")) {
+                    const self: *T = @ptrCast(@alignCast(raw));
+                    return self.wantsKeyRelease();
+                }
+                if (@hasField(T, "wants_key_release")) {
+                    const self: *T = @ptrCast(@alignCast(raw));
+                    return self.wants_key_release;
+                }
+                return false;
+            }
+
+            fn setFocused(raw: *anyopaque, focused: bool) void {
+                if (@hasField(T, "focused")) {
+                    const self: *T = @ptrCast(@alignCast(raw));
+                    self.focused = focused;
+                }
+            }
+
+            fn getFocused(raw: *anyopaque) bool {
+                if (@hasField(T, "focused")) {
+                    const self: *T = @ptrCast(@alignCast(raw));
+                    return self.focused;
+                }
+                return false;
+            }
         };
 
         return .{
             .ptr = ptr,
             .render_fn = Adapter.render,
             .invalidate_fn = if (@hasDecl(T, "invalidate")) Adapter.invalidate else null,
+            .handle_input_fn = if (@hasDecl(T, "handleInput")) Adapter.handleInput else null,
+            .wants_key_release_fn = if (@hasDecl(T, "wantsKeyRelease") or @hasField(T, "wants_key_release")) Adapter.wantsKeyRelease else null,
+            .set_focused_fn = if (@hasField(T, "focused")) Adapter.setFocused else null,
+            .get_focused_fn = if (@hasField(T, "focused")) Adapter.getFocused else null,
         };
     }
 
@@ -981,7 +1030,1091 @@ pub const Component = struct {
     pub fn invalidate(self: Component) void {
         if (self.invalidate_fn) |invalidate_fn| invalidate_fn(self.ptr);
     }
+
+    pub fn handleInput(self: Component, allocator: std.mem.Allocator, data: []const u8) !void {
+        if (self.handle_input_fn) |handle_input_fn| try handle_input_fn(self.ptr, allocator, data);
+    }
+
+    pub fn canHandleInput(self: Component) bool {
+        return self.handle_input_fn != null;
+    }
+
+    pub fn wantsKeyRelease(self: Component) bool {
+        if (self.wants_key_release_fn) |wants_key_release_fn| return wants_key_release_fn(self.ptr);
+        return false;
+    }
+
+    pub fn isFocusable(self: Component) bool {
+        return self.set_focused_fn != null;
+    }
+
+    pub fn setFocused(self: Component, focused: bool) void {
+        if (self.set_focused_fn) |set_focused_fn| set_focused_fn(self.ptr, focused);
+    }
+
+    pub fn isFocused(self: Component) bool {
+        if (self.get_focused_fn) |get_focused_fn| return get_focused_fn(self.ptr);
+        return false;
+    }
 };
+
+pub const CURSOR_MARKER = "\x1b_pi:c\x07";
+const TUI_SEGMENT_RESET = "\x1b[0m\x1b]8;;\x07";
+
+pub const Container = struct {
+    allocator: std.mem.Allocator,
+    children: std.ArrayList(Component) = .empty,
+
+    pub fn init(allocator: std.mem.Allocator) Container {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *Container) void {
+        self.children.deinit(self.allocator);
+    }
+
+    pub fn addChild(self: *Container, component: Component) !void {
+        try self.children.append(self.allocator, component);
+    }
+
+    pub fn removeChild(self: *Container, component: Component) void {
+        for (self.children.items, 0..) |child, index| {
+            if (child.ptr == component.ptr) {
+                _ = self.children.orderedRemove(index);
+                return;
+            }
+        }
+    }
+
+    pub fn clear(self: *Container) void {
+        self.children.clearRetainingCapacity();
+    }
+
+    pub fn invalidate(self: *Container) void {
+        for (self.children.items) |child| child.invalidate();
+    }
+
+    pub fn render(self: *Container, allocator: std.mem.Allocator, width: usize) ![][]u8 {
+        var result: std.ArrayList([]u8) = .empty;
+        errdefer freeOwnedLines(allocator, result.items);
+
+        for (self.children.items) |child| {
+            const rendered = try child.render(allocator, width);
+            defer allocator.free(rendered);
+            for (rendered) |line| try result.append(allocator, line);
+        }
+
+        return result.toOwnedSlice(allocator);
+    }
+};
+
+const VirtualCell = struct {
+    text: []u8,
+    italic: []bool,
+
+    fn deinit(self: *VirtualCell, allocator: std.mem.Allocator) void {
+        allocator.free(self.text);
+        allocator.free(self.italic);
+    }
+};
+
+pub const VirtualTerminal = struct {
+    allocator: std.mem.Allocator,
+    width: usize,
+    height: usize,
+    input_handler: ?terminal.InputCallback = null,
+    resize_handler: ?terminal.VoidCallback = null,
+    screen: std.ArrayList(VirtualCell) = .empty,
+    writes: std.ArrayList(u8) = .empty,
+    cursor_x: usize = 0,
+    cursor_y: usize = 0,
+    kitty_active: bool = true,
+
+    pub fn init(allocator: std.mem.Allocator, column_count: usize, row_count: usize) VirtualTerminal {
+        return .{
+            .allocator = allocator,
+            .width = column_count,
+            .height = row_count,
+        };
+    }
+
+    pub fn deinit(self: *VirtualTerminal) void {
+        self.clearScreenCells();
+        self.screen.deinit(self.allocator);
+        self.writes.deinit(self.allocator);
+    }
+
+    pub fn asTerminal(self: *VirtualTerminal) Terminal {
+        return Terminal.from(VirtualTerminal, self);
+    }
+
+    pub fn start(self: *VirtualTerminal, on_input: terminal.InputCallback, on_resize: terminal.VoidCallback) !void {
+        self.input_handler = on_input;
+        self.resize_handler = on_resize;
+        try self.write("\x1b[?2004h");
+    }
+
+    pub fn drainInput(_: *VirtualTerminal, _: u64, _: u64) !void {}
+
+    pub fn stop(self: *VirtualTerminal) !void {
+        try self.write("\x1b[?2004l");
+        self.input_handler = null;
+        self.resize_handler = null;
+    }
+
+    pub fn write(self: *VirtualTerminal, data: []const u8) !void {
+        try self.writes.appendSlice(self.allocator, data);
+        try self.captureRenderedPayload(data);
+    }
+
+    pub fn columns(self: *VirtualTerminal) usize {
+        return self.width;
+    }
+
+    pub fn rows(self: *VirtualTerminal) usize {
+        return self.height;
+    }
+
+    pub fn kittyProtocolActive(self: *VirtualTerminal) bool {
+        return self.kitty_active;
+    }
+
+    pub fn moveBy(_: *VirtualTerminal, _: isize) !void {}
+
+    pub fn hideCursor(self: *VirtualTerminal) !void {
+        try self.writes.appendSlice(self.allocator, "\x1b[?25l");
+    }
+
+    pub fn showCursor(self: *VirtualTerminal) !void {
+        try self.writes.appendSlice(self.allocator, "\x1b[?25h");
+    }
+
+    pub fn clearLine(_: *VirtualTerminal) !void {}
+
+    pub fn clearFromCursor(_: *VirtualTerminal) !void {}
+
+    pub fn clearScreen(self: *VirtualTerminal) !void {
+        self.clearScreenCells();
+    }
+
+    pub fn setTitle(_: *VirtualTerminal, _: []const u8) !void {}
+
+    pub fn setProgress(_: *VirtualTerminal, _: bool) !void {}
+
+    pub fn sendInput(self: *VirtualTerminal, data: []const u8) void {
+        if (self.input_handler) |handler| handler.call(data);
+    }
+
+    pub fn resize(self: *VirtualTerminal, columns_value: usize, rows_value: usize) void {
+        self.width = columns_value;
+        self.height = rows_value;
+        if (self.resize_handler) |handler| handler.call();
+    }
+
+    pub fn clearWrites(self: *VirtualTerminal) void {
+        self.writes.clearRetainingCapacity();
+    }
+
+    pub fn getWrites(self: *VirtualTerminal) []const u8 {
+        return self.writes.items;
+    }
+
+    pub fn getViewport(self: *VirtualTerminal, allocator: std.mem.Allocator) ![][]u8 {
+        var result = try allocator.alloc([]u8, self.height);
+        var initialized: usize = 0;
+        errdefer {
+            for (result[0..initialized]) |line| allocator.free(line);
+            allocator.free(result);
+        }
+
+        const viewport_start = if (self.screen.items.len > self.height) self.screen.items.len - self.height else 0;
+        var row: usize = 0;
+        while (row < self.height) : (row += 1) {
+            const source_index = viewport_start + row;
+            result[row] = if (source_index < self.screen.items.len)
+                try allocator.dupe(u8, self.screen.items[source_index].text)
+            else
+                try allocator.dupe(u8, "");
+            initialized += 1;
+        }
+        return result;
+    }
+
+    pub fn getCellItalic(self: *VirtualTerminal, row: usize, col: usize) bool {
+        const viewport_start = if (self.screen.items.len > self.height) self.screen.items.len - self.height else 0;
+        const source_index = viewport_start + row;
+        if (source_index >= self.screen.items.len) return false;
+        const line = self.screen.items[source_index];
+        if (col >= line.italic.len) return false;
+        return line.italic[col];
+    }
+
+    pub fn getCursorPosition(self: *const VirtualTerminal) struct { x: usize, y: usize } {
+        return .{ .x = self.cursor_x, .y = self.cursor_y };
+    }
+
+    fn captureRenderedPayload(self: *VirtualTerminal, data: []const u8) !void {
+        if (std.mem.indexOf(u8, data, "\x1b[?2026h")) |start_marker| {
+            const payload_start = start_marker + "\x1b[?2026h".len;
+            const payload_end = std.mem.indexOfPos(u8, data, payload_start, "\x1b[?2026l") orelse data.len;
+            var payload = data[payload_start..payload_end];
+            if (std.mem.indexOf(u8, payload, "\x1b[2J")) |_| self.clearScreenCells();
+            payload = stripKnownTuiControls(payload);
+            try self.replaceScreenFromPayload(payload);
+            return;
+        }
+
+        if (std.mem.indexOf(u8, data, "\x1b[2J") != null) self.clearScreenCells();
+    }
+
+    fn replaceScreenFromPayload(self: *VirtualTerminal, payload: []const u8) !void {
+        self.clearScreenCells();
+
+        var line_start: usize = 0;
+        while (line_start <= payload.len) {
+            const newline = std.mem.indexOfPos(u8, payload, line_start, "\r\n") orelse payload.len;
+            const raw_line = payload[line_start..newline];
+            const parsed = try parseVirtualLine(self.allocator, raw_line);
+            errdefer {
+                var owned = parsed;
+                owned.deinit(self.allocator);
+            }
+            try self.screen.append(self.allocator, parsed);
+            if (newline == payload.len) break;
+            line_start = newline + 2;
+        }
+
+        if (self.screen.items.len == 0) {
+            try self.screen.append(self.allocator, try parseVirtualLine(self.allocator, ""));
+        }
+        self.cursor_y = if (self.screen.items.len == 0) 0 else self.screen.items.len - 1;
+        self.cursor_x = if (self.screen.items.len == 0) 0 else self.screen.items[self.cursor_y].text.len;
+    }
+
+    fn clearScreenCells(self: *VirtualTerminal) void {
+        for (self.screen.items) |*line| line.deinit(self.allocator);
+        self.screen.clearRetainingCapacity();
+        self.cursor_x = 0;
+        self.cursor_y = 0;
+    }
+};
+
+fn stripKnownTuiControls(payload: []const u8) []const u8 {
+    var start: usize = 0;
+    while (true) {
+        if (std.mem.startsWith(u8, payload[start..], "\x1b[2J")) {
+            start += "\x1b[2J".len;
+        } else if (std.mem.startsWith(u8, payload[start..], "\x1b[H")) {
+            start += "\x1b[H".len;
+        } else if (std.mem.startsWith(u8, payload[start..], "\x1b[3J")) {
+            start += "\x1b[3J".len;
+        } else {
+            break;
+        }
+        if (start >= payload.len) break;
+    }
+    return payload[start..];
+}
+
+fn parseVirtualLine(allocator: std.mem.Allocator, line: []const u8) !VirtualCell {
+    var text: std.ArrayList(u8) = .empty;
+    errdefer text.deinit(allocator);
+    var italic_flags: std.ArrayList(bool) = .empty;
+    errdefer italic_flags.deinit(allocator);
+    var tracker: AnsiCodeTracker = .{};
+
+    var index: usize = 0;
+    while (index < line.len) {
+        if (extractAnsiCode(line, index)) |ansi| {
+            tracker.process(ansi.code);
+            index += ansi.length;
+            continue;
+        }
+        const end = nextUtf8SliceEnd(line, index);
+        try text.appendSlice(allocator, line[index..end]);
+        const width = visibleWidth(line[index..end]);
+        const cells = @max(@as(usize, 1), width);
+        var cell: usize = 0;
+        while (cell < cells) : (cell += 1) try italic_flags.append(allocator, tracker.italic);
+        index = end;
+    }
+
+    return .{
+        .text = try text.toOwnedSlice(allocator),
+        .italic = try italic_flags.toOwnedSlice(allocator),
+    };
+}
+
+pub const SizeValue = union(enum) {
+    cells: usize,
+    percent: f64,
+};
+
+pub const OverlayAnchor = enum {
+    center,
+    top_left,
+    top_right,
+    bottom_left,
+    bottom_right,
+    top_center,
+    bottom_center,
+    left_center,
+    right_center,
+};
+
+pub const OverlayMargin = struct {
+    top: usize = 0,
+    right: usize = 0,
+    bottom: usize = 0,
+    left: usize = 0,
+};
+
+pub const OverlayOptions = struct {
+    width: ?SizeValue = null,
+    min_width: ?usize = null,
+    max_height: ?SizeValue = null,
+    anchor: OverlayAnchor = .center,
+    offset_x: isize = 0,
+    offset_y: isize = 0,
+    row: ?SizeValue = null,
+    col: ?SizeValue = null,
+    margin: OverlayMargin = .{},
+    non_capturing: bool = false,
+    visible: ?OverlayVisibleCallback = null,
+};
+
+pub const OverlayVisibleCallback = struct {
+    ptr: ?*anyopaque = null,
+    call_fn: *const fn (?*anyopaque, usize, usize) bool,
+
+    pub fn call(self: OverlayVisibleCallback, width: usize, height: usize) bool {
+        return self.call_fn(self.ptr, width, height);
+    }
+};
+
+pub const OverlayUnfocusOptions = struct {
+    target: ?Component = null,
+};
+
+const OverlayStackEntry = struct {
+    id: usize,
+    component: Component,
+    options: OverlayOptions,
+    pre_focus: ?Component,
+    hidden: bool = false,
+    focus_order: usize,
+};
+
+pub const OverlayHandle = struct {
+    tui: *TUI,
+    id: usize,
+
+    pub fn hide(self: OverlayHandle) void {
+        self.tui.hideOverlayById(self.id);
+    }
+
+    pub fn setHidden(self: OverlayHandle, hidden: bool) void {
+        self.tui.setOverlayHidden(self.id, hidden);
+    }
+
+    pub fn isHidden(self: OverlayHandle) bool {
+        if (self.tui.findOverlayIndex(self.id)) |index| return self.tui.overlay_stack.items[index].hidden;
+        return true;
+    }
+
+    pub fn focus(self: OverlayHandle) void {
+        self.tui.focusOverlay(self.id);
+    }
+
+    pub fn unfocus(self: OverlayHandle, options: ?OverlayUnfocusOptions) void {
+        self.tui.unfocusOverlay(self.id, options);
+    }
+
+    pub fn isFocused(self: OverlayHandle) bool {
+        if (self.tui.findOverlayIndex(self.id)) |index| {
+            return sameComponent(self.tui.focused_component, self.tui.overlay_stack.items[index].component);
+        }
+        return false;
+    }
+};
+
+pub const InputListenerResult = struct {
+    consume: bool = false,
+    data: ?[]const u8 = null,
+};
+
+pub const InputListener = struct {
+    ptr: ?*anyopaque = null,
+    call_fn: *const fn (?*anyopaque, []const u8) InputListenerResult,
+
+    pub fn call(self: InputListener, data: []const u8) InputListenerResult {
+        return self.call_fn(self.ptr, data);
+    }
+};
+
+pub const TUI = struct {
+    allocator: std.mem.Allocator,
+    terminal_handle: Terminal,
+    container: Container,
+    previous_lines: [][]u8 = &.{},
+    previous_kitty_image_ids: std.ArrayList(u32) = .empty,
+    previous_width: usize = 0,
+    previous_height: usize = 0,
+    focused_component: ?Component = null,
+    input_listeners: std.ArrayList(InputListener) = .empty,
+    on_debug: ?terminal.VoidCallback = null,
+    cursor_row: usize = 0,
+    hardware_cursor_row: usize = 0,
+    show_hardware_cursor: bool = false,
+    clear_on_shrink: bool = true,
+    max_lines_rendered: usize = 0,
+    previous_viewport_top: usize = 0,
+    full_redraw_count: usize = 0,
+    stopped: bool = true,
+    focus_order_counter: usize = 0,
+    overlay_id_counter: usize = 0,
+    overlay_stack: std.ArrayList(OverlayStackEntry) = .empty,
+    termux_session: bool = false,
+
+    pub fn init(allocator: std.mem.Allocator, terminal_handle: Terminal) TUI {
+        return .{
+            .allocator = allocator,
+            .terminal_handle = terminal_handle,
+            .container = Container.init(allocator),
+        };
+    }
+
+    pub fn deinit(self: *TUI) void {
+        if (self.previous_lines.len > 0) freeOwnedLines(self.allocator, self.previous_lines);
+        self.previous_kitty_image_ids.deinit(self.allocator);
+        self.input_listeners.deinit(self.allocator);
+        self.overlay_stack.deinit(self.allocator);
+        self.container.deinit();
+    }
+
+    pub fn terminalRef(self: *TUI) Terminal {
+        return self.terminal_handle;
+    }
+
+    pub fn fullRedraws(self: *const TUI) usize {
+        return self.full_redraw_count;
+    }
+
+    pub fn setTermuxSessionForTesting(self: *TUI, enabled: bool) void {
+        self.termux_session = enabled;
+    }
+
+    pub fn getShowHardwareCursor(self: *const TUI) bool {
+        return self.show_hardware_cursor;
+    }
+
+    pub fn setShowHardwareCursor(self: *TUI, enabled: bool) !void {
+        if (self.show_hardware_cursor == enabled) return;
+        self.show_hardware_cursor = enabled;
+        if (!enabled) try self.terminal_handle.hideCursor();
+        try self.requestRender(false);
+    }
+
+    pub fn getClearOnShrink(self: *const TUI) bool {
+        return self.clear_on_shrink;
+    }
+
+    pub fn setClearOnShrink(self: *TUI, enabled: bool) void {
+        self.clear_on_shrink = enabled;
+    }
+
+    pub fn addChild(self: *TUI, component: Component) !void {
+        try self.container.addChild(component);
+    }
+
+    pub fn removeChild(self: *TUI, component: Component) void {
+        self.container.removeChild(component);
+    }
+
+    pub fn clear(self: *TUI) void {
+        self.container.clear();
+    }
+
+    pub fn invalidate(self: *TUI) void {
+        self.container.invalidate();
+        for (self.overlay_stack.items) |entry| entry.component.invalidate();
+    }
+
+    pub fn render(self: *TUI, allocator: std.mem.Allocator, width: usize) ![][]u8 {
+        return self.container.render(allocator, width);
+    }
+
+    pub fn setFocus(self: *TUI, component: ?Component) void {
+        if (self.focused_component) |previous| previous.setFocused(false);
+        self.focused_component = component;
+        if (component) |next| next.setFocused(true);
+    }
+
+    pub fn showOverlay(self: *TUI, component: Component, options: OverlayOptions) !OverlayHandle {
+        self.overlay_id_counter += 1;
+        const entry = OverlayStackEntry{
+            .id = self.overlay_id_counter,
+            .component = component,
+            .options = options,
+            .pre_focus = self.focused_component,
+            .focus_order = self.nextFocusOrder(),
+        };
+        try self.overlay_stack.append(self.allocator, entry);
+        if (!options.non_capturing and self.isOverlayVisible(entry)) self.setFocus(component);
+        self.terminal_handle.hideCursor() catch {};
+        try self.requestRender(false);
+        return .{ .tui = self, .id = entry.id };
+    }
+
+    pub fn hideOverlay(self: *TUI) void {
+        if (self.overlay_stack.items.len == 0) return;
+        const id = self.overlay_stack.items[self.overlay_stack.items.len - 1].id;
+        self.hideOverlayById(id);
+    }
+
+    pub fn hasOverlay(self: *const TUI) bool {
+        for (self.overlay_stack.items) |entry| if (self.isOverlayVisible(entry)) return true;
+        return false;
+    }
+
+    pub fn start(self: *TUI) !void {
+        self.stopped = false;
+        try self.terminal_handle.start(
+            .{ .ptr = self, .call_fn = inputCallback },
+            .{ .ptr = self, .call_fn = resizeCallback },
+        );
+        try self.terminal_handle.hideCursor();
+        try self.queryCellSize();
+        try self.requestRender(false);
+    }
+
+    pub fn stop(self: *TUI) !void {
+        self.stopped = true;
+        if (self.previous_lines.len > 0) try self.terminal_handle.write("\r\n");
+        try self.terminal_handle.showCursor();
+        try self.terminal_handle.stop();
+    }
+
+    pub fn requestRender(self: *TUI, force: bool) !void {
+        if (force) {
+            if (self.previous_lines.len > 0) freeOwnedLines(self.allocator, self.previous_lines);
+            self.previous_lines = &.{};
+            self.previous_width = std.math.maxInt(usize);
+            self.previous_height = std.math.maxInt(usize);
+            self.cursor_row = 0;
+            self.hardware_cursor_row = 0;
+            self.max_lines_rendered = 0;
+            self.previous_viewport_top = 0;
+        }
+        try self.doRender();
+    }
+
+    pub fn addInputListener(self: *TUI, listener: InputListener) !void {
+        try self.input_listeners.append(self.allocator, listener);
+    }
+
+    pub fn removeInputListener(self: *TUI, listener: InputListener) void {
+        for (self.input_listeners.items, 0..) |candidate, index| {
+            if (candidate.ptr == listener.ptr and candidate.call_fn == listener.call_fn) {
+                _ = self.input_listeners.orderedRemove(index);
+                return;
+            }
+        }
+    }
+
+    fn nextFocusOrder(self: *TUI) usize {
+        self.focus_order_counter += 1;
+        return self.focus_order_counter;
+    }
+
+    fn queryCellSize(self: *TUI) !void {
+        if (terminal_image.getCapabilities().images == null) return;
+        try self.terminal_handle.write("\x1b[16t");
+    }
+
+    fn handleInput(self: *TUI, input: []const u8) !void {
+        var data = input;
+        for (self.input_listeners.items) |listener| {
+            const result = listener.call(data);
+            if (result.consume) return;
+            if (result.data) |next| data = next;
+            if (data.len == 0) return;
+        }
+
+        if (try self.consumeCellSizeResponse(data)) return;
+        if (keys.matchesKey(data, "shift+ctrl+d") and self.on_debug != null) {
+            self.on_debug.?.call();
+            return;
+        }
+
+        if (self.focused_component) |focused| {
+            if (keys.isKeyRelease(data) and !focused.wantsKeyRelease()) return;
+            if (focused.canHandleInput()) {
+                try focused.handleInput(self.allocator, data);
+                try self.requestRender(false);
+            }
+        }
+    }
+
+    fn consumeCellSizeResponse(self: *TUI, data: []const u8) !bool {
+        if (!std.mem.startsWith(u8, data, "\x1b[6;") or !std.mem.endsWith(u8, data, "t")) return false;
+        const body = data[4 .. data.len - 1];
+        const semicolon = std.mem.indexOfScalar(u8, body, ';') orelse return false;
+        const height_px = std.fmt.parseInt(usize, body[0..semicolon], 10) catch return false;
+        const width_px = std.fmt.parseInt(usize, body[semicolon + 1 ..], 10) catch return false;
+        if (height_px == 0 or width_px == 0) return true;
+        terminal_image.setCellDimensions(.{ .width_px = width_px, .height_px = height_px });
+        self.invalidate();
+        try self.requestRender(false);
+        return true;
+    }
+
+    fn doRender(self: *TUI) !void {
+        if (self.stopped) return;
+        const width = self.terminal_handle.columns();
+        const height = self.terminal_handle.rows();
+        const width_changed = self.previous_width != 0 and self.previous_width != width;
+        const height_changed = self.previous_height != 0 and self.previous_height != height;
+
+        var new_lines = try self.render(self.allocator, width);
+        errdefer freeOwnedLines(self.allocator, new_lines);
+
+        if (self.overlay_stack.items.len > 0) {
+            const composited = try self.compositeOverlays(new_lines, width, height);
+            freeOwnedLines(self.allocator, new_lines);
+            new_lines = composited;
+        }
+
+        self.extractCursorPosition(&new_lines, height);
+        try applyLineResets(self.allocator, new_lines);
+
+        const first_render = self.previous_lines.len == 0 and !width_changed and !height_changed;
+        var full_render = first_render;
+        var should_clear = false;
+        if (width_changed) {
+            full_render = true;
+            should_clear = true;
+        } else if (height_changed and !self.termux_session) {
+            full_render = true;
+            should_clear = true;
+        } else if (self.clear_on_shrink and new_lines.len < self.max_lines_rendered and self.overlay_stack.items.len == 0) {
+            full_render = true;
+            should_clear = true;
+        } else if (new_lines.len < self.previous_lines.len and new_lines.len > 0 and new_lines.len - 1 < self.previous_viewport_top) {
+            full_render = true;
+            should_clear = true;
+        }
+
+        var first_changed: ?usize = null;
+        var last_changed: usize = 0;
+        const max_lines = @max(new_lines.len, self.previous_lines.len);
+        var index: usize = 0;
+        while (index < max_lines) : (index += 1) {
+            const old_line = if (index < self.previous_lines.len) self.previous_lines[index] else "";
+            const new_line = if (index < new_lines.len) new_lines[index] else "";
+            if (!std.mem.eql(u8, old_line, new_line)) {
+                if (first_changed == null) first_changed = index;
+                last_changed = index;
+            }
+        }
+
+        if (!full_render and first_changed == null) {
+            freeOwnedLines(self.allocator, new_lines);
+            self.previous_width = width;
+            self.previous_height = height;
+            return;
+        }
+
+        var buffer: std.ArrayList(u8) = .empty;
+        defer buffer.deinit(self.allocator);
+        try buffer.appendSlice(self.allocator, "\x1b[?2026h");
+        if (should_clear) {
+            try self.appendDeleteKittyImages(&buffer, self.previous_kitty_image_ids.items);
+            try buffer.appendSlice(self.allocator, "\x1b[2J\x1b[H\x1b[3J");
+        } else if (first_changed) |changed| {
+            try self.appendDeleteChangedKittyImages(&buffer, changed, last_changed);
+        }
+
+        for (new_lines, 0..) |line, line_index| {
+            if (line_index > 0) try buffer.appendSlice(self.allocator, "\r\n");
+            try buffer.appendSlice(self.allocator, line);
+        }
+        try buffer.appendSlice(self.allocator, "\x1b[?2026l");
+        try self.terminal_handle.write(buffer.items);
+
+        if (full_render) self.full_redraw_count += 1;
+        self.cursor_row = if (new_lines.len == 0) 0 else new_lines.len - 1;
+        self.hardware_cursor_row = self.cursor_row;
+        self.max_lines_rendered = if (should_clear) new_lines.len else @max(self.max_lines_rendered, new_lines.len);
+        const buffer_length = @max(height, new_lines.len);
+        self.previous_viewport_top = if (buffer_length > height) buffer_length - height else 0;
+
+        if (self.previous_lines.len > 0) freeOwnedLines(self.allocator, self.previous_lines);
+        self.previous_lines = new_lines;
+        try self.replacePreviousKittyImageIds(new_lines);
+        self.previous_width = width;
+        self.previous_height = height;
+    }
+
+    fn resolveOverlayLayout(
+        self: *const TUI,
+        options: OverlayOptions,
+        overlay_height: usize,
+        term_width: usize,
+        term_height: usize,
+    ) struct { width: usize, row: usize, col: usize, max_height: ?usize } {
+        _ = self;
+        const margin_top = options.margin.top;
+        const margin_right = options.margin.right;
+        const margin_bottom = options.margin.bottom;
+        const margin_left = options.margin.left;
+        const avail_width = @max(@as(usize, 1), term_width -| margin_left -| margin_right);
+        const avail_height = @max(@as(usize, 1), term_height -| margin_top -| margin_bottom);
+
+        var overlay_width = parseSizeValue(options.width, term_width) orelse @min(@as(usize, 80), avail_width);
+        if (options.min_width) |min_width| overlay_width = @max(overlay_width, min_width);
+        overlay_width = clampUsize(overlay_width, 1, avail_width);
+
+        const max_height = if (parseSizeValue(options.max_height, term_height)) |value| clampUsize(value, 1, avail_height) else null;
+        const effective_height = if (max_height) |value| @min(overlay_height, value) else overlay_height;
+
+        var row = if (options.row) |value|
+            parsePositionValue(value, avail_height, effective_height, margin_top)
+        else
+            resolveAnchorRow(options.anchor, effective_height, avail_height, margin_top);
+        var col = if (options.col) |value|
+            parsePositionValue(value, avail_width, overlay_width, margin_left)
+        else
+            resolveAnchorCol(options.anchor, overlay_width, avail_width, margin_left);
+
+        row = addSignedClamped(row, options.offset_y);
+        col = addSignedClamped(col, options.offset_x);
+
+        const max_row = term_height -| margin_bottom -| effective_height;
+        const max_col = term_width -| margin_right -| overlay_width;
+        row = clampUsize(row, margin_top, @max(margin_top, max_row));
+        col = clampUsize(col, margin_left, @max(margin_left, max_col));
+        return .{ .width = overlay_width, .row = row, .col = col, .max_height = max_height };
+    }
+
+    fn compositeOverlays(self: *TUI, lines: [][]u8, term_width: usize, term_height: usize) ![][]u8 {
+        var result = try cloneOwnedLines(self.allocator, lines);
+        errdefer freeOwnedLines(self.allocator, result);
+        if (self.overlay_stack.items.len == 0) return result;
+
+        var visible_entries: std.ArrayList(OverlayStackEntry) = .empty;
+        defer visible_entries.deinit(self.allocator);
+        for (self.overlay_stack.items) |entry| {
+            if (self.isOverlayVisible(entry)) try visible_entries.append(self.allocator, entry);
+        }
+        std.mem.sort(OverlayStackEntry, visible_entries.items, {}, overlayLessThan);
+
+        var rendered_entries: std.ArrayList(RenderedOverlay) = .empty;
+        defer {
+            for (rendered_entries.items) |*entry| freeOwnedLines(self.allocator, entry.lines);
+            rendered_entries.deinit(self.allocator);
+        }
+
+        var min_lines_needed = result.len;
+        for (visible_entries.items) |entry| {
+            const initial = self.resolveOverlayLayout(entry.options, 0, term_width, term_height);
+            var overlay_lines = try entry.component.render(self.allocator, initial.width);
+            errdefer freeOwnedLines(self.allocator, overlay_lines);
+            if (initial.max_height) |max_height| {
+                if (overlay_lines.len > max_height) {
+                    for (overlay_lines[max_height..]) |line| self.allocator.free(line);
+                    overlay_lines = try self.allocator.realloc(overlay_lines, max_height);
+                }
+            }
+            const final = self.resolveOverlayLayout(entry.options, overlay_lines.len, term_width, term_height);
+            min_lines_needed = @max(min_lines_needed, final.row + overlay_lines.len);
+            try rendered_entries.append(self.allocator, .{
+                .lines = overlay_lines,
+                .row = final.row,
+                .col = final.col,
+                .width = final.width,
+            });
+        }
+
+        const working_height = @max(@max(result.len, term_height), min_lines_needed);
+        if (result.len < working_height) {
+            const old_len = result.len;
+            result = try self.allocator.realloc(result, working_height);
+            var index = old_len;
+            errdefer {
+                for (result[old_len..index]) |line| self.allocator.free(line);
+            }
+            while (index < working_height) : (index += 1) result[index] = try self.allocator.dupe(u8, "");
+        }
+
+        const viewport_start = if (working_height > term_height) working_height - term_height else 0;
+        for (rendered_entries.items) |entry| {
+            for (entry.lines, 0..) |overlay_line, row_offset| {
+                const idx = viewport_start + entry.row + row_offset;
+                if (idx >= result.len) continue;
+                const next = try compositeLineAt(self.allocator, result[idx], overlay_line, entry.col, entry.width, term_width);
+                self.allocator.free(result[idx]);
+                result[idx] = next;
+            }
+        }
+
+        return result;
+    }
+
+    fn extractCursorPosition(_: *TUI, lines: *[][]u8, height: usize) void {
+        const viewport_top = if (lines.*.len > height) lines.*.len - height else 0;
+        var row = lines.*.len;
+        while (row > viewport_top) {
+            row -= 1;
+            if (std.mem.indexOf(u8, lines.*[row], CURSOR_MARKER)) |marker_index| {
+                const line = lines.*[row];
+                std.mem.copyForwards(u8, line[marker_index..], line[marker_index + CURSOR_MARKER.len ..]);
+                lines.*[row] = line[0 .. line.len - CURSOR_MARKER.len];
+                return;
+            }
+        }
+    }
+
+    fn replacePreviousKittyImageIds(self: *TUI, lines: []const []const u8) !void {
+        self.previous_kitty_image_ids.clearRetainingCapacity();
+        for (lines) |line| {
+            if (extractKittyImageId(line)) |image_id| {
+                if (!containsU32(self.previous_kitty_image_ids.items, image_id)) {
+                    try self.previous_kitty_image_ids.append(self.allocator, image_id);
+                }
+            }
+        }
+    }
+
+    fn appendDeleteKittyImages(self: *TUI, buffer: *std.ArrayList(u8), ids: []const u32) !void {
+        for (ids) |image_id| {
+            const sequence = try terminal_image.deleteKittyImage(self.allocator, image_id);
+            defer self.allocator.free(sequence);
+            try buffer.appendSlice(self.allocator, sequence);
+        }
+    }
+
+    fn appendDeleteChangedKittyImages(self: *TUI, buffer: *std.ArrayList(u8), first_changed: usize, last_changed: usize) !void {
+        if (first_changed >= self.previous_lines.len) return;
+        var ids: std.ArrayList(u32) = .empty;
+        defer ids.deinit(self.allocator);
+        const max_line = @min(last_changed, self.previous_lines.len - 1);
+        var line_index = first_changed;
+        while (line_index <= max_line) : (line_index += 1) {
+            if (extractKittyImageId(self.previous_lines[line_index])) |image_id| {
+                if (!containsU32(ids.items, image_id)) try ids.append(self.allocator, image_id);
+            }
+        }
+        try self.appendDeleteKittyImages(buffer, ids.items);
+    }
+
+    fn isOverlayVisible(self: *const TUI, entry: OverlayStackEntry) bool {
+        if (entry.hidden) return false;
+        if (entry.options.visible) |visible| return visible.call(self.terminal_handle.columns(), self.terminal_handle.rows());
+        return true;
+    }
+
+    fn findOverlayIndex(self: *const TUI, id: usize) ?usize {
+        for (self.overlay_stack.items, 0..) |entry, index| if (entry.id == id) return index;
+        return null;
+    }
+
+    fn getTopmostVisibleOverlay(self: *const TUI) ?OverlayStackEntry {
+        var topmost: ?OverlayStackEntry = null;
+        for (self.overlay_stack.items) |entry| {
+            if (entry.options.non_capturing or !self.isOverlayVisible(entry)) continue;
+            if (topmost == null or entry.focus_order > topmost.?.focus_order) topmost = entry;
+        }
+        return topmost;
+    }
+
+    fn hideOverlayById(self: *TUI, id: usize) void {
+        const index = self.findOverlayIndex(id) orelse return;
+        const entry = self.overlay_stack.orderedRemove(index);
+        if (sameComponent(self.focused_component, entry.component)) {
+            if (self.getTopmostVisibleOverlay()) |top| {
+                self.setFocus(top.component);
+            } else {
+                self.setFocus(entry.pre_focus);
+            }
+        }
+        self.requestRender(false) catch {};
+    }
+
+    fn setOverlayHidden(self: *TUI, id: usize, hidden: bool) void {
+        const index = self.findOverlayIndex(id) orelse return;
+        if (self.overlay_stack.items[index].hidden == hidden) return;
+        self.overlay_stack.items[index].hidden = hidden;
+        const entry = self.overlay_stack.items[index];
+        if (hidden and sameComponent(self.focused_component, entry.component)) {
+            if (self.getTopmostVisibleOverlay()) |top| {
+                self.setFocus(top.component);
+            } else {
+                self.setFocus(entry.pre_focus);
+            }
+        } else if (!hidden and !entry.options.non_capturing and self.isOverlayVisible(entry)) {
+            self.overlay_stack.items[index].focus_order = self.nextFocusOrder();
+            self.setFocus(entry.component);
+        }
+        self.requestRender(false) catch {};
+    }
+
+    fn focusOverlay(self: *TUI, id: usize) void {
+        const index = self.findOverlayIndex(id) orelse return;
+        if (!self.isOverlayVisible(self.overlay_stack.items[index])) return;
+        self.overlay_stack.items[index].focus_order = self.nextFocusOrder();
+        self.setFocus(self.overlay_stack.items[index].component);
+        self.requestRender(false) catch {};
+    }
+
+    fn unfocusOverlay(self: *TUI, id: usize, options: ?OverlayUnfocusOptions) void {
+        const index = self.findOverlayIndex(id) orelse return;
+        const entry = self.overlay_stack.items[index];
+        if (!sameComponent(self.focused_component, entry.component) and options == null) return;
+        if (options) |unfocus_options| {
+            self.setFocus(unfocus_options.target);
+        } else if (self.getTopmostVisibleOverlay()) |top| {
+            if (top.id != id) self.setFocus(top.component) else self.setFocus(entry.pre_focus);
+        } else {
+            self.setFocus(entry.pre_focus);
+        }
+        self.requestRender(false) catch {};
+    }
+
+    fn inputCallback(ptr: ?*anyopaque, data: []const u8) void {
+        const self: *TUI = @ptrCast(@alignCast(ptr.?));
+        self.handleInput(data) catch {};
+    }
+
+    fn resizeCallback(ptr: ?*anyopaque) void {
+        const self: *TUI = @ptrCast(@alignCast(ptr.?));
+        self.requestRender(false) catch {};
+    }
+};
+
+const RenderedOverlay = struct {
+    lines: [][]u8,
+    row: usize,
+    col: usize,
+    width: usize,
+};
+
+fn overlayLessThan(_: void, lhs: OverlayStackEntry, rhs: OverlayStackEntry) bool {
+    return lhs.focus_order < rhs.focus_order;
+}
+
+fn applyLineResets(allocator: std.mem.Allocator, lines: [][]u8) !void {
+    for (lines) |*line| {
+        if (terminal_image.isImageLine(line.*)) continue;
+        const normalized = try normalizeTerminalOutput(allocator, line.*);
+        defer allocator.free(normalized);
+        const with_reset = try std.mem.concat(allocator, u8, &.{ normalized, TUI_SEGMENT_RESET });
+        allocator.free(line.*);
+        line.* = with_reset;
+    }
+}
+
+fn parseSizeValue(value: ?SizeValue, reference_size: usize) ?usize {
+    const size = value orelse return null;
+    return switch (size) {
+        .cells => |cells| cells,
+        .percent => |percent| @as(usize, @intFromFloat(@floor(@as(f64, @floatFromInt(reference_size)) * percent / 100.0))),
+    };
+}
+
+fn parsePositionValue(value: SizeValue, available: usize, size: usize, margin: usize) usize {
+    return switch (value) {
+        .cells => |cells| cells,
+        .percent => |percent| blk: {
+            const max_position = available -| size;
+            break :blk margin + @as(usize, @intFromFloat(@floor(@as(f64, @floatFromInt(max_position)) * percent / 100.0)));
+        },
+    };
+}
+
+fn resolveAnchorRow(anchor: OverlayAnchor, height: usize, avail_height: usize, margin_top: usize) usize {
+    return switch (anchor) {
+        .top_left, .top_center, .top_right => margin_top,
+        .bottom_left, .bottom_center, .bottom_right => margin_top + avail_height -| height,
+        .left_center, .center, .right_center => margin_top + ((avail_height -| height) / 2),
+    };
+}
+
+fn resolveAnchorCol(anchor: OverlayAnchor, width: usize, avail_width: usize, margin_left: usize) usize {
+    return switch (anchor) {
+        .top_left, .left_center, .bottom_left => margin_left,
+        .top_right, .right_center, .bottom_right => margin_left + avail_width -| width,
+        .top_center, .center, .bottom_center => margin_left + ((avail_width -| width) / 2),
+    };
+}
+
+fn addSignedClamped(value: usize, offset: isize) usize {
+    if (offset >= 0) return value + @as(usize, @intCast(offset));
+    return value -| @as(usize, @intCast(-offset));
+}
+
+fn sameComponent(lhs: ?Component, rhs: Component) bool {
+    if (lhs) |component| return component.ptr == rhs.ptr;
+    return false;
+}
+
+fn compositeLineAt(
+    allocator: std.mem.Allocator,
+    base_line: []const u8,
+    overlay_line: []const u8,
+    start_col: usize,
+    overlay_width: usize,
+    total_width: usize,
+) ![]u8 {
+    if (terminal_image.isImageLine(base_line)) return allocator.dupe(u8, base_line);
+
+    const after_start = start_col + overlay_width;
+    const base = try extractSegments(allocator, base_line, start_col, after_start, total_width -| after_start, true);
+    defer base.deinit(allocator);
+    const overlay = try sliceWithWidth(allocator, overlay_line, 0, overlay_width, true);
+    defer allocator.free(overlay.text);
+
+    const before_pad = start_col -| base.before_width;
+    const overlay_pad = overlay_width -| overlay.width;
+    const actual_before_width = @max(start_col, base.before_width);
+    const actual_overlay_width = @max(overlay_width, overlay.width);
+    const after_target = total_width -| actual_before_width -| actual_overlay_width;
+    const after_pad = after_target -| base.after_width;
+
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(allocator);
+    try output.appendSlice(allocator, base.before);
+    try appendSpaces(allocator, &output, before_pad);
+    try output.appendSlice(allocator, TUI_SEGMENT_RESET);
+    try output.appendSlice(allocator, overlay.text);
+    try appendSpaces(allocator, &output, overlay_pad);
+    try output.appendSlice(allocator, TUI_SEGMENT_RESET);
+    try output.appendSlice(allocator, base.after);
+    try appendSpaces(allocator, &output, after_pad);
+
+    if (visibleWidth(output.items) <= total_width) return output.toOwnedSlice(allocator);
+    const truncated = try sliceByColumn(allocator, output.items, 0, total_width, true);
+    output.deinit(allocator);
+    return truncated;
+}
+
+fn extractKittyImageId(line: []const u8) ?u32 {
+    const prefix = "\x1b_G";
+    const sequence_start = std.mem.indexOf(u8, line, prefix) orelse return null;
+    const params_start = sequence_start + prefix.len;
+    const params_end = std.mem.indexOfScalarPos(u8, line, params_start, ';') orelse return null;
+    var params = std.mem.splitScalar(u8, line[params_start..params_end], ',');
+    while (params.next()) |param| {
+        if (!std.mem.startsWith(u8, param, "i=")) continue;
+        return std.fmt.parseInt(u32, param[2..], 10) catch null;
+    }
+    return null;
+}
+
+fn containsU32(values: []const u32, needle: u32) bool {
+    for (values) |value| if (value == needle) return true;
+    return false;
+}
 
 pub const TruncatedText = struct {
     allocator: std.mem.Allocator,
@@ -3707,6 +4840,50 @@ const test_markdown_theme = MarkdownTheme{
     .underline = .{ .apply_fn = ansiUnderline },
 };
 
+const TestLinesComponent = struct {
+    lines: []const []const u8 = &.{},
+    requested_width: usize = 0,
+
+    fn render(self: *TestLinesComponent, allocator: std.mem.Allocator, width: usize) ![][]u8 {
+        self.requested_width = width;
+        var result = try allocator.alloc([]u8, self.lines.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (result[0..initialized]) |line| allocator.free(line);
+            allocator.free(result);
+        }
+        for (self.lines, 0..) |line, index| {
+            result[index] = try allocator.dupe(u8, line);
+            initialized += 1;
+        }
+        return result;
+    }
+
+    fn invalidate(_: *TestLinesComponent) void {}
+};
+
+const FocusableInputComponent = struct {
+    allocator: std.mem.Allocator,
+    focused: bool = false,
+    inputs: std.ArrayList(u8) = .empty,
+    lines: []const []const u8 = &.{"FOCUSABLE"},
+
+    fn deinit(self: *FocusableInputComponent) void {
+        self.inputs.deinit(self.allocator);
+    }
+
+    fn render(self: *FocusableInputComponent, allocator: std.mem.Allocator, width: usize) ![][]u8 {
+        var component = TestLinesComponent{ .lines = self.lines };
+        return component.render(allocator, width);
+    }
+
+    fn handleInput(self: *FocusableInputComponent, _: std.mem.Allocator, data: []const u8) !void {
+        try self.inputs.appendSlice(self.allocator, data);
+    }
+
+    fn invalidate(_: *FocusableInputComponent) void {}
+};
+
 fn stripAnsiAlloc(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
     var output: std.ArrayList(u8) = .empty;
     errdefer output.deinit(allocator);
@@ -3761,6 +4938,211 @@ fn removeTableNoise(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
         }
     }
     return output.toOwnedSlice(allocator);
+}
+
+test "TUI virtual terminal renders lines and resets styles after each row" {
+    const allocator = std.testing.allocator;
+    var virtual_terminal = VirtualTerminal.init(allocator, 20, 6);
+    defer virtual_terminal.deinit();
+    var tui = TUI.init(allocator, virtual_terminal.asTerminal());
+    defer tui.deinit();
+    var component = TestLinesComponent{ .lines = &.{ "\x1b[3mItalic", "Plain" } };
+    try tui.addChild(Component.from(TestLinesComponent, &component));
+
+    try tui.start();
+    defer tui.stop() catch {};
+
+    const viewport = try virtual_terminal.getViewport(allocator);
+    defer freeOwnedLines(allocator, viewport);
+    try std.testing.expect(std.mem.indexOf(u8, viewport[0], "Italic") != null);
+    try std.testing.expect(std.mem.indexOf(u8, viewport[1], "Plain") != null);
+    try std.testing.expect(!virtual_terminal.getCellItalic(1, 0));
+}
+
+test "TUI resize handling mirrors upstream full redraw rules" {
+    const allocator = std.testing.allocator;
+    var virtual_terminal = VirtualTerminal.init(allocator, 40, 10);
+    defer virtual_terminal.deinit();
+    var tui = TUI.init(allocator, virtual_terminal.asTerminal());
+    defer tui.deinit();
+    var component = TestLinesComponent{ .lines = &.{ "Line 0", "Line 1", "Line 2" } };
+    try tui.addChild(Component.from(TestLinesComponent, &component));
+
+    try tui.start();
+    defer tui.stop() catch {};
+    const initial_redraws = tui.fullRedraws();
+
+    virtual_terminal.resize(60, 10);
+    try std.testing.expect(tui.fullRedraws() > initial_redraws);
+
+    const width_redraws = tui.fullRedraws();
+    tui.setTermuxSessionForTesting(true);
+    virtual_terminal.clearWrites();
+    virtual_terminal.resize(60, 15);
+    try std.testing.expectEqual(width_redraws, tui.fullRedraws());
+    try std.testing.expect(std.mem.indexOf(u8, virtual_terminal.getWrites(), "\x1b[2J") == null);
+}
+
+test "TUI clears stale rows when content shrinks and then appends differentially" {
+    const allocator = std.testing.allocator;
+    var virtual_terminal = VirtualTerminal.init(allocator, 40, 10);
+    defer virtual_terminal.deinit();
+    var tui = TUI.init(allocator, virtual_terminal.asTerminal());
+    defer tui.deinit();
+    var component = TestLinesComponent{ .lines = &.{ "Line 0", "Line 1", "Line 2", "Line 3", "Line 4", "Line 5" } };
+    try tui.addChild(Component.from(TestLinesComponent, &component));
+
+    try tui.start();
+    defer tui.stop() catch {};
+    const initial_redraws = tui.fullRedraws();
+
+    component.lines = &.{ "Line 0", "Line 1" };
+    try tui.requestRender(false);
+    try std.testing.expect(tui.fullRedraws() > initial_redraws);
+    const viewport = try virtual_terminal.getViewport(allocator);
+    defer freeOwnedLines(allocator, viewport);
+    try std.testing.expect(std.mem.indexOf(u8, viewport[0], "Line 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, viewport[1], "Line 1") != null);
+    try std.testing.expectEqualStrings("", viewport[2]);
+
+    const redraws_after_shrink = tui.fullRedraws();
+    component.lines = &.{ "Line 0", "Line 1", "Line 2" };
+    try tui.requestRender(false);
+    try std.testing.expectEqual(redraws_after_shrink, tui.fullRedraws());
+    const next_viewport = try virtual_terminal.getViewport(allocator);
+    defer freeOwnedLines(allocator, next_viewport);
+    try std.testing.expect(std.mem.indexOf(u8, next_viewport[2], "Line 2") != null);
+}
+
+test "TUI full redraws when deleted lines move the viewport upward" {
+    const allocator = std.testing.allocator;
+    var virtual_terminal = VirtualTerminal.init(allocator, 20, 5);
+    defer virtual_terminal.deinit();
+    var tui = TUI.init(allocator, virtual_terminal.asTerminal());
+    defer tui.deinit();
+    tui.setClearOnShrink(false);
+    var long_lines = [_][]const u8{
+        "Line 0", "Line 1", "Line 2", "Line 3", "Line 4",  "Line 5",
+        "Line 6", "Line 7", "Line 8", "Line 9", "Line 10", "Line 11",
+    };
+    var short_lines = [_][]const u8{ "Line 0", "Line 1", "Line 2", "Line 3", "Line 4", "Line 5", "Line 6" };
+    var component = TestLinesComponent{ .lines = long_lines[0..] };
+    try tui.addChild(Component.from(TestLinesComponent, &component));
+
+    try tui.start();
+    defer tui.stop() catch {};
+    const initial_redraws = tui.fullRedraws();
+
+    component.lines = short_lines[0..];
+    try tui.requestRender(false);
+    try std.testing.expect(tui.fullRedraws() > initial_redraws);
+
+    const viewport = try virtual_terminal.getViewport(allocator);
+    defer freeOwnedLines(allocator, viewport);
+    try std.testing.expectEqualStrings("Line 2", viewport[0]);
+    try std.testing.expectEqualStrings("Line 6", viewport[4]);
+}
+
+test "TUI deletes changed Kitty image ids before drawing moved placements" {
+    const allocator = std.testing.allocator;
+    var virtual_terminal = VirtualTerminal.init(allocator, 40, 10);
+    defer virtual_terminal.deinit();
+    var tui = TUI.init(allocator, virtual_terminal.asTerminal());
+    defer tui.deinit();
+
+    const old_image = try terminal_image.encodeKitty(allocator, "AAAA", .{ .columns = 2, .rows = 2, .image_id = 42, .move_cursor = false });
+    defer allocator.free(old_image);
+    const new_image = try terminal_image.encodeKitty(allocator, "BBBB", .{ .columns = 2, .rows = 1, .image_id = 42, .move_cursor = false });
+    defer allocator.free(new_image);
+
+    var component = TestLinesComponent{ .lines = &.{ "top", old_image } };
+    try tui.addChild(Component.from(TestLinesComponent, &component));
+    try tui.start();
+    defer tui.stop() catch {};
+    virtual_terminal.clearWrites();
+
+    component.lines = &.{ new_image, "" };
+    try tui.requestRender(false);
+    const writes = virtual_terminal.getWrites();
+    const delete_sequence = try terminal_image.deleteKittyImage(allocator, 42);
+    defer allocator.free(delete_sequence);
+    const delete_index = std.mem.indexOf(u8, writes, delete_sequence) orelse std.math.maxInt(usize);
+    const draw_index = std.mem.indexOf(u8, writes, new_image) orelse std.math.maxInt(usize);
+    try std.testing.expect(delete_index != std.math.maxInt(usize));
+    try std.testing.expect(draw_index != std.math.maxInt(usize));
+    try std.testing.expect(delete_index < draw_index);
+}
+
+test "TUI overlays render over short content and honor percentage width" {
+    const allocator = std.testing.allocator;
+    var virtual_terminal = VirtualTerminal.init(allocator, 80, 24);
+    defer virtual_terminal.deinit();
+    var tui = TUI.init(allocator, virtual_terminal.asTerminal());
+    defer tui.deinit();
+    var content = TestLinesComponent{ .lines = &.{ "Line 1", "Line 2", "Line 3" } };
+    var overlay = TestLinesComponent{ .lines = &.{ "OVERLAY_TOP", "OVERLAY_MID", "OVERLAY_BOT" } };
+    try tui.addChild(Component.from(TestLinesComponent, &content));
+    _ = try tui.showOverlay(Component.from(TestLinesComponent, &overlay), .{ .width = .{ .percent = 50.0 } });
+
+    try tui.start();
+    defer tui.stop() catch {};
+    try std.testing.expectEqual(@as(usize, 40), overlay.requested_width);
+    const viewport = try virtual_terminal.getViewport(allocator);
+    defer freeOwnedLines(allocator, viewport);
+    try std.testing.expect(containsLineWith(viewport, "OVERLAY_MID"));
+}
+
+test "TUI overlay anchors position top-left and bottom-right content" {
+    const allocator = std.testing.allocator;
+    var virtual_terminal = VirtualTerminal.init(allocator, 80, 24);
+    defer virtual_terminal.deinit();
+    var tui = TUI.init(allocator, virtual_terminal.asTerminal());
+    defer tui.deinit();
+    var content = TestLinesComponent{};
+    var top_left = TestLinesComponent{ .lines = &.{"TOP-LEFT"} };
+    var bottom_right = TestLinesComponent{ .lines = &.{"BTM-RIGHT"} };
+    try tui.addChild(Component.from(TestLinesComponent, &content));
+    _ = try tui.showOverlay(Component.from(TestLinesComponent, &top_left), .{ .anchor = .top_left, .width = .{ .cells = 10 } });
+    _ = try tui.showOverlay(Component.from(TestLinesComponent, &bottom_right), .{ .anchor = .bottom_right, .width = .{ .cells = 10 }, .non_capturing = true });
+
+    try tui.start();
+    defer tui.stop() catch {};
+
+    const viewport = try virtual_terminal.getViewport(allocator);
+    defer freeOwnedLines(allocator, viewport);
+    try std.testing.expect(std.mem.startsWith(u8, viewport[0], "TOP-LEFT"));
+    try std.testing.expect(std.mem.indexOf(u8, viewport[23], "BTM-RIGHT") != null);
+    try std.testing.expect(std.mem.endsWith(u8, std.mem.trimEnd(u8, viewport[23], " "), "BTM-RIGHT"));
+}
+
+test "TUI non-capturing overlays preserve focus and explicit focus can receive input" {
+    const allocator = std.testing.allocator;
+    var virtual_terminal = VirtualTerminal.init(allocator, 80, 24);
+    defer virtual_terminal.deinit();
+    var tui = TUI.init(allocator, virtual_terminal.asTerminal());
+    defer tui.deinit();
+    var content = TestLinesComponent{};
+    var editor = FocusableInputComponent{ .allocator = allocator, .lines = &.{"EDITOR"} };
+    defer editor.deinit();
+    var overlay = FocusableInputComponent{ .allocator = allocator, .lines = &.{"OVERLAY"} };
+    defer overlay.deinit();
+    try tui.addChild(Component.from(TestLinesComponent, &content));
+    tui.setFocus(Component.from(FocusableInputComponent, &editor));
+    try tui.start();
+    defer tui.stop() catch {};
+
+    const handle = try tui.showOverlay(Component.from(FocusableInputComponent, &overlay), .{ .non_capturing = true });
+    try std.testing.expect(editor.focused);
+    try std.testing.expect(!overlay.focused);
+
+    handle.focus();
+    try std.testing.expect(!editor.focused);
+    try std.testing.expect(overlay.focused);
+    virtual_terminal.sendInput("x");
+    try std.testing.expectEqualStrings("x", overlay.inputs.items);
+
+    handle.unfocus(null);
+    try std.testing.expect(editor.focused);
 }
 
 test "truncateToWidth keeps output within width for very large unicode input" {
