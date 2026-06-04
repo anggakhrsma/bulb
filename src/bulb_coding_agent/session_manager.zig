@@ -1,5 +1,6 @@
 const std = @import("std");
 const agent = @import("bulb_agent");
+const config = @import("config.zig");
 const paths = @import("paths.zig");
 const session_cwd = @import("session_cwd.zig");
 
@@ -47,6 +48,7 @@ pub const NewSessionOptions = struct {
 pub const SessionManager = struct {
     arena: std.heap.ArenaAllocator,
     persist: bool,
+    flushed: bool,
     session_id: []const u8,
     session_file: ?[]const u8,
     session_dir: []const u8,
@@ -61,6 +63,30 @@ pub const SessionManager = struct {
         session_dir: []const u8,
         options: NewSessionOptions,
     ) !SessionManager {
+        return initNew(allocator, io, cwd, session_dir, true, options);
+    }
+
+    pub fn createDefault(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        cwd: []const u8,
+        agent_dir: []const u8,
+        options: NewSessionOptions,
+    ) !SessionManager {
+        const session_dir = try getDefaultSessionDirAlloc(allocator, io, cwd, agent_dir);
+        defer allocator.free(session_dir);
+        return initNew(allocator, io, cwd, session_dir, true, options);
+    }
+
+    pub fn createDefaultFromEnv(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        cwd: []const u8,
+        environ: *const std.process.Environ.Map,
+        options: NewSessionOptions,
+    ) !SessionManager {
+        const session_dir = try getDefaultSessionDirFromEnvAlloc(allocator, io, cwd, environ);
+        defer allocator.free(session_dir);
         return initNew(allocator, io, cwd, session_dir, true, options);
     }
 
@@ -84,19 +110,44 @@ pub const SessionManager = struct {
         defer allocator.free(process_cwd);
         const resolved_path = try paths.resolvePathAlloc(allocator, path, process_cwd, .{});
         defer allocator.free(resolved_path);
-
-        var loaded = try loadEntriesFromFile(allocator, io, resolved_path);
-        errdefer loaded.deinit();
-        const header = loaded.header orelse return error.InvalidSessionFile;
-        const effective_cwd_input = options.cwd_override orelse header.cwd orelse process_cwd;
-        const resolved_cwd = try paths.resolvePathAlloc(allocator, effective_cwd_input, process_cwd, .{});
-        defer allocator.free(resolved_cwd);
-
         const normalized_session_dir = if (options.session_dir) |session_dir|
             try paths.normalizePathAlloc(allocator, session_dir, .{})
         else
             try allocator.dupe(u8, std.fs.path.dirname(resolved_path) orelse process_cwd);
         defer allocator.free(normalized_session_dir);
+
+        const file_exists = blk: {
+            std.Io.Dir.cwd().access(io, resolved_path, .{}) catch |err| switch (err) {
+                error.FileNotFound => break :blk false,
+                else => |access_error| return access_error,
+            };
+            break :blk true;
+        };
+        var loaded = try loadEntriesFromFile(allocator, io, resolved_path);
+        var loaded_released = false;
+        errdefer if (!loaded_released) loaded.deinit();
+        const header = loaded.header orelse {
+            loaded_released = true;
+            loaded.deinit();
+            var manager = try initNew(
+                allocator,
+                io,
+                options.cwd_override orelse process_cwd,
+                normalized_session_dir,
+                true,
+                .{},
+            );
+            errdefer manager.deinit();
+            manager.session_file = try manager.arena.allocator().dupe(u8, resolved_path);
+            if (file_exists) {
+                try manager.rewriteFile(io);
+                manager.flushed = true;
+            }
+            return manager;
+        };
+        const effective_cwd_input = options.cwd_override orelse header.cwd orelse process_cwd;
+        const resolved_cwd = try paths.resolvePathAlloc(allocator, effective_cwd_input, process_cwd, .{});
+        defer allocator.free(resolved_cwd);
 
         const arena_allocator = loaded.arena.allocator();
         const manager_session_file = try arena_allocator.dupe(u8, resolved_path);
@@ -105,6 +156,7 @@ pub const SessionManager = struct {
         const manager = SessionManager{
             .arena = loaded.arena,
             .persist = true,
+            .flushed = true,
             .session_id = header.id,
             .session_file = manager_session_file,
             .session_dir = manager_session_dir,
@@ -112,6 +164,7 @@ pub const SessionManager = struct {
             .file_entries = loaded.entries,
             .header = header,
         };
+        loaded_released = true;
         return manager;
     }
 
@@ -176,6 +229,32 @@ pub const SessionManager = struct {
         return self.session_dir;
     }
 
+    pub fn isPersisted(self: *const SessionManager) bool {
+        return self.persist;
+    }
+
+    pub fn usesDefaultSessionDir(
+        self: *const SessionManager,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        agent_dir: []const u8,
+    ) !bool {
+        const default_dir = try getDefaultSessionDirPathAlloc(allocator, io, self.cwd, agent_dir);
+        defer allocator.free(default_dir);
+        return std.mem.eql(u8, self.session_dir, default_dir);
+    }
+
+    pub fn usesDefaultSessionDirFromEnv(
+        self: *const SessionManager,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        environ: *const std.process.Environ.Map,
+    ) !bool {
+        const agent_dir = try config.agentDirAlloc(allocator, environ);
+        defer allocator.free(agent_dir);
+        return self.usesDefaultSessionDir(allocator, io, agent_dir);
+    }
+
     pub fn getSessionId(self: *const SessionManager) []const u8 {
         return self.session_id;
     }
@@ -235,6 +314,7 @@ pub const SessionManager = struct {
         var manager = SessionManager{
             .arena = .init(allocator),
             .persist = persist,
+            .flushed = false,
             .session_id = "",
             .session_file = null,
             .session_dir = "",
@@ -255,7 +335,76 @@ pub const SessionManager = struct {
         _ = try manager.newSession(io, options);
         return manager;
     }
+
+    fn rewriteFile(self: *const SessionManager, io: std.Io) !void {
+        if (!self.persist) return;
+        const session_file = self.session_file orelse return;
+        var output: std.Io.Writer.Allocating = .init(self.arena.child_allocator);
+        defer output.deinit();
+        for (self.file_entries) |entry| {
+            try output.writer.writeAll(entry.raw_json);
+            try output.writer.writeByte('\n');
+        }
+        try writeAbsoluteFile(io, session_file, output.written());
+    }
 };
+
+pub fn getDefaultSessionDirPathAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    agent_dir: []const u8,
+) ![]u8 {
+    const process_cwd = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(process_cwd);
+    const resolved_cwd = try paths.resolvePathAlloc(allocator, cwd, process_cwd, .{});
+    defer allocator.free(resolved_cwd);
+    const resolved_agent_dir = try paths.resolvePathAlloc(allocator, agent_dir, process_cwd, .{});
+    defer allocator.free(resolved_agent_dir);
+    const safe_path = try defaultSessionSafePathAlloc(allocator, resolved_cwd);
+    defer allocator.free(safe_path);
+    return std.fs.path.join(allocator, &.{ resolved_agent_dir, "sessions", safe_path });
+}
+
+pub fn getDefaultSessionDirAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    agent_dir: []const u8,
+) ![]u8 {
+    const session_dir = try getDefaultSessionDirPathAlloc(allocator, io, cwd, agent_dir);
+    errdefer allocator.free(session_dir);
+    try std.Io.Dir.cwd().createDirPath(io, session_dir);
+    return session_dir;
+}
+
+pub fn getDefaultSessionDirFromEnvAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    environ: *const std.process.Environ.Map,
+) ![]u8 {
+    const agent_dir = try config.agentDirAlloc(allocator, environ);
+    defer allocator.free(agent_dir);
+    return getDefaultSessionDirAlloc(allocator, io, cwd, agent_dir);
+}
+
+fn defaultSessionSafePathAlloc(allocator: std.mem.Allocator, resolved_cwd: []const u8) ![]u8 {
+    const start: usize = if (resolved_cwd.len > 0 and (resolved_cwd[0] == '/' or resolved_cwd[0] == '\\')) 1 else 0;
+    const body = resolved_cwd[start..];
+    const safe = try allocator.alloc(u8, body.len + 4);
+    safe[0] = '-';
+    safe[1] = '-';
+    for (body, 0..) |byte, index| {
+        safe[index + 2] = switch (byte) {
+            '/', '\\', ':' => '-',
+            else => byte,
+        };
+    }
+    safe[safe.len - 2] = '-';
+    safe[safe.len - 1] = '-';
+    return safe;
+}
 
 pub fn isValidSessionId(id: []const u8) bool {
     if (id.len == 0 or !std.ascii.isAlphanumeric(id[0]) or !std.ascii.isAlphanumeric(id[id.len - 1])) {
@@ -503,6 +652,28 @@ fn writeAbsoluteFile(io: std.Io, path: []const u8, data: []const u8) !void {
     });
 }
 
+fn expectRecoveredSessionFile(allocator: std.mem.Allocator, path: []const u8, session_id: []const u8) !void {
+    const content = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        path,
+        allocator,
+        .limited(16 * 1024),
+    );
+    defer allocator.free(content);
+    const trimmed = std.mem.trim(u8, content, " \t\r\n");
+    var lines = std.mem.splitScalar(u8, trimmed, '\n');
+    const header_line = lines.next() orelse return error.MissingRecoveredSessionHeader;
+    try std.testing.expectEqual(null, lines.next());
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, header_line, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+    const object = parsed.value.object;
+    try std.testing.expectEqualStrings("session", optionalString(object, "type").?);
+    try std.testing.expectEqualStrings(session_id, optionalString(object, "id").?);
+    try std.testing.expectEqual(current_session_version, optionalU32(object, "version").?);
+}
+
 fn expectUuidV7(id: []const u8) !void {
     try std.testing.expectEqual(@as(usize, 36), id.len);
     for (id, 0..) |byte, index| {
@@ -537,6 +708,104 @@ fn expectTimestampedSessionBasename(path: []const u8, id: []const u8) !void {
     try std.testing.expectEqual(@as(u8, '_'), basename[24]);
     try std.testing.expectEqualStrings(id, basename[25 .. 25 + id.len]);
     try std.testing.expectEqualStrings(".jsonl", basename[25 + id.len ..]);
+}
+
+// Ported from packages/coding-agent/src/core/session-manager.ts default directory helpers.
+test "default session directories use Bulb agent dir and Pi-compatible cwd encoding" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tempDirPathAlloc(allocator, &tmp);
+    defer allocator.free(tmp_path);
+
+    const cwd = try std.fs.path.join(allocator, &.{ tmp_path, "project:a", "nested" });
+    defer allocator.free(cwd);
+    const agent_dir = try std.fs.path.join(allocator, &.{ tmp_path, "agent-root" });
+    defer allocator.free(agent_dir);
+
+    const resolved_cwd = try paths.resolvePathAlloc(allocator, cwd, tmp_path, .{});
+    defer allocator.free(resolved_cwd);
+    const expected_safe_path = try defaultSessionSafePathAlloc(allocator, resolved_cwd);
+    defer allocator.free(expected_safe_path);
+    const expected_dir = try std.fs.path.join(allocator, &.{ agent_dir, "sessions", expected_safe_path });
+    defer allocator.free(expected_dir);
+
+    const default_dir_path = try getDefaultSessionDirPathAlloc(
+        allocator,
+        std.testing.io,
+        cwd,
+        agent_dir,
+    );
+    defer allocator.free(default_dir_path);
+    try std.testing.expectEqualStrings(expected_dir, default_dir_path);
+    try std.testing.expectEqual(null, std.mem.indexOf(u8, default_dir_path, ".pi"));
+
+    const created_dir = try getDefaultSessionDirAlloc(
+        allocator,
+        std.testing.io,
+        cwd,
+        agent_dir,
+    );
+    defer allocator.free(created_dir);
+    try std.testing.expectEqualStrings(default_dir_path, created_dir);
+    try std.Io.Dir.cwd().access(std.testing.io, created_dir, .{});
+
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put("HOME", tmp_path);
+    const env_dir = try getDefaultSessionDirFromEnvAlloc(
+        allocator,
+        std.testing.io,
+        cwd,
+        &env,
+    );
+    defer allocator.free(env_dir);
+    const expected_env_prefix = try std.fs.path.join(allocator, &.{ tmp_path, ".bulb", "agent", "sessions" });
+    defer allocator.free(expected_env_prefix);
+    try std.testing.expect(std.mem.startsWith(u8, env_dir, expected_env_prefix));
+    try std.testing.expectEqualStrings(expected_safe_path, std.fs.path.basename(env_dir));
+    try std.Io.Dir.cwd().access(std.testing.io, env_dir, .{});
+}
+
+test "SessionManager createDefault uses encoded default session directory" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tempDirPathAlloc(allocator, &tmp);
+    defer allocator.free(tmp_path);
+    const cwd = try std.fs.path.join(allocator, &.{ tmp_path, "project" });
+    defer allocator.free(cwd);
+    const agent_dir = try std.fs.path.join(allocator, &.{ tmp_path, "agent-root" });
+    defer allocator.free(agent_dir);
+
+    var session = try SessionManager.createDefault(
+        allocator,
+        std.testing.io,
+        cwd,
+        agent_dir,
+        .{ .id = "default-dir-session" },
+    );
+    defer session.deinit();
+
+    const default_dir = try getDefaultSessionDirPathAlloc(
+        allocator,
+        std.testing.io,
+        cwd,
+        agent_dir,
+    );
+    defer allocator.free(default_dir);
+    try std.testing.expect(session.isPersisted());
+    try std.testing.expect(try session.usesDefaultSessionDir(
+        allocator,
+        std.testing.io,
+        agent_dir,
+    ));
+    try std.testing.expectEqualStrings(default_dir, session.getSessionDir());
+    try std.testing.expectEqualStrings(default_dir, std.fs.path.dirname(session.getSessionFile().?).?);
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.cwd().access(std.testing.io, session.getSessionFile().?, .{}),
+    );
 }
 
 // Ported from packages/coding-agent/test/session-manager/custom-session-id.test.ts.
@@ -715,6 +984,73 @@ test "SessionManager opens persisted sessions and exposes header and entries" {
     try std.testing.expectEqualStrings(tmp_path, manager.getSessionDir());
     try std.testing.expectEqualStrings("session-id", manager.getHeader().?.id);
     try std.testing.expectEqual(@as(usize, 1), manager.getEntries().len);
+}
+
+test "SessionManager open recovers existing empty and headerless session files" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tempDirPathAlloc(allocator, &tmp);
+    defer allocator.free(tmp_path);
+
+    const cases = [_]struct { name: []const u8, data: []const u8 }{
+        .{ .name = "empty.jsonl", .data = "" },
+        .{
+            .name = "no-header.jsonl",
+            .data = "{\"type\":\"message\",\"id\":\"abc\",\"parentId\":\"orphaned\",\"timestamp\":\"2025-01-01T00:00:00Z\",\"message\":{\"role\":\"assistant\",\"content\":\"test\"}}\n",
+        },
+    };
+    for (cases) |case| {
+        const path = try std.fs.path.join(allocator, &.{ tmp_path, case.name });
+        defer allocator.free(path);
+        try writeAbsoluteFile(std.testing.io, path, case.data);
+
+        var manager = try SessionManager.open(allocator, std.testing.io, path, .{
+            .session_dir = tmp_path,
+        });
+        defer manager.deinit();
+
+        try expectUuidV7(manager.getSessionId());
+        try std.testing.expectEqualStrings(path, manager.getSessionFile().?);
+        try std.testing.expectEqual(current_session_version, manager.getHeader().?.version.?);
+        try expectRecoveredSessionFile(allocator, path, manager.getSessionId());
+        try std.testing.expectEqual(@as(usize, 0), manager.getEntries().len);
+    }
+}
+
+test "SessionManager open preserves explicit path and reloads recovered corrupted files" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tempDirPathAlloc(allocator, &tmp);
+    defer allocator.free(tmp_path);
+
+    const explicit_path = try std.fs.path.join(allocator, &.{ tmp_path, "my-session.jsonl" });
+    defer allocator.free(explicit_path);
+    try writeAbsoluteFile(std.testing.io, explicit_path, "");
+    var explicit = try SessionManager.open(allocator, std.testing.io, explicit_path, .{
+        .session_dir = tmp_path,
+    });
+    defer explicit.deinit();
+    try std.testing.expectEqualStrings(explicit_path, explicit.getSessionFile().?);
+    try expectRecoveredSessionFile(allocator, explicit_path, explicit.getSessionId());
+
+    const corrupted_path = try std.fs.path.join(allocator, &.{ tmp_path, "corrupted.jsonl" });
+    defer allocator.free(corrupted_path);
+    try writeAbsoluteFile(std.testing.io, corrupted_path, "garbage content\n");
+    var first = try SessionManager.open(allocator, std.testing.io, corrupted_path, .{
+        .session_dir = tmp_path,
+    });
+    const recovered_id = try allocator.dupe(u8, first.getSessionId());
+    defer allocator.free(recovered_id);
+    first.deinit();
+
+    var second = try SessionManager.open(allocator, std.testing.io, corrupted_path, .{
+        .session_dir = tmp_path,
+    });
+    defer second.deinit();
+    try std.testing.expectEqualStrings(recovered_id, second.getSessionId());
+    try expectRecoveredSessionFile(allocator, corrupted_path, recovered_id);
 }
 
 // Ported integration cases from packages/coding-agent/test/session-cwd.test.ts.
