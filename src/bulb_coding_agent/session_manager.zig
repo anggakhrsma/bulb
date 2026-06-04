@@ -25,6 +25,38 @@ pub const FileEntry = struct {
     id: ?[]const u8,
 };
 
+pub const LabelState = struct {
+    label: []u8,
+    timestamp: []u8,
+};
+
+pub const SessionTreeNode = struct {
+    entry: FileEntry,
+    children: []*SessionTreeNode,
+    label: ?[]const u8 = null,
+    label_timestamp: ?[]const u8 = null,
+};
+
+pub const SessionTree = struct {
+    arena: std.heap.ArenaAllocator,
+    roots: []*SessionTreeNode,
+
+    pub fn deinit(self: *SessionTree) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
+pub const SessionContext = struct {
+    arena: std.heap.ArenaAllocator,
+    messages: []FileEntry,
+
+    pub fn deinit(self: *SessionContext) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
 pub const SessionInfo = struct {
     path: []const u8,
     id: []const u8,
@@ -498,6 +530,96 @@ pub const SessionManager = struct {
         return entry_id;
     }
 
+    pub fn appendCustomEntryJson(
+        self: *SessionManager,
+        io: std.Io,
+        custom_type: []const u8,
+        data_json: ?[]const u8,
+    ) ![]const u8 {
+        if (data_json) |data| {
+            var parsed = try std.json.parseFromSlice(std.json.Value, self.arena.child_allocator, data, .{});
+            defer parsed.deinit();
+        }
+
+        const arena_allocator = self.arena.allocator();
+        const entry_id = try generateEntryIdAlloc(arena_allocator, io, self.file_entries);
+        errdefer arena_allocator.free(entry_id);
+        const timestamp = try isoTimestampAlloc(
+            arena_allocator,
+            std.Io.Clock.real.now(io).toMilliseconds(),
+        );
+        errdefer arena_allocator.free(timestamp);
+        const raw_json = try customEntryJsonAlloc(arena_allocator, entry_id, self.leaf_id, timestamp, custom_type, data_json);
+        errdefer arena_allocator.free(raw_json);
+        const grown = try arena_allocator.alloc(FileEntry, self.file_entries.len + 1);
+        @memcpy(grown[0..self.file_entries.len], self.file_entries);
+        grown[self.file_entries.len] = .{
+            .raw_json = raw_json,
+            .entry_type = "custom",
+            .id = entry_id,
+        };
+        self.file_entries = grown;
+        self.leaf_id = entry_id;
+        try self.persistEntry(io, raw_json);
+        return entry_id;
+    }
+
+    pub fn appendLabelChange(
+        self: *SessionManager,
+        io: std.Io,
+        target_id: []const u8,
+        label: ?[]const u8,
+    ) ![]const u8 {
+        if (self.getEntry(target_id) == null) return error.EntryNotFound;
+
+        const arena_allocator = self.arena.allocator();
+        const entry_id = try generateEntryIdAlloc(arena_allocator, io, self.file_entries);
+        errdefer arena_allocator.free(entry_id);
+        const timestamp = try isoTimestampAlloc(
+            arena_allocator,
+            std.Io.Clock.real.now(io).toMilliseconds(),
+        );
+        errdefer arena_allocator.free(timestamp);
+        const normalized_label = if (label) |value| blk: {
+            if (value.len == 0) break :blk null;
+            break :blk value;
+        } else null;
+        const raw_json = try labelEntryJsonAlloc(arena_allocator, entry_id, self.leaf_id, timestamp, target_id, normalized_label);
+        errdefer arena_allocator.free(raw_json);
+        const grown = try arena_allocator.alloc(FileEntry, self.file_entries.len + 1);
+        @memcpy(grown[0..self.file_entries.len], self.file_entries);
+        grown[self.file_entries.len] = .{
+            .raw_json = raw_json,
+            .entry_type = "label",
+            .id = entry_id,
+        };
+        self.file_entries = grown;
+        self.leaf_id = entry_id;
+        try self.persistEntry(io, raw_json);
+        return entry_id;
+    }
+
+    pub fn getLabelAlloc(
+        self: *const SessionManager,
+        allocator: std.mem.Allocator,
+        target_id: []const u8,
+    ) !?[]u8 {
+        const state = try self.getLabelStateAlloc(allocator, target_id);
+        if (state) |value| {
+            allocator.free(value.timestamp);
+            return value.label;
+        }
+        return null;
+    }
+
+    pub fn getLabelStateAlloc(
+        self: *const SessionManager,
+        allocator: std.mem.Allocator,
+        target_id: []const u8,
+    ) !?LabelState {
+        return latestLabelForIdAlloc(allocator, allocator, self.getEntries(), target_id);
+    }
+
     pub fn getSessionName(
         self: *const SessionManager,
         allocator: std.mem.Allocator,
@@ -521,6 +643,104 @@ pub const SessionManager = struct {
         return null;
     }
 
+    pub fn buildSessionContextAlloc(
+        self: *const SessionManager,
+        allocator: std.mem.Allocator,
+    ) !SessionContext {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+        const arena_allocator = arena.allocator();
+
+        const branch_entries = try self.getBranchAlloc(arena_allocator, null);
+        var messages: std.ArrayList(FileEntry) = .empty;
+        for (branch_entries) |entry| {
+            if (!entryTypeEquals(entry, "message")) continue;
+            try messages.append(arena_allocator, try cloneFileEntry(arena_allocator, entry));
+        }
+
+        return .{
+            .arena = arena,
+            .messages = try messages.toOwnedSlice(arena_allocator),
+        };
+    }
+
+    pub fn getTreeAlloc(
+        self: *const SessionManager,
+        allocator: std.mem.Allocator,
+    ) !SessionTree {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+        const arena_allocator = arena.allocator();
+        const scratch_allocator = allocator;
+        const entries = self.getEntries();
+
+        var by_id = std.StringHashMap(usize).init(scratch_allocator);
+        defer by_id.deinit();
+        for (entries, 0..) |entry, index| {
+            if (entry.id) |id| {
+                try by_id.put(id, index);
+            }
+        }
+
+        var child_counts = try scratch_allocator.alloc(usize, entries.len);
+        defer scratch_allocator.free(child_counts);
+        @memset(child_counts, 0);
+        var root_count: usize = 0;
+        for (entries, 0..) |entry, index| {
+            const parent_id = try entryParentIdAlloc(scratch_allocator, entry.raw_json);
+            defer if (parent_id) |value| scratch_allocator.free(value);
+            if (parent_id) |parent| {
+                if (entry.id == null or !std.mem.eql(u8, parent, entry.id.?)) {
+                    if (by_id.get(parent)) |parent_index| {
+                        child_counts[parent_index] += 1;
+                        continue;
+                    }
+                }
+            }
+            _ = index;
+            root_count += 1;
+        }
+
+        const nodes = try arena_allocator.alloc(SessionTreeNode, entries.len);
+        for (entries, 0..) |entry, index| {
+            const label_state = if (entry.id) |id|
+                try latestLabelForIdAlloc(arena_allocator, scratch_allocator, entries, id)
+            else
+                null;
+            nodes[index] = .{
+                .entry = try cloneFileEntry(arena_allocator, entry),
+                .children = try arena_allocator.alloc(*SessionTreeNode, child_counts[index]),
+                .label = if (label_state) |state| state.label else null,
+                .label_timestamp = if (label_state) |state| state.timestamp else null,
+            };
+            child_counts[index] = 0;
+        }
+
+        const roots = try arena_allocator.alloc(*SessionTreeNode, root_count);
+        var root_index: usize = 0;
+        for (entries, 0..) |entry, index| {
+            const parent_id = try entryParentIdAlloc(scratch_allocator, entry.raw_json);
+            defer if (parent_id) |value| scratch_allocator.free(value);
+            if (parent_id) |parent| {
+                if (entry.id == null or !std.mem.eql(u8, parent, entry.id.?)) {
+                    if (by_id.get(parent)) |parent_index| {
+                        const write_index = child_counts[parent_index];
+                        nodes[parent_index].children[write_index] = &nodes[index];
+                        child_counts[parent_index] = write_index + 1;
+                        continue;
+                    }
+                }
+            }
+            roots[root_index] = &nodes[index];
+            root_index += 1;
+        }
+
+        return .{
+            .arena = arena,
+            .roots = roots,
+        };
+    }
+
     pub fn createBranchedSession(
         self: *SessionManager,
         io: std.Io,
@@ -536,6 +756,30 @@ pub const SessionManager = struct {
         for (path) |entry| {
             if (entryTypeEquals(entry, "label")) continue;
             try path_without_labels.append(scratch_allocator, entry);
+        }
+
+        var label_arena = std.heap.ArenaAllocator.init(scratch_allocator);
+        defer label_arena.deinit();
+        const label_allocator = label_arena.allocator();
+        const LabelToWrite = struct {
+            target_id: []const u8,
+            label: []const u8,
+            timestamp: []const u8,
+        };
+        var labels_to_write: std.ArrayList(LabelToWrite) = .empty;
+        for (path_without_labels.items) |entry| {
+            const target_id = entry.id orelse continue;
+            const label_state = try latestLabelForIdAlloc(
+                label_allocator,
+                scratch_allocator,
+                self.getEntries(),
+                target_id,
+            ) orelse continue;
+            try labels_to_write.append(label_allocator, .{
+                .target_id = target_id,
+                .label = label_state.label,
+                .timestamp = label_state.timestamp,
+            });
         }
 
         var generated_id: [36]u8 = agent.uuid.uuidv7(io);
@@ -562,13 +806,38 @@ pub const SessionManager = struct {
         const raw_header = try freshHeaderJsonAlloc(arena_allocator, header);
         errdefer arena_allocator.free(raw_header);
 
-        const new_entries = try arena_allocator.alloc(FileEntry, path_without_labels.items.len + 1);
+        const new_entries = try arena_allocator.alloc(FileEntry, path_without_labels.items.len + labels_to_write.items.len + 1);
         new_entries[0] = .{
             .raw_json = raw_header,
             .entry_type = "session",
             .id = new_session_id,
         };
-        @memcpy(new_entries[1..], path_without_labels.items);
+        @memcpy(new_entries[1 .. 1 + path_without_labels.items.len], path_without_labels.items);
+        var write_index: usize = 1 + path_without_labels.items.len;
+        var label_parent_id: ?[]const u8 = if (path_without_labels.items.len > 0)
+            path_without_labels.items[path_without_labels.items.len - 1].id
+        else
+            null;
+        for (labels_to_write.items) |label_to_write| {
+            const label_id = try generateEntryIdAlloc(arena_allocator, io, new_entries[0..write_index]);
+            errdefer arena_allocator.free(label_id);
+            const raw_label = try labelEntryJsonAlloc(
+                arena_allocator,
+                label_id,
+                label_parent_id,
+                label_to_write.timestamp,
+                label_to_write.target_id,
+                label_to_write.label,
+            );
+            errdefer arena_allocator.free(raw_label);
+            new_entries[write_index] = .{
+                .raw_json = raw_label,
+                .entry_type = "label",
+                .id = label_id,
+            };
+            label_parent_id = label_id;
+            write_index += 1;
+        }
 
         const new_session_file = if (self.persist)
             try freshSessionFileAlloc(arena_allocator, self.session_dir, timestamp, new_session_id)
@@ -1289,6 +1558,59 @@ fn cloneSessionInfo(allocator: std.mem.Allocator, info: SessionInfo) !SessionInf
     };
 }
 
+fn cloneFileEntry(allocator: std.mem.Allocator, entry: FileEntry) !FileEntry {
+    return .{
+        .raw_json = try allocator.dupe(u8, entry.raw_json),
+        .entry_type = if (entry.entry_type) |entry_type|
+            try allocator.dupe(u8, entry_type)
+        else
+            null,
+        .id = if (entry.id) |id| try allocator.dupe(u8, id) else null,
+    };
+}
+
+fn latestLabelForIdAlloc(
+    output_allocator: std.mem.Allocator,
+    scratch_allocator: std.mem.Allocator,
+    entries: []const FileEntry,
+    target_id: []const u8,
+) !?LabelState {
+    var latest: ?LabelState = null;
+    errdefer if (latest) |state| {
+        output_allocator.free(state.label);
+        output_allocator.free(state.timestamp);
+    };
+
+    for (entries) |entry| {
+        if (!entryTypeEquals(entry, "label")) continue;
+        var parsed = std.json.parseFromSlice(std.json.Value, scratch_allocator, entry.raw_json, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => continue,
+        };
+        defer parsed.deinit();
+        if (parsed.value != .object) continue;
+        const object = parsed.value.object;
+        const current_target = optionalString(object, "targetId") orelse continue;
+        if (!std.mem.eql(u8, current_target, target_id)) continue;
+
+        if (latest) |state| {
+            output_allocator.free(state.label);
+            output_allocator.free(state.timestamp);
+            latest = null;
+        }
+
+        const label = optionalString(object, "label") orelse continue;
+        if (label.len == 0) continue;
+        const timestamp = optionalString(object, "timestamp") orelse "";
+        latest = .{
+            .label = try output_allocator.dupe(u8, label),
+            .timestamp = try output_allocator.dupe(u8, timestamp),
+        };
+    }
+
+    return latest;
+}
+
 fn findLeafId(entries: []const FileEntry) ?[]const u8 {
     var index = entries.len;
     while (index > 1) {
@@ -1377,6 +1699,76 @@ fn sessionInfoEntryJsonAlloc(
     try json.write(timestamp);
     try json.objectField("name");
     try json.write(name);
+    try json.endObject();
+    return output.toOwnedSlice();
+}
+
+fn customEntryJsonAlloc(
+    allocator: std.mem.Allocator,
+    id: []const u8,
+    parent_id: ?[]const u8,
+    timestamp: []const u8,
+    custom_type: []const u8,
+    data_json: ?[]const u8,
+) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    var json: std.json.Stringify = .{ .writer = &output.writer };
+    try json.beginObject();
+    try json.objectField("type");
+    try json.write("custom");
+    try json.objectField("customType");
+    try json.write(custom_type);
+    if (data_json) |data| {
+        try json.objectField("data");
+        try json.beginWriteRaw();
+        try output.writer.writeAll(data);
+        json.endWriteRaw();
+    }
+    try json.objectField("id");
+    try json.write(id);
+    try json.objectField("parentId");
+    if (parent_id) |parent| {
+        try json.write(parent);
+    } else {
+        try json.write(null);
+    }
+    try json.objectField("timestamp");
+    try json.write(timestamp);
+    try json.endObject();
+    return output.toOwnedSlice();
+}
+
+fn labelEntryJsonAlloc(
+    allocator: std.mem.Allocator,
+    id: []const u8,
+    parent_id: ?[]const u8,
+    timestamp: []const u8,
+    target_id: []const u8,
+    label: ?[]const u8,
+) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    var json: std.json.Stringify = .{ .writer = &output.writer };
+    try json.beginObject();
+    try json.objectField("type");
+    try json.write("label");
+    try json.objectField("id");
+    try json.write(id);
+    try json.objectField("parentId");
+    if (parent_id) |parent| {
+        try json.write(parent);
+    } else {
+        try json.write(null);
+    }
+    try json.objectField("timestamp");
+    try json.write(timestamp);
+    try json.objectField("targetId");
+    try json.write(target_id);
+    if (label) |value| {
+        try json.objectField("label");
+        try json.write(value);
+    }
     try json.endObject();
     return output.toOwnedSlice();
 }
@@ -1883,6 +2275,51 @@ fn expectOneHeaderAndUniqueEntryIds(allocator: std.mem.Allocator, path: []const 
         try seen_ids.put(id, {});
     }
     try std.testing.expectEqual(@as(usize, 1), session_headers);
+}
+
+fn findEntryByType(entries: []const FileEntry, entry_type: []const u8) ?FileEntry {
+    for (entries) |entry| {
+        if (entryTypeEquals(entry, entry_type)) return entry;
+    }
+    return null;
+}
+
+fn findEntryById(entries: []const FileEntry, id: []const u8) ?FileEntry {
+    for (entries) |entry| {
+        if (entry.id) |entry_id| {
+            if (std.mem.eql(u8, entry_id, id)) return entry;
+        }
+    }
+    return null;
+}
+
+fn countEntriesByType(entries: []const FileEntry, entry_type: []const u8) usize {
+    var count: usize = 0;
+    for (entries) |entry| {
+        if (entryTypeEquals(entry, entry_type)) count += 1;
+    }
+    return count;
+}
+
+fn findTreeNodeById(nodes: []*SessionTreeNode, id: []const u8) ?*SessionTreeNode {
+    for (nodes) |node| {
+        if (node.entry.id) |entry_id| {
+            if (std.mem.eql(u8, entry_id, id)) return node;
+        }
+        if (findTreeNodeById(node.children, id)) |found| return found;
+    }
+    return null;
+}
+
+fn expectEntryStringField(
+    allocator: std.mem.Allocator,
+    entry: FileEntry,
+    field: []const u8,
+    expected: []const u8,
+) !void {
+    const value = try entryStringFieldAlloc(allocator, entry.raw_json, field);
+    defer allocator.free(value.?);
+    try std.testing.expectEqualStrings(expected, value.?);
 }
 
 // Ported from packages/coding-agent/src/core/session-manager.ts default directory helpers.
@@ -2809,4 +3246,170 @@ test "SessionManager createBranchedSession defers or writes forked files by assi
     _ = try session.appendMessageJson(std.testing.io, new_answer);
     try std.Io.Dir.cwd().access(std.testing.io, user_only_file, .{});
     try expectOneHeaderAndUniqueEntryIds(allocator, user_only_file);
+}
+
+// Ported from packages/coding-agent/test/session-manager/save-entry.test.ts.
+test "SessionManager appendCustomEntryJson saves custom entries and skips them in context" {
+    const allocator = std.testing.allocator;
+    var session = try SessionManager.inMemory(allocator, std.testing.io, null);
+    defer session.deinit();
+
+    const user_json = try testUserMessageJsonAlloc(allocator, "hello", 1);
+    defer allocator.free(user_json);
+    const msg_id = try session.appendMessageJson(std.testing.io, user_json);
+    const custom_id = try session.appendCustomEntryJson(std.testing.io, "my_data", "{\"foo\":\"bar\"}");
+    const assistant_json = try testAssistantMessageJsonAlloc(allocator, "hi", 2);
+    defer allocator.free(assistant_json);
+    const msg2_id = try session.appendMessageJson(std.testing.io, assistant_json);
+
+    const entries = session.getEntries();
+    try std.testing.expectEqual(@as(usize, 3), entries.len);
+    const custom_entry = findEntryByType(entries, "custom") orelse return error.MissingCustomEntry;
+    try std.testing.expectEqualStrings(custom_id, custom_entry.id.?);
+    try expectEntryStringField(allocator, custom_entry, "customType", "my_data");
+    try expectEntryParent(allocator, custom_entry, msg_id);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, custom_entry.raw_json, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+    const data = parsed.value.object.get("data") orelse return error.MissingCustomData;
+    try std.testing.expect(data == .object);
+    try std.testing.expectEqualStrings("bar", optionalString(data.object, "foo").?);
+
+    const branch = try session.getBranchAlloc(allocator, null);
+    defer allocator.free(branch);
+    try std.testing.expectEqual(@as(usize, 3), branch.len);
+    try std.testing.expectEqualStrings(msg_id, branch[0].id.?);
+    try std.testing.expectEqualStrings(custom_id, branch[1].id.?);
+    try std.testing.expectEqualStrings(msg2_id, branch[2].id.?);
+
+    var context = try session.buildSessionContextAlloc(allocator);
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 2), context.messages.len);
+    try std.testing.expect(entryTypeEquals(context.messages[0], "message"));
+    try std.testing.expect(entryTypeEquals(context.messages[1], "message"));
+}
+
+// Ported from packages/coding-agent/test/session-manager/labels.test.ts.
+test "SessionManager labels set clear and last label wins" {
+    const allocator = std.testing.allocator;
+    var session = try SessionManager.inMemory(allocator, std.testing.io, null);
+    defer session.deinit();
+
+    const user_json = try testUserMessageJsonAlloc(allocator, "hello", 1);
+    defer allocator.free(user_json);
+    const msg_id = try session.appendMessageJson(std.testing.io, user_json);
+
+    try std.testing.expectEqual(null, try session.getLabelAlloc(allocator, msg_id));
+
+    const first_label_id = try session.appendLabelChange(std.testing.io, msg_id, "checkpoint");
+    const first_label = (try session.getLabelAlloc(allocator, msg_id)).?;
+    defer allocator.free(first_label);
+    try std.testing.expectEqualStrings("checkpoint", first_label);
+
+    const first_label_entry = findEntryById(session.getEntries(), first_label_id) orelse return error.MissingLabelEntry;
+    try expectEntryStringField(allocator, first_label_entry, "targetId", msg_id);
+    try expectEntryStringField(allocator, first_label_entry, "label", "checkpoint");
+
+    _ = try session.appendLabelChange(std.testing.io, msg_id, null);
+    try std.testing.expectEqual(null, try session.getLabelAlloc(allocator, msg_id));
+
+    _ = try session.appendLabelChange(std.testing.io, msg_id, "first");
+    _ = try session.appendLabelChange(std.testing.io, msg_id, "second");
+    const last_label_id = try session.appendLabelChange(std.testing.io, msg_id, "third");
+    const last_label = (try session.getLabelAlloc(allocator, msg_id)).?;
+    defer allocator.free(last_label);
+    try std.testing.expectEqualStrings("third", last_label);
+
+    const last_label_entry = findEntryById(session.getEntries(), last_label_id) orelse return error.MissingLabelEntry;
+    const last_timestamp = try entryStringFieldAlloc(allocator, last_label_entry.raw_json, "timestamp");
+    defer allocator.free(last_timestamp.?);
+    var tree = try session.getTreeAlloc(allocator);
+    defer tree.deinit();
+    const msg_node = findTreeNodeById(tree.roots, msg_id) orelse return error.MissingMessageNode;
+    try std.testing.expectEqualStrings("third", msg_node.label.?);
+    try std.testing.expectEqualStrings(last_timestamp.?, msg_node.label_timestamp.?);
+}
+
+test "SessionManager labels annotate tree nodes and are skipped in context" {
+    const allocator = std.testing.allocator;
+    var session = try SessionManager.inMemory(allocator, std.testing.io, null);
+    defer session.deinit();
+
+    const msg1_json = try testUserMessageJsonAlloc(allocator, "hello", 1);
+    defer allocator.free(msg1_json);
+    const msg2_json = try testAssistantMessageJsonAlloc(allocator, "hi", 2);
+    defer allocator.free(msg2_json);
+    const msg1_id = try session.appendMessageJson(std.testing.io, msg1_json);
+    const msg2_id = try session.appendMessageJson(std.testing.io, msg2_json);
+    const msg1_label_id = try session.appendLabelChange(std.testing.io, msg1_id, "start");
+    const msg2_label_id = try session.appendLabelChange(std.testing.io, msg2_id, "response");
+
+    const msg1_label_entry = findEntryById(session.getEntries(), msg1_label_id) orelse return error.MissingLabelEntry;
+    const msg2_label_entry = findEntryById(session.getEntries(), msg2_label_id) orelse return error.MissingLabelEntry;
+    const msg1_label_timestamp = try entryStringFieldAlloc(allocator, msg1_label_entry.raw_json, "timestamp");
+    defer allocator.free(msg1_label_timestamp.?);
+    const msg2_label_timestamp = try entryStringFieldAlloc(allocator, msg2_label_entry.raw_json, "timestamp");
+    defer allocator.free(msg2_label_timestamp.?);
+
+    var tree = try session.getTreeAlloc(allocator);
+    defer tree.deinit();
+    const msg1_node = findTreeNodeById(tree.roots, msg1_id) orelse return error.MissingMessageNode;
+    try std.testing.expectEqualStrings("start", msg1_node.label.?);
+    try std.testing.expectEqualStrings(msg1_label_timestamp.?, msg1_node.label_timestamp.?);
+    const msg2_node = findTreeNodeById(msg1_node.children, msg2_id) orelse return error.MissingMessageNode;
+    try std.testing.expectEqualStrings("response", msg2_node.label.?);
+    try std.testing.expectEqualStrings(msg2_label_timestamp.?, msg2_node.label_timestamp.?);
+
+    var context = try session.buildSessionContextAlloc(allocator);
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 2), context.messages.len);
+    try std.testing.expectError(
+        error.EntryNotFound,
+        session.appendLabelChange(std.testing.io, "non-existent", "label"),
+    );
+}
+
+test "SessionManager createBranchedSession preserves labels only for selected path" {
+    const allocator = std.testing.allocator;
+    var session = try SessionManager.inMemory(allocator, std.testing.io, null);
+    defer session.deinit();
+
+    const msg1_json = try testUserMessageJsonAlloc(allocator, "hello", 1);
+    defer allocator.free(msg1_json);
+    const msg2_json = try testAssistantMessageJsonAlloc(allocator, "hi", 2);
+    defer allocator.free(msg2_json);
+    const msg3_json = try testUserMessageJsonAlloc(allocator, "followup", 3);
+    defer allocator.free(msg3_json);
+    const msg1_id = try session.appendMessageJson(std.testing.io, msg1_json);
+    const msg2_id = try session.appendMessageJson(std.testing.io, msg2_json);
+    const msg3_id = try session.appendMessageJson(std.testing.io, msg3_json);
+
+    const msg1_label_id = try session.appendLabelChange(std.testing.io, msg1_id, "first");
+    const msg2_label_id = try session.appendLabelChange(std.testing.io, msg2_id, "second");
+    _ = try session.appendLabelChange(std.testing.io, msg3_id, "third");
+    const msg1_label_entry = findEntryById(session.getEntries(), msg1_label_id) orelse return error.MissingLabelEntry;
+    const msg2_label_entry = findEntryById(session.getEntries(), msg2_label_id) orelse return error.MissingLabelEntry;
+    const msg1_label_timestamp = try entryStringFieldAlloc(allocator, msg1_label_entry.raw_json, "timestamp");
+    defer allocator.free(msg1_label_timestamp.?);
+    const msg2_label_timestamp = try entryStringFieldAlloc(allocator, msg2_label_entry.raw_json, "timestamp");
+    defer allocator.free(msg2_label_timestamp.?);
+
+    try std.testing.expectEqual(null, try session.createBranchedSession(std.testing.io, msg2_id));
+    try std.testing.expectEqual(@as(usize, 2), countEntriesByType(session.getEntries(), "label"));
+
+    const msg1_label = (try session.getLabelAlloc(allocator, msg1_id)).?;
+    defer allocator.free(msg1_label);
+    const msg2_label = (try session.getLabelAlloc(allocator, msg2_id)).?;
+    defer allocator.free(msg2_label);
+    try std.testing.expectEqualStrings("first", msg1_label);
+    try std.testing.expectEqualStrings("second", msg2_label);
+    try std.testing.expectEqual(null, try session.getLabelAlloc(allocator, msg3_id));
+
+    var tree = try session.getTreeAlloc(allocator);
+    defer tree.deinit();
+    const msg1_node = findTreeNodeById(tree.roots, msg1_id) orelse return error.MissingMessageNode;
+    const msg2_node = findTreeNodeById(msg1_node.children, msg2_id) orelse return error.MissingMessageNode;
+    try std.testing.expectEqualStrings(msg1_label_timestamp.?, msg1_node.label_timestamp.?);
+    try std.testing.expectEqualStrings(msg2_label_timestamp.?, msg2_node.label_timestamp.?);
 }
