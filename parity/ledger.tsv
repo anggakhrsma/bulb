@@ -737,7 +737,7 @@ packages/tui/src/components/box.ts	bulb_tui	source	implemented	src/bulb_tui/root
 packages/tui/src/components/cancellable-loader.ts	bulb_tui	source	implemented	src/bulb_tui/root.zig	Native cancellable loader wrapper, abort signal state, Escape/Ctrl-C keybinding handling, dispose, and abort callback behavior ported
 packages/tui/src/components/editor.ts	bulb_tui	source	pending		
 packages/tui/src/components/image.ts	bulb_tui	source	implemented	src/bulb_tui/root.zig	Native Image component fallback rendering, Kitty/iTerm2 protocol row accounting, image-id reuse, cached render invalidation, and explicit allocator ownership ported
-packages/tui/src/components/input.ts	bulb_tui	source	pending		
+packages/tui/src/components/input.ts	bulb_tui	source	implemented	src/bulb_tui/input.zig	Native single-line input component, submit/escape callbacks, horizontal scrolling render, cursor marker, bracketed paste cleanup, kill ring/yank-pop, undo stack, cursor movement, and Pi-compatible wide-text handling ported
 packages/tui/src/components/loader.ts	bulb_tui	source	implemented	src/bulb_tui/root.zig	Native text-backed loader, default/custom indicator frames, verbatim custom indicators, message updates, render requests, stop/start state, and deterministic frame advancement ported
 packages/tui/src/components/markdown.ts	bulb_tui	source	implemented	src/bulb_tui/root.zig	Native Markdown component, default/theme styling, strict strikethrough, inline code/bold/links, OSC 8 fallback, lists, blockquotes, fenced code, tables, spacing normalization, padding/background, image-line bypass, and render cache ported
 packages/tui/src/components/select-list.ts	bulb_tui	source	implemented	src/bulb_tui/root.zig	Native select list filtering, scrolling window, keybinding input, callbacks, description alignment, primary-column bounds, and custom truncation ported
@@ -765,7 +765,7 @@ packages/tui/test/chat-simple.ts	bulb_tui	test	pending
 packages/tui/test/editor.test.ts	bulb_tui	test	pending		
 packages/tui/test/fuzzy.test.ts	bulb_tui	test	implemented	src/bulb_tui/fuzzy.zig	Upstream fuzzyMatch and fuzzyFilter empty, ordering, scoring, case, exact, swapped alpha-numeric, and custom getText regressions ported
 packages/tui/test/image-test.ts	bulb_tui	test	pending		
-packages/tui/test/input.test.ts	bulb_tui	test	pending		
+packages/tui/test/input.test.ts	bulb_tui	test	implemented	src/bulb_tui/input.zig	Upstream submit/backslash, wide render overflow, cursor visibility, kill ring, yank/yank-pop, Unicode word deletion, paste cleanup, and undo regressions ported
 packages/tui/test/key-tester.ts	bulb_tui	test	pending		
 packages/tui/test/keybindings.test.ts	bulb_tui	test	implemented	src/bulb_tui/keybindings.zig	Upstream default-preservation and direct-conflict regressions ported
 packages/tui/test/keys.test.ts	bulb_tui	test	implemented	src/bulb_tui/keys.zig	Upstream Kitty alternate-layout, super/digit/keypad, event/remap, modifyOtherKeys, legacy ctrl/symbol/alt/navigation, parseKey, printable decode, and event-helper regressions ported
