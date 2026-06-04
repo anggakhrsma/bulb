@@ -54,7 +54,7 @@ packages/agent/src/harness/session/memory-repo.ts	bulb_agent	source	pending
 packages/agent/src/harness/session/memory-storage.ts	bulb_agent	source	pending		
 packages/agent/src/harness/session/repo-utils.ts	bulb_agent	source	pending		
 packages/agent/src/harness/session/session.ts	bulb_agent	source	pending		
-packages/agent/src/harness/session/uuid.ts	bulb_agent	source	pending		
+packages/agent/src/harness/session/uuid.ts	bulb_agent	source	implemented	src/bulb_agent/uuid.zig	Native RFC 9562 UUIDv7 layout, monotonic sequence rollover, thread-safe process generator, and reusable deterministic generator ported
 packages/agent/src/harness/skills.ts	bulb_agent	source	pending		
 packages/agent/src/harness/system-prompt.ts	bulb_agent	source	pending		
 packages/agent/src/harness/types.ts	bulb_agent	source	pending		
@@ -75,7 +75,7 @@ packages/agent/test/harness/prompt-templates.test.ts	bulb_agent	test	pending
 packages/agent/test/harness/repo.test.ts	bulb_agent	test	pending		
 packages/agent/test/harness/resource-formatting.test.ts	bulb_agent	test	pending		
 packages/agent/test/harness/session-test-utils.ts	bulb_agent	test	pending		
-packages/agent/test/harness/session-uuid.test.ts	bulb_agent	test	pending		
+packages/agent/test/harness/session-uuid.test.ts	bulb_agent	test	implemented	src/bulb_agent/uuid.zig	Exact RFC layout, sequence increment and rollover, timestamp carry, and lexical monotonicity regression ported
 packages/agent/test/harness/session.test.ts	bulb_agent	test	pending		
 packages/agent/test/harness/skills.test.ts	bulb_agent	test	pending		
 packages/agent/test/harness/storage.test.ts	bulb_agent	test	pending		
@@ -452,7 +452,7 @@ packages/coding-agent/src/core/resolve-config-value.ts	bulb_coding_agent	source	
 packages/coding-agent/src/core/resource-loader.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/core/sdk.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/core/session-cwd.ts	bulb_coding_agent	source	implemented	src/bulb_coding_agent/session_cwd.zig	Native session cwd source contract, persisted-session missing-directory detection, exact error and prompt formatting, issue payload, and controlled assertion ported
-packages/coding-agent/src/core/session-manager.ts	bulb_coding_agent	source	in_progress	src/bulb_coding_agent/session_manager.zig	Native allocator-owned raw JSONL loading with malformed-line skipping, validated session headers, Pi-compatible ID validation, valid persisted-session open/cwd override behavior, getters, and cwd-source adapter ported; new/in-memory sessions, invalid-file recovery, persistence, migrations, recent-session lookup, tree/context, and mutations remain
+packages/coding-agent/src/core/session-manager.ts	bulb_coding_agent	source	in_progress	src/bulb_coding_agent/session_manager.zig	Native allocator-owned raw JSONL loading with malformed-line skipping, validated session headers, Pi-compatible ID validation, fresh in-memory and persisted session creation, UUIDv7/custom IDs, deferred file naming, valid persisted-session open/cwd override behavior, getters, and cwd-source adapter ported; default session directories, invalid-file recovery, persistence, migrations, recent-session lookup, branch/fork, tree/context, and mutations remain
 packages/coding-agent/src/core/settings-manager.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/core/skills.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/core/slash-commands.ts	bulb_coding_agent	source	pending		
@@ -661,7 +661,7 @@ packages/coding-agent/test/session-cwd.test.ts	bulb_coding_agent	test	in_progres
 packages/coding-agent/test/session-id-readonly.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/session-info-modified-timestamp.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/session-manager/build-context.test.ts	bulb_coding_agent	test	pending		
-packages/coding-agent/test/session-manager/custom-session-id.test.ts	bulb_coding_agent	test	in_progress	src/bulb_coding_agent/session_manager.zig	Accepted and rejected custom session ID validation cases ported; newSession ID propagation, UUIDv7 generation, persisted create, branch, and fork cases remain
+packages/coding-agent/test/session-manager/custom-session-id.test.ts	bulb_coding_agent	test	in_progress	src/bulb_coding_agent/session_manager.zig	Custom ID validation and propagation, header inclusion, UUIDv7 generation, in-memory defaults, parent option, and persisted create/deferred filename cases ported; branch and fork cases remain
 packages/coding-agent/test/session-manager/file-operations.test.ts	bulb_coding_agent	test	in_progress	src/bulb_coding_agent/session_manager.zig	Missing, empty, headerless, malformed, valid, and mixed JSONL loader plus valid SessionManager open cases ported; giant sparse-file regression, recent-session lookup, invalid-file rewrite, and flat-session directory cases remain
 packages/coding-agent/test/session-manager/labels.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/session-manager/migration.test.ts	bulb_coding_agent	test	pending		

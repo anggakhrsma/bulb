@@ -1,6 +1,8 @@
 const std = @import("std");
 const ai = @import("bulb_ai");
 
+pub const uuid = @import("uuid.zig");
+
 pub const AgentStatus = enum {
     idle,
     streaming,
@@ -51,4 +53,8 @@ test "agent lifecycle guards streaming state" {
     try state.endTurn();
     try std.testing.expectEqual(@as(usize, 1), state.turn_count);
     try std.testing.expectError(error.NotStreaming, state.endTurn());
+}
+
+test {
+    _ = @import("uuid.zig");
 }
