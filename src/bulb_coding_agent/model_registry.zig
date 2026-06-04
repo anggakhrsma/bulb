@@ -3,6 +3,7 @@ const ai = @import("bulb_ai");
 const auth_storage = @import("auth_storage.zig");
 const config_value = @import("resolve_config_value.zig");
 const json_util = @import("json.zig");
+const provider_display_names = @import("provider_display_names.zig");
 
 const max_models_json_bytes = 4 * 1024 * 1024;
 
@@ -281,7 +282,7 @@ pub const ModelRegistry = struct {
         for (self.auth_storage.getOAuthProviders()) |oauth| {
             if (std.mem.eql(u8, oauth.id, provider)) return oauth.name;
         }
-        return builtInProviderDisplayName(provider) orelse provider;
+        return provider_display_names.get(provider) orelse provider;
     }
 
     pub fn registerProvider(self: *ModelRegistry, provider_name: []const u8, input: ProviderConfigInput) !void {
@@ -2280,45 +2281,6 @@ fn builtInDefaultApi(provider: []const u8) ?[]const u8 {
 fn builtInDefaultBaseUrl(provider: []const u8) ?[]const u8 {
     var models = ai.models.getModels(provider);
     return if (models.next()) |model| model.base_url else null;
-}
-
-fn builtInProviderDisplayName(provider: []const u8) ?[]const u8 {
-    const display_names = [_]struct { id: []const u8, name: []const u8 }{
-        .{ .id = "anthropic", .name = "Anthropic" },
-        .{ .id = "amazon-bedrock", .name = "Amazon Bedrock" },
-        .{ .id = "azure-openai-responses", .name = "Azure OpenAI Responses" },
-        .{ .id = "cerebras", .name = "Cerebras" },
-        .{ .id = "cloudflare-ai-gateway", .name = "Cloudflare AI Gateway" },
-        .{ .id = "cloudflare-workers-ai", .name = "Cloudflare Workers AI" },
-        .{ .id = "deepseek", .name = "DeepSeek" },
-        .{ .id = "fireworks", .name = "Fireworks" },
-        .{ .id = "google", .name = "Google Gemini" },
-        .{ .id = "google-vertex", .name = "Google Vertex AI" },
-        .{ .id = "groq", .name = "Groq" },
-        .{ .id = "huggingface", .name = "Hugging Face" },
-        .{ .id = "kimi-coding", .name = "Kimi For Coding" },
-        .{ .id = "mistral", .name = "Mistral" },
-        .{ .id = "minimax", .name = "MiniMax" },
-        .{ .id = "minimax-cn", .name = "MiniMax (China)" },
-        .{ .id = "moonshotai", .name = "Moonshot AI" },
-        .{ .id = "moonshotai-cn", .name = "Moonshot AI (China)" },
-        .{ .id = "opencode", .name = "OpenCode Zen" },
-        .{ .id = "opencode-go", .name = "OpenCode Go" },
-        .{ .id = "openai", .name = "OpenAI" },
-        .{ .id = "openrouter", .name = "OpenRouter" },
-        .{ .id = "together", .name = "Together AI" },
-        .{ .id = "vercel-ai-gateway", .name = "Vercel AI Gateway" },
-        .{ .id = "xai", .name = "xAI" },
-        .{ .id = "zai", .name = "ZAI" },
-        .{ .id = "xiaomi", .name = "Xiaomi MiMo" },
-        .{ .id = "xiaomi-token-plan-cn", .name = "Xiaomi MiMo Token Plan (China)" },
-        .{ .id = "xiaomi-token-plan-ams", .name = "Xiaomi MiMo Token Plan (Amsterdam)" },
-        .{ .id = "xiaomi-token-plan-sgp", .name = "Xiaomi MiMo Token Plan (Singapore)" },
-    };
-    for (display_names) |entry| {
-        if (std.mem.eql(u8, entry.id, provider)) return entry.name;
-    }
-    return null;
 }
 
 fn joinEnvVarNamesAlloc(allocator: std.mem.Allocator, names: []const []const u8) ![]u8 {
