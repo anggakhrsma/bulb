@@ -4924,6 +4924,13 @@ fn containsLineWith(lines: []const []const u8, needle: []const u8) bool {
     return false;
 }
 
+fn findLineWith(lines: []const []const u8, needle: []const u8) ?usize {
+    for (lines, 0..) |line, index| {
+        if (std.mem.indexOf(u8, line, needle) != null) return index;
+    }
+    return null;
+}
+
 fn removeTableNoise(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
     var output: std.ArrayList(u8) = .empty;
     errdefer output.deinit(allocator);
@@ -4956,6 +4963,75 @@ test "TUI virtual terminal renders lines and resets styles after each row" {
     defer freeOwnedLines(allocator, viewport);
     try std.testing.expect(std.mem.indexOf(u8, viewport[0], "Italic") != null);
     try std.testing.expect(std.mem.indexOf(u8, viewport[1], "Plain") != null);
+    try std.testing.expect(!virtual_terminal.getCellItalic(1, 0));
+}
+
+test "TUI forwards bare escape after startup cell-size query" {
+    const allocator = std.testing.allocator;
+    terminal_image.setCapabilities(.{ .images = .kitty, .true_color = true, .hyperlinks = true });
+    defer terminal_image.resetCapabilitiesCache();
+
+    var virtual_terminal = VirtualTerminal.init(allocator, 80, 24);
+    defer virtual_terminal.deinit();
+    var tui = TUI.init(allocator, virtual_terminal.asTerminal());
+    defer tui.deinit();
+    var recorder = FocusableInputComponent{ .allocator = allocator, .lines = &.{""} };
+    defer recorder.deinit();
+    tui.setFocus(Component.from(FocusableInputComponent, &recorder));
+
+    try tui.start();
+    defer tui.stop() catch {};
+
+    virtual_terminal.sendInput("\x1b");
+    try std.testing.expectEqualStrings("\x1b", recorder.inputs.items);
+}
+
+test "TUI consumes cell-size responses and forwards later user input" {
+    const allocator = std.testing.allocator;
+    terminal_image.setCapabilities(.{ .images = .kitty, .true_color = true, .hyperlinks = true });
+    terminal_image.setCellDimensions(.{ .width_px = 9, .height_px = 18 });
+    defer {
+        terminal_image.resetCapabilitiesCache();
+        terminal_image.setCellDimensions(.{ .width_px = 9, .height_px = 18 });
+    }
+
+    var virtual_terminal = VirtualTerminal.init(allocator, 80, 24);
+    defer virtual_terminal.deinit();
+    var tui = TUI.init(allocator, virtual_terminal.asTerminal());
+    defer tui.deinit();
+    var recorder = FocusableInputComponent{ .allocator = allocator, .lines = &.{""} };
+    defer recorder.deinit();
+    tui.setFocus(Component.from(FocusableInputComponent, &recorder));
+
+    try tui.start();
+    defer tui.stop() catch {};
+
+    virtual_terminal.sendInput("\x1b[6;20;10t");
+    try std.testing.expectEqualStrings("", recorder.inputs.items);
+    try std.testing.expectEqual(terminal_image.CellDimensions{ .width_px = 10, .height_px = 20 }, terminal_image.getCellDimensions());
+
+    virtual_terminal.sendInput("q");
+    try std.testing.expectEqualStrings("q", recorder.inputs.items);
+}
+
+test "TUI overlay compositing does not leak italic styles" {
+    const allocator = std.testing.allocator;
+    const base_line = "\x1b[3mXXXXXXXXXXXXXXXXXXXX\x1b[23m";
+
+    var virtual_terminal = VirtualTerminal.init(allocator, 20, 6);
+    defer virtual_terminal.deinit();
+    var tui = TUI.init(allocator, virtual_terminal.asTerminal());
+    defer tui.deinit();
+    var content = TestLinesComponent{ .lines = &.{ base_line, "INPUT" } };
+    try tui.addChild(Component.from(TestLinesComponent, &content));
+
+    try tui.start();
+    defer tui.stop() catch {};
+    try std.testing.expect(!virtual_terminal.getCellItalic(1, 0));
+
+    var overlay = TestLinesComponent{ .lines = &.{"OVR"} };
+    _ = try tui.showOverlay(Component.from(TestLinesComponent, &overlay), .{ .row = .{ .cells = 0 }, .col = .{ .cells = 5 }, .width = .{ .cells = 3 } });
+    try tui.requestRender(true);
     try std.testing.expect(!virtual_terminal.getCellItalic(1, 0));
 }
 
@@ -5092,7 +5168,7 @@ test "TUI overlays render over short content and honor percentage width" {
     try std.testing.expect(containsLineWith(viewport, "OVERLAY_MID"));
 }
 
-test "TUI overlay anchors position top-left and bottom-right content" {
+test "TUI overlay anchors position top-left, top-center, and bottom-right content" {
     const allocator = std.testing.allocator;
     var virtual_terminal = VirtualTerminal.init(allocator, 80, 24);
     defer virtual_terminal.deinit();
@@ -5100,9 +5176,11 @@ test "TUI overlay anchors position top-left and bottom-right content" {
     defer tui.deinit();
     var content = TestLinesComponent{};
     var top_left = TestLinesComponent{ .lines = &.{"TOP-LEFT"} };
+    var top_center = TestLinesComponent{ .lines = &.{"CENTERED"} };
     var bottom_right = TestLinesComponent{ .lines = &.{"BTM-RIGHT"} };
     try tui.addChild(Component.from(TestLinesComponent, &content));
     _ = try tui.showOverlay(Component.from(TestLinesComponent, &top_left), .{ .anchor = .top_left, .width = .{ .cells = 10 } });
+    _ = try tui.showOverlay(Component.from(TestLinesComponent, &top_center), .{ .anchor = .top_center, .width = .{ .cells = 10 }, .non_capturing = true });
     _ = try tui.showOverlay(Component.from(TestLinesComponent, &bottom_right), .{ .anchor = .bottom_right, .width = .{ .cells = 10 }, .non_capturing = true });
 
     try tui.start();
@@ -5111,8 +5189,133 @@ test "TUI overlay anchors position top-left and bottom-right content" {
     const viewport = try virtual_terminal.getViewport(allocator);
     defer freeOwnedLines(allocator, viewport);
     try std.testing.expect(std.mem.startsWith(u8, viewport[0], "TOP-LEFT"));
+    const centered_col = std.mem.indexOf(u8, viewport[0], "CENTERED") orelse std.math.maxInt(usize);
+    try std.testing.expect(centered_col >= 30 and centered_col <= 40);
     try std.testing.expect(std.mem.indexOf(u8, viewport[23], "BTM-RIGHT") != null);
     try std.testing.expect(std.mem.endsWith(u8, std.mem.trimEnd(u8, viewport[23], " "), "BTM-RIGHT"));
+}
+
+test "TUI overlay layout respects margins, offsets, absolute and percentage positions" {
+    const allocator = std.testing.allocator;
+    var virtual_terminal = VirtualTerminal.init(allocator, 80, 24);
+    defer virtual_terminal.deinit();
+    var tui = TUI.init(allocator, virtual_terminal.asTerminal());
+    defer tui.deinit();
+    var content = TestLinesComponent{};
+    var margin = TestLinesComponent{ .lines = &.{"MARGIN"} };
+    var offset = TestLinesComponent{ .lines = &.{"OFFSET"} };
+    var pct = TestLinesComponent{ .lines = &.{"PCT"} };
+    var absolute = TestLinesComponent{ .lines = &.{"ABSOLUTE"} };
+    try tui.addChild(Component.from(TestLinesComponent, &content));
+    _ = try tui.showOverlay(Component.from(TestLinesComponent, &margin), .{
+        .anchor = .top_left,
+        .width = .{ .cells = 10 },
+        .margin = .{ .top = 2, .left = 3 },
+        .non_capturing = true,
+    });
+    _ = try tui.showOverlay(Component.from(TestLinesComponent, &offset), .{
+        .anchor = .top_left,
+        .width = .{ .cells = 10 },
+        .offset_x = 10,
+        .offset_y = 5,
+        .non_capturing = true,
+    });
+    _ = try tui.showOverlay(Component.from(TestLinesComponent, &pct), .{
+        .width = .{ .cells = 10 },
+        .row = .{ .percent = 50.0 },
+        .col = .{ .percent = 50.0 },
+        .non_capturing = true,
+    });
+    _ = try tui.showOverlay(Component.from(TestLinesComponent, &absolute), .{
+        .anchor = .bottom_right,
+        .row = .{ .cells = 3 },
+        .col = .{ .cells = 5 },
+        .width = .{ .cells = 10 },
+        .non_capturing = true,
+    });
+
+    try tui.start();
+    defer tui.stop() catch {};
+
+    const viewport = try virtual_terminal.getViewport(allocator);
+    defer freeOwnedLines(allocator, viewport);
+    try std.testing.expectEqual(@as(usize, 3), std.mem.indexOf(u8, viewport[2], "MARGIN").?);
+    try std.testing.expectEqual(@as(usize, 10), std.mem.indexOf(u8, viewport[5], "OFFSET").?);
+    const pct_row = findLineWith(viewport, "PCT") orelse std.math.maxInt(usize);
+    try std.testing.expect(pct_row >= 10 and pct_row <= 13);
+    try std.testing.expectEqual(@as(usize, 5), std.mem.indexOf(u8, viewport[3], "ABSOLUTE").?);
+}
+
+test "TUI overlay maxHeight truncates cell and percentage sized overlays" {
+    const allocator = std.testing.allocator;
+
+    {
+        var virtual_terminal = VirtualTerminal.init(allocator, 80, 24);
+        defer virtual_terminal.deinit();
+        var tui = TUI.init(allocator, virtual_terminal.asTerminal());
+        defer tui.deinit();
+        var content = TestLinesComponent{};
+        var overlay = TestLinesComponent{ .lines = &.{ "Line 1", "Line 2", "Line 3", "Line 4", "Line 5" } };
+        try tui.addChild(Component.from(TestLinesComponent, &content));
+        _ = try tui.showOverlay(Component.from(TestLinesComponent, &overlay), .{ .max_height = .{ .cells = 3 } });
+
+        try tui.start();
+        defer tui.stop() catch {};
+
+        const viewport = try virtual_terminal.getViewport(allocator);
+        defer freeOwnedLines(allocator, viewport);
+        try std.testing.expect(containsLineWith(viewport, "Line 1"));
+        try std.testing.expect(containsLineWith(viewport, "Line 3"));
+        try std.testing.expect(!containsLineWith(viewport, "Line 4"));
+    }
+
+    {
+        var virtual_terminal = VirtualTerminal.init(allocator, 80, 10);
+        defer virtual_terminal.deinit();
+        var tui = TUI.init(allocator, virtual_terminal.asTerminal());
+        defer tui.deinit();
+        var content = TestLinesComponent{};
+        var overlay = TestLinesComponent{ .lines = &.{ "L1", "L2", "L3", "L4", "L5", "L6", "L7", "L8", "L9", "L10" } };
+        try tui.addChild(Component.from(TestLinesComponent, &content));
+        _ = try tui.showOverlay(Component.from(TestLinesComponent, &overlay), .{ .max_height = .{ .percent = 50.0 } });
+
+        try tui.start();
+        defer tui.stop() catch {};
+
+        const viewport = try virtual_terminal.getViewport(allocator);
+        defer freeOwnedLines(allocator, viewport);
+        try std.testing.expect(containsLineWith(viewport, "L1"));
+        try std.testing.expect(containsLineWith(viewport, "L5"));
+        try std.testing.expect(!containsLineWith(viewport, "L6"));
+    }
+}
+
+test "TUI stacked overlays render later focused overlays on top and reveal previous overlays" {
+    const allocator = std.testing.allocator;
+    var virtual_terminal = VirtualTerminal.init(allocator, 80, 24);
+    defer virtual_terminal.deinit();
+    var tui = TUI.init(allocator, virtual_terminal.asTerminal());
+    defer tui.deinit();
+    var content = TestLinesComponent{};
+    var first = TestLinesComponent{ .lines = &.{"FIRST-OVERLAY"} };
+    var second = TestLinesComponent{ .lines = &.{"SECOND"} };
+    try tui.addChild(Component.from(TestLinesComponent, &content));
+    _ = try tui.showOverlay(Component.from(TestLinesComponent, &first), .{ .anchor = .top_left, .width = .{ .cells = 20 } });
+    _ = try tui.showOverlay(Component.from(TestLinesComponent, &second), .{ .anchor = .top_left, .width = .{ .cells = 10 } });
+
+    try tui.start();
+    defer tui.stop() catch {};
+
+    const viewport = try virtual_terminal.getViewport(allocator);
+    defer freeOwnedLines(allocator, viewport);
+    try std.testing.expect(std.mem.indexOf(u8, viewport[0], "SECOND") != null);
+
+    tui.hideOverlay();
+    try tui.requestRender(true);
+
+    const next_viewport = try virtual_terminal.getViewport(allocator);
+    defer freeOwnedLines(allocator, next_viewport);
+    try std.testing.expect(std.mem.indexOf(u8, next_viewport[0], "FIRST") != null);
 }
 
 test "TUI non-capturing overlays preserve focus and explicit focus can receive input" {
