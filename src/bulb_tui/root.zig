@@ -12,6 +12,7 @@ pub const terminal_image = @import("terminal_image.zig");
 pub const native_modifiers = @import("native_modifiers.zig");
 pub const terminal = @import("terminal.zig");
 pub const input_component = @import("input.zig");
+pub const editor_component = @import("editor.zig");
 
 pub const Terminal = terminal.Terminal;
 pub const ProcessTerminal = terminal.ProcessTerminal;
@@ -19,6 +20,8 @@ pub const KeyboardProtocolNegotiationSequence = terminal.KeyboardProtocolNegotia
 pub const parseKeyboardProtocolNegotiationSequence = terminal.parseKeyboardProtocolNegotiationSequence;
 pub const normalizeAppleTerminalInput = terminal.normalizeAppleTerminalInput;
 pub const Input = input_component.Input;
+pub const Editor = editor_component.Editor;
+pub const EditorComponent = editor_component.EditorComponent;
 
 const ESC: u8 = 0x1b;
 const BEL: u8 = 0x07;
@@ -9413,4 +9416,5 @@ test {
     _ = @import("terminal_image.zig");
     _ = @import("native_modifiers.zig");
     _ = @import("input.zig");
+    _ = @import("editor.zig");
 }
