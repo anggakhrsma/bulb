@@ -425,6 +425,14 @@ pub const Editor = struct {
             self.moveCursorHorizontal(-1);
             return;
         }
+        if (kb.matches(data, "tui.editor.pageUp")) {
+            self.pageScroll(-1);
+            return;
+        }
+        if (kb.matches(data, "tui.editor.pageDown")) {
+            self.pageScroll(1);
+            return;
+        }
 
         if (keys.matchesKey(data, "shift+space")) {
             try self.insertCharacter(" ", false);
@@ -1062,7 +1070,11 @@ pub const Editor = struct {
                 self.cursor_line += 1;
                 self.setCursorCol(0);
             } else {
-                self.preferred_visual_col = self.cursor_col;
+                const visual_lines = self.buildVisualLineMap(self.allocator, self.last_width) catch return;
+                defer self.allocator.free(visual_lines);
+                const current = self.findCurrentVisualLine(visual_lines);
+                const current_vl = visual_lines[current];
+                self.preferred_visual_col = self.cursor_col -| current_vl.start_col;
             }
         } else {
             if (self.cursor_col > 0) {
@@ -1084,12 +1096,69 @@ pub const Editor = struct {
         if (direction < 0 and current == 0) return;
         if (direction > 0 and current + 1 >= visual_lines.len) return;
         const target_index = if (direction < 0) current - 1 else current + 1;
+        self.moveToVisualLine(visual_lines, current, target_index);
+    }
+
+    fn pageScroll(self: *Editor, direction: i32) void {
+        self.last_action = null;
+        const visual_lines = self.buildVisualLineMap(self.allocator, self.last_width) catch return;
+        defer self.allocator.free(visual_lines);
+        if (visual_lines.len == 0) return;
+
+        const current = self.findCurrentVisualLine(visual_lines);
+        const page_size = @max(@as(usize, 5), self.terminal_rows * 3 / 10);
+        const target_index = if (direction < 0)
+            current -| page_size
+        else
+            @min(visual_lines.len - 1, current + page_size);
+        self.moveToVisualLine(visual_lines, current, target_index);
+    }
+
+    fn moveToVisualLine(self: *Editor, visual_lines: []const VisualLine, current: usize, target_index: usize) void {
+        if (current >= visual_lines.len or target_index >= visual_lines.len) return;
         const current_vl = visual_lines[current];
         const target_vl = visual_lines[target_index];
         const current_visual_col = self.cursor_col -| current_vl.start_col;
-        const target_col = target_vl.start_col + @min(current_visual_col, target_vl.length);
+
+        const source_is_last_segment = current + 1 >= visual_lines.len or visual_lines[current + 1].logical_line != current_vl.logical_line;
+        const source_max_visual_col = if (source_is_last_segment) current_vl.length else current_vl.length -| 1;
+        const target_is_last_segment = target_index + 1 >= visual_lines.len or visual_lines[target_index + 1].logical_line != target_vl.logical_line;
+        const target_max_visual_col = if (target_is_last_segment) target_vl.length else target_vl.length -| 1;
+        const move_to_visual_col = self.computeVerticalMoveColumn(current_visual_col, source_max_visual_col, target_max_visual_col);
+        const target_col = target_vl.start_col + move_to_visual_col;
+
         self.cursor_line = target_vl.logical_line;
-        self.setCursorCol(target_col);
+        const target_line = self.currentLine();
+        self.cursor_col = clampToUtf8Boundary(target_line, @min(target_col, target_line.len));
+    }
+
+    fn computeVerticalMoveColumn(
+        self: *Editor,
+        current_visual_col: usize,
+        source_max_visual_col: usize,
+        target_max_visual_col: usize,
+    ) usize {
+        const preferred = self.preferred_visual_col;
+        const cursor_in_middle = current_visual_col < source_max_visual_col;
+        const target_too_short = target_max_visual_col < current_visual_col;
+
+        if (preferred == null or cursor_in_middle) {
+            if (target_too_short) {
+                self.preferred_visual_col = current_visual_col;
+                return target_max_visual_col;
+            }
+            self.preferred_visual_col = null;
+            return current_visual_col;
+        }
+
+        const preferred_col = preferred.?;
+        const target_cant_fit_preferred = target_max_visual_col < preferred_col;
+        if (target_too_short or target_cant_fit_preferred) {
+            return target_max_visual_col;
+        }
+
+        self.preferred_visual_col = null;
+        return preferred_col;
     }
 
     fn setCursorCol(self: *Editor, col: usize) void {
@@ -1807,6 +1876,18 @@ fn expectText(editor: *const Editor, expected: []const u8) !void {
     try std.testing.expectEqualStrings(expected, actual);
 }
 
+fn positionCursor(editor: *Editor, line: usize, col: usize) !void {
+    var reset: usize = 0;
+    while (reset < 20) : (reset += 1) try editor.handleInput("\x1b[A");
+
+    var line_index: usize = 0;
+    while (line_index < line) : (line_index += 1) try editor.handleInput("\x1b[B");
+
+    try editor.handleInput("\x01");
+    var col_index: usize = 0;
+    while (col_index < col) : (col_index += 1) try editor.handleInput("\x1b[C");
+}
+
 fn expectChunks(chunks: []const TextChunk, expected: []const []const u8) !void {
     try std.testing.expectEqual(expected.len, chunks.len);
     for (expected, 0..) |text, index| {
@@ -2299,5 +2380,349 @@ test "Editor character jump Ctrl bracket" {
         try expectText(&editor, "xhellYo world");
         try editor.handleInput("\x1b[45;5u");
         try expectText(&editor, "xhello world");
+    }
+}
+
+test "Editor sticky column" {
+    const allocator = std.testing.allocator;
+    defer keybindings.resetGlobalKeybindings(allocator);
+
+    {
+        var editor = try Editor.init(allocator, .{});
+        defer editor.deinit();
+        try editor.setText("2222222222x222\n\n1111111111_111111111111");
+        try std.testing.expectEqual(Cursor{ .line = 2, .col = 23 }, editor.getCursor());
+        try editor.handleInput("\x01");
+        var index: usize = 0;
+        while (index < 10) : (index += 1) try editor.handleInput("\x1b[C");
+        try std.testing.expectEqual(Cursor{ .line = 2, .col = 10 }, editor.getCursor());
+        try editor.handleInput("\x1b[A");
+        try std.testing.expectEqual(Cursor{ .line = 1, .col = 0 }, editor.getCursor());
+        try editor.handleInput("\x1b[A");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = 10 }, editor.getCursor());
+    }
+    {
+        var editor = try Editor.init(allocator, .{});
+        defer editor.deinit();
+        try editor.setText("1111111111_111\n\n2222222222x222222222222");
+        try editor.handleInput("\x1b[A");
+        try editor.handleInput("\x1b[A");
+        try editor.handleInput("\x01");
+        var index: usize = 0;
+        while (index < 10) : (index += 1) try editor.handleInput("\x1b[C");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = 10 }, editor.getCursor());
+        try editor.handleInput("\x1b[B");
+        try std.testing.expectEqual(Cursor{ .line = 1, .col = 0 }, editor.getCursor());
+        try editor.handleInput("\x1b[B");
+        try std.testing.expectEqual(Cursor{ .line = 2, .col = 10 }, editor.getCursor());
+    }
+    {
+        var editor = try Editor.init(allocator, .{});
+        defer editor.deinit();
+        try editor.setText("1234567890\n\n1234567890");
+        try editor.handleInput("\x01");
+        var index: usize = 0;
+        while (index < 5) : (index += 1) try editor.handleInput("\x1b[C");
+        try std.testing.expectEqual(Cursor{ .line = 2, .col = 5 }, editor.getCursor());
+        try editor.handleInput("\x1b[A");
+        try editor.handleInput("\x1b[A");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = 5 }, editor.getCursor());
+        try editor.handleInput("\x1b[D");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = 4 }, editor.getCursor());
+        try editor.handleInput("\x1b[B");
+        try editor.handleInput("\x1b[B");
+        try std.testing.expectEqual(Cursor{ .line = 2, .col = 4 }, editor.getCursor());
+    }
+    {
+        var editor = try Editor.init(allocator, .{});
+        defer editor.deinit();
+        try editor.setText("1234567890\n\n1234567890");
+        try editor.handleInput("\x1b[A");
+        try editor.handleInput("\x1b[A");
+        try editor.handleInput("\x01");
+        var index: usize = 0;
+        while (index < 5) : (index += 1) try editor.handleInput("\x1b[C");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = 5 }, editor.getCursor());
+        try editor.handleInput("\x1b[B");
+        try editor.handleInput("\x1b[B");
+        try std.testing.expectEqual(Cursor{ .line = 2, .col = 5 }, editor.getCursor());
+        try editor.handleInput("\x1b[C");
+        try std.testing.expectEqual(Cursor{ .line = 2, .col = 6 }, editor.getCursor());
+        try editor.handleInput("\x1b[A");
+        try editor.handleInput("\x1b[A");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = 6 }, editor.getCursor());
+    }
+    {
+        var editor = try Editor.init(allocator, .{});
+        defer editor.deinit();
+        try editor.setText("1234567890\n\n1234567890");
+        try editor.handleInput("\x01");
+        var index: usize = 0;
+        while (index < 8) : (index += 1) try editor.handleInput("\x1b[C");
+        try editor.handleInput("\x1b[A");
+        try editor.handleInput("\x1b[A");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = 8 }, editor.getCursor());
+        try editor.handleInput("X");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = 9 }, editor.getCursor());
+        try editor.handleInput("\x1b[B");
+        try editor.handleInput("\x1b[B");
+        try std.testing.expectEqual(Cursor{ .line = 2, .col = 9 }, editor.getCursor());
+    }
+    {
+        var editor = try Editor.init(allocator, .{});
+        defer editor.deinit();
+        try editor.setText("1234567890\n\n1234567890");
+        try editor.handleInput("\x01");
+        var index: usize = 0;
+        while (index < 8) : (index += 1) try editor.handleInput("\x1b[C");
+        try editor.handleInput("\x1b[A");
+        try editor.handleInput("\x1b[A");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = 8 }, editor.getCursor());
+        try editor.handleInput("\x7f");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = 7 }, editor.getCursor());
+        try editor.handleInput("\x1b[B");
+        try editor.handleInput("\x1b[B");
+        try std.testing.expectEqual(Cursor{ .line = 2, .col = 7 }, editor.getCursor());
+    }
+    {
+        var editor = try Editor.init(allocator, .{});
+        defer editor.deinit();
+        try editor.setText("1234567890\n\n1234567890");
+        try editor.handleInput("\x01");
+        var index: usize = 0;
+        while (index < 8) : (index += 1) try editor.handleInput("\x1b[C");
+        try editor.handleInput("\x1b[A");
+        try editor.handleInput("\x01");
+        try std.testing.expectEqual(Cursor{ .line = 1, .col = 0 }, editor.getCursor());
+        try editor.handleInput("\x1b[A");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = 0 }, editor.getCursor());
+    }
+    {
+        var editor = try Editor.init(allocator, .{});
+        defer editor.deinit();
+        try editor.setText("12345\n\n1234567890");
+        try editor.handleInput("\x01");
+        var index: usize = 0;
+        while (index < 3) : (index += 1) try editor.handleInput("\x1b[C");
+        try editor.handleInput("\x1b[A");
+        try editor.handleInput("\x1b[A");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = 3 }, editor.getCursor());
+        try editor.handleInput("\x05");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = 5 }, editor.getCursor());
+        try editor.handleInput("\x1b[B");
+        try editor.handleInput("\x1b[B");
+        try std.testing.expectEqual(Cursor{ .line = 2, .col = 5 }, editor.getCursor());
+    }
+    {
+        var editor = try Editor.init(allocator, .{});
+        defer editor.deinit();
+        try editor.setText("hello world\n\nhello world");
+        try std.testing.expectEqual(Cursor{ .line = 2, .col = 11 }, editor.getCursor());
+        try editor.handleInput("\x1b[A");
+        try editor.handleInput("\x1b[A");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = 11 }, editor.getCursor());
+        try editor.handleInput("\x1b[1;5D");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = 6 }, editor.getCursor());
+        try editor.handleInput("\x1b[B");
+        try editor.handleInput("\x1b[B");
+        try std.testing.expectEqual(Cursor{ .line = 2, .col = 6 }, editor.getCursor());
+    }
+    {
+        var editor = try Editor.init(allocator, .{});
+        defer editor.deinit();
+        try editor.setText("hello world\n\nhello world");
+        try editor.handleInput("\x1b[A");
+        try editor.handleInput("\x1b[A");
+        try editor.handleInput("\x01");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = 0 }, editor.getCursor());
+        try editor.handleInput("\x1b[B");
+        try editor.handleInput("\x1b[B");
+        try std.testing.expectEqual(Cursor{ .line = 2, .col = 0 }, editor.getCursor());
+        try editor.handleInput("\x1b[1;5C");
+        try std.testing.expectEqual(Cursor{ .line = 2, .col = 5 }, editor.getCursor());
+        try editor.handleInput("\x1b[A");
+        try editor.handleInput("\x1b[A");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = 5 }, editor.getCursor());
+    }
+    {
+        var editor = try Editor.init(allocator, .{});
+        defer editor.deinit();
+        try editor.setText("1234567890\n\n1234567890");
+        try editor.handleInput("\x1b[A");
+        try editor.handleInput("\x1b[A");
+        try editor.handleInput("\x01");
+        var index: usize = 0;
+        while (index < 8) : (index += 1) try editor.handleInput("\x1b[C");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = 8 }, editor.getCursor());
+        try editor.handleInput("\x1b[B");
+        try editor.handleInput("\x1b[B");
+        try std.testing.expectEqual(Cursor{ .line = 2, .col = 8 }, editor.getCursor());
+        try editor.handleInput("X");
+        try expectText(&editor, "1234567890\n\n12345678X90");
+        try std.testing.expectEqual(Cursor{ .line = 2, .col = 9 }, editor.getCursor());
+        try editor.handleInput("\x1b[A");
+        try editor.handleInput("\x1b[A");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = 9 }, editor.getCursor());
+        try editor.handleInput("\x1b[45;5u");
+        try expectText(&editor, "1234567890\n\n1234567890");
+        try std.testing.expectEqual(Cursor{ .line = 2, .col = 8 }, editor.getCursor());
+        try editor.handleInput("\x1b[A");
+        try editor.handleInput("\x1b[A");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = 8 }, editor.getCursor());
+    }
+    {
+        var editor = try Editor.init(allocator, .{});
+        defer editor.deinit();
+        try editor.setText("1234567890\nab\ncd\nef\n1234567890");
+        try editor.handleInput("\x01");
+        var index: usize = 0;
+        while (index < 7) : (index += 1) try editor.handleInput("\x1b[C");
+        try std.testing.expectEqual(Cursor{ .line = 4, .col = 7 }, editor.getCursor());
+        try editor.handleInput("\x1b[A");
+        try editor.handleInput("\x1b[A");
+        try editor.handleInput("\x1b[A");
+        try editor.handleInput("\x1b[A");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = 7 }, editor.getCursor());
+        try editor.handleInput("\x1b[B");
+        try editor.handleInput("\x1b[B");
+        try editor.handleInput("\x1b[B");
+        try editor.handleInput("\x1b[B");
+        try std.testing.expectEqual(Cursor{ .line = 4, .col = 7 }, editor.getCursor());
+    }
+    {
+        var editor = try Editor.init(allocator, .{ .terminal_rows = 24 });
+        defer editor.deinit();
+        try editor.setText("short\n123456789012345678901234567890");
+        const rendered = try editor.render(allocator, 15);
+        defer allocator.free(rendered);
+        defer freeRenderedLines(allocator, rendered);
+        try std.testing.expectEqual(Cursor{ .line = 1, .col = 30 }, editor.getCursor());
+        try editor.handleInput("\x1b[A");
+        try std.testing.expectEqual(@as(usize, 1), editor.getCursor().line);
+        try editor.handleInput("\x1b[A");
+        try std.testing.expectEqual(@as(usize, 1), editor.getCursor().line);
+        try editor.handleInput("\x1b[A");
+        try std.testing.expectEqual(@as(usize, 0), editor.getCursor().line);
+    }
+    {
+        var editor = try Editor.init(allocator, .{});
+        defer editor.deinit();
+        try editor.setText("1234567890\n\n1234567890");
+        try editor.handleInput("\x01");
+        var index: usize = 0;
+        while (index < 8) : (index += 1) try editor.handleInput("\x1b[C");
+        try editor.handleInput("\x1b[A");
+        try editor.setText("abcdefghij\n\nabcdefghij");
+        try std.testing.expectEqual(Cursor{ .line = 2, .col = 10 }, editor.getCursor());
+        try editor.handleInput("\x1b[A");
+        try editor.handleInput("\x1b[A");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = 10 }, editor.getCursor());
+    }
+    {
+        var editor = try Editor.init(allocator, .{});
+        defer editor.deinit();
+        try editor.setText("111111111x1111111111\n\n333333333_");
+        try editor.handleInput("\x1b[A");
+        try editor.handleInput("\x1b[A");
+        try editor.handleInput("\x05");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = 20 }, editor.getCursor());
+        try editor.handleInput("\x1b[B");
+        try editor.handleInput("\x1b[B");
+        try std.testing.expectEqual(Cursor{ .line = 2, .col = 10 }, editor.getCursor());
+        try editor.handleInput("\x1b[C");
+        try std.testing.expectEqual(Cursor{ .line = 2, .col = 10 }, editor.getCursor());
+        try editor.handleInput("\x1b[A");
+        try editor.handleInput("\x1b[A");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = 10 }, editor.getCursor());
+    }
+    {
+        var editor = try Editor.init(allocator, .{ .terminal_rows = 24 });
+        defer editor.deinit();
+        try editor.setText("12345678901234567890\n\n12345678901234567890");
+        try editor.handleInput("\x01");
+        var index: usize = 0;
+        while (index < 15) : (index += 1) try editor.handleInput("\x1b[C");
+        try editor.handleInput("\x1b[A");
+        try editor.handleInput("\x1b[A");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = 15 }, editor.getCursor());
+        const rendered = try editor.render(allocator, 12);
+        defer allocator.free(rendered);
+        defer freeRenderedLines(allocator, rendered);
+        try editor.handleInput("\x1b[B");
+        try editor.handleInput("\x1b[B");
+        try std.testing.expectEqual(@as(usize, 4), editor.getCursor().col);
+    }
+    {
+        var editor = try Editor.init(allocator, .{ .terminal_rows = 24 });
+        defer editor.deinit();
+        try editor.setText("short\n12345678901234567890");
+        try editor.handleInput("\x01");
+        var index: usize = 0;
+        while (index < 15) : (index += 1) try editor.handleInput("\x1b[C");
+        try std.testing.expectEqual(Cursor{ .line = 1, .col = 15 }, editor.getCursor());
+        try editor.handleInput("\x1b[A");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = 5 }, editor.getCursor());
+        {
+            const rendered = try editor.render(allocator, 10);
+            defer allocator.free(rendered);
+            defer freeRenderedLines(allocator, rendered);
+        }
+        try editor.handleInput("\x1b[B");
+        try std.testing.expectEqual(Cursor{ .line = 1, .col = 8 }, editor.getCursor());
+        try editor.handleInput("\x1b[A");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = 5 }, editor.getCursor());
+        {
+            const rendered = try editor.render(allocator, 80);
+            defer allocator.free(rendered);
+            defer freeRenderedLines(allocator, rendered);
+        }
+        try editor.handleInput("\x1b[B");
+        try std.testing.expectEqual(Cursor{ .line = 1, .col = 15 }, editor.getCursor());
+    }
+    {
+        var editor = try Editor.init(allocator, .{ .terminal_rows = 24 });
+        defer editor.deinit();
+        try editor.setText("abcdefghijklmnopqr\n123456789012345678");
+        try positionCursor(&editor, 0, 18);
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = 18 }, editor.getCursor());
+        {
+            const rendered = try editor.render(allocator, 10);
+            defer allocator.free(rendered);
+            defer freeRenderedLines(allocator, rendered);
+        }
+        try editor.handleInput("\x1b[B");
+        try std.testing.expectEqual(Cursor{ .line = 1, .col = 8 }, editor.getCursor());
+        {
+            const rendered = try editor.render(allocator, 80);
+            defer allocator.free(rendered);
+            defer freeRenderedLines(allocator, rendered);
+        }
+        try editor.handleInput("\x1b[A");
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = 8 }, editor.getCursor());
+        try editor.handleInput("\x1b[B");
+        try std.testing.expectEqual(Cursor{ .line = 1, .col = 8 }, editor.getCursor());
+    }
+    {
+        var editor = try Editor.init(allocator, .{ .terminal_rows = 24 });
+        defer editor.deinit();
+        try editor.setText("abcdefghijklmnopqr\n123456789012345678\nab");
+        try positionCursor(&editor, 0, 18);
+        try std.testing.expectEqual(Cursor{ .line = 0, .col = 18 }, editor.getCursor());
+        {
+            const rendered = try editor.render(allocator, 10);
+            defer allocator.free(rendered);
+            defer freeRenderedLines(allocator, rendered);
+        }
+        try editor.handleInput("\x1b[B");
+        try std.testing.expectEqual(Cursor{ .line = 1, .col = 8 }, editor.getCursor());
+        {
+            const rendered = try editor.render(allocator, 80);
+            defer allocator.free(rendered);
+            defer freeRenderedLines(allocator, rendered);
+        }
+        try editor.handleInput("\x1b[B");
+        try std.testing.expectEqual(Cursor{ .line = 2, .col = 2 }, editor.getCursor());
+        try editor.handleInput("\x1b[A");
+        try std.testing.expectEqual(Cursor{ .line = 1, .col = 8 }, editor.getCursor());
     }
 }
