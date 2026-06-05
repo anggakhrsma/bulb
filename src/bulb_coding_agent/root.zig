@@ -25,6 +25,7 @@ pub const oauth_selector = @import("oauth_selector.zig");
 pub const output_guard = @import("output_guard.zig");
 pub const paths = @import("paths.zig");
 pub const path_utils = @import("path_utils.zig");
+pub const plan_mode_utils = @import("plan_mode_utils.zig");
 pub const provider_display_names = @import("provider_display_names.zig");
 pub const prompt_templates = @import("prompt_templates.zig");
 pub const shell = @import("shell.zig");
@@ -62,6 +63,7 @@ test {
     _ = @import("output_guard.zig");
     _ = @import("paths.zig");
     _ = @import("path_utils.zig");
+    _ = @import("plan_mode_utils.zig");
     _ = @import("provider_display_names.zig");
     _ = @import("prompt_templates.zig");
     _ = @import("shell.zig");

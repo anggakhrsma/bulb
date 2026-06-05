@@ -331,7 +331,7 @@ packages/coding-agent/examples/extensions/permission-gate.ts	bulb_coding_agent	e
 packages/coding-agent/examples/extensions/pirate.ts	bulb_coding_agent	example	pending		
 packages/coding-agent/examples/extensions/plan-mode/README.md	bulb_coding_agent	example	pending		
 packages/coding-agent/examples/extensions/plan-mode/index.ts	bulb_coding_agent	example	pending		
-packages/coding-agent/examples/extensions/plan-mode/utils.ts	bulb_coding_agent	example	pending		
+packages/coding-agent/examples/extensions/plan-mode/utils.ts	bulb_coding_agent	example	implemented	src/bulb_coding_agent/plan_mode_utils.zig	Plan-mode command safety, todo extraction/cleanup, DONE marker parsing, and completion marking ported as a native utility; full Zig example extension packaging remains
 packages/coding-agent/examples/extensions/preset.ts	bulb_coding_agent	example	pending		
 packages/coding-agent/examples/extensions/prompt-customizer.ts	bulb_coding_agent	example	pending		
 packages/coding-agent/examples/extensions/protected-paths.ts	bulb_coding_agent	example	pending		
@@ -641,7 +641,7 @@ packages/coding-agent/test/package-manager.test.ts	bulb_coding_agent	test	pendin
 packages/coding-agent/test/path-utils.test.ts	bulb_coding_agent	test	implemented	src/bulb_coding_agent/path_utils.zig	Upstream expandPath, resolveToCwd, existing-file, Unicode accent, curly quote, French screenshot, and AM/PM screenshot path regressions ported
 packages/coding-agent/test/paths.test.ts	bulb_coding_agent	test	implemented	src/bulb_coding_agent/paths.zig	Upstream canonicalizePath, symlink, missing/dangling fallback, cwd-relative traversal, tilde, file URL, percent literal, and isLocalPath regressions ported
 packages/coding-agent/test/pi-user-agent.test.ts	bulb_coding_agent	test	implemented	src/bulb_coding_agent/user_agent.zig	Upstream user-agent formatting test translated to Bulb product name and Zig-native runtime string
-packages/coding-agent/test/plan-mode-utils.test.ts	bulb_coding_agent	test	pending		
+packages/coding-agent/test/plan-mode-utils.test.ts	bulb_coding_agent	test	implemented	src/bulb_coding_agent/plan_mode_utils.zig	Upstream safe/destructive command, cleanStepText, todo extraction, DONE marker, and completion marking regressions ported
 packages/coding-agent/test/print-mode.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/prompt-templates.test.ts	bulb_coding_agent	test	implemented	src/bulb_coding_agent/prompt_templates.zig	Upstream positional, wildcard, non-recursive, slice, quote, whitespace, Unicode, multiline expansion, and argument-hint frontmatter regressions ported
 packages/coding-agent/test/resource-loader.test.ts	bulb_coding_agent	test	pending		
