@@ -495,8 +495,23 @@ pub const SessionManager = struct {
         branch_from_id: ?[]const u8,
         summary: []const u8,
     ) ![]const u8 {
+        return self.branchWithSummaryJson(io, branch_from_id, summary, null, null);
+    }
+
+    pub fn branchWithSummaryJson(
+        self: *SessionManager,
+        io: std.Io,
+        branch_from_id: ?[]const u8,
+        summary: []const u8,
+        details_json: ?[]const u8,
+        from_hook: ?bool,
+    ) ![]const u8 {
         if (branch_from_id) |id| {
             if (self.getEntry(id) == null) return error.EntryNotFound;
+        }
+        if (details_json) |details| {
+            var parsed = try std.json.parseFromSlice(std.json.Value, self.arena.child_allocator, details, .{});
+            defer parsed.deinit();
         }
         self.leaf_id = branch_from_id;
 
@@ -515,6 +530,8 @@ pub const SessionManager = struct {
             timestamp,
             branch_from_id orelse "root",
             summary,
+            details_json,
+            from_hook,
         );
         errdefer arena_allocator.free(raw_json);
         const grown = try arena_allocator.alloc(FileEntry, self.file_entries.len + 1);
@@ -2982,6 +2999,8 @@ fn branchSummaryEntryJsonAlloc(
     timestamp: []const u8,
     from_id: []const u8,
     summary: []const u8,
+    details_json: ?[]const u8,
+    from_hook: ?bool,
 ) ![]u8 {
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
@@ -3003,6 +3022,16 @@ fn branchSummaryEntryJsonAlloc(
     try json.write(from_id);
     try json.objectField("summary");
     try json.write(summary);
+    if (details_json) |details| {
+        try json.objectField("details");
+        try json.beginWriteRaw();
+        try output.writer.writeAll(details);
+        json.endWriteRaw();
+    }
+    if (from_hook) |value| {
+        try json.objectField("fromHook");
+        try json.write(value);
+    }
     try json.endObject();
     return output.toOwnedSlice();
 }
@@ -3762,6 +3791,8 @@ fn testBranchSummaryEntryAlloc(
         "2025-01-01T00:00:00Z",
         from_id,
         summary,
+        null,
+        null,
     );
     return .{ .raw_json = raw_json, .entry_type = "branch_summary", .id = id };
 }
@@ -3918,6 +3949,35 @@ fn expectEntryU64Field(
     const value = parsed.value.object.get(field) orelse return error.MissingField;
     try std.testing.expect(value == .integer);
     try std.testing.expectEqual(expected, @as(u64, @intCast(value.integer)));
+}
+
+fn expectEntryBoolField(
+    allocator: std.mem.Allocator,
+    entry: FileEntry,
+    field: []const u8,
+    expected: bool,
+) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, entry.raw_json, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+    const value = optionalBool(parsed.value.object, field) orelse return error.MissingField;
+    try std.testing.expectEqual(expected, value);
+}
+
+fn expectEntryNestedStringField(
+    allocator: std.mem.Allocator,
+    entry: FileEntry,
+    object_field: []const u8,
+    field: []const u8,
+    expected: []const u8,
+) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, entry.raw_json, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+    const nested = parsed.value.object.get(object_field) orelse return error.MissingField;
+    try std.testing.expect(nested == .object);
+    const value = optionalString(nested.object, field) orelse return error.MissingNestedField;
+    try std.testing.expectEqualStrings(expected, value);
 }
 
 fn expectMessageText(
@@ -5088,6 +5148,35 @@ test "SessionManager branchWithSummary appends summary under branch point" {
         error.EntryNotFound,
         session.branchWithSummary(std.testing.io, "nonexistent", "summary"),
     );
+}
+
+test "SessionManager branchWithSummaryJson preserves extension metadata" {
+    const allocator = std.testing.allocator;
+    var session = try SessionManager.inMemory(allocator, std.testing.io, null);
+    defer session.deinit();
+
+    const summary_id = try session.branchWithSummaryJson(
+        std.testing.io,
+        null,
+        "Summary before first turn",
+        "{\"kind\":\"hook\",\"version\":\"1\"}",
+        true,
+    );
+    try std.testing.expectEqualStrings(summary_id, session.getLeafId().?);
+    const summary_entry = session.getEntry(summary_id) orelse return error.MissingSummaryEntry;
+    try std.testing.expect(entryTypeEquals(summary_entry, "branch_summary"));
+    try expectEntryParent(allocator, summary_entry, null);
+    try expectEntryStringField(allocator, summary_entry, "fromId", "root");
+    try expectEntryStringField(allocator, summary_entry, "summary", "Summary before first turn");
+    try expectEntryNestedStringField(allocator, summary_entry, "details", "kind", "hook");
+    try expectEntryNestedStringField(allocator, summary_entry, "details", "version", "1");
+    try expectEntryBoolField(allocator, summary_entry, "fromHook", true);
+
+    try std.testing.expectError(
+        error.UnexpectedEndOfInput,
+        session.branchWithSummaryJson(std.testing.io, summary_id, "bad metadata", "{", false),
+    );
+    try std.testing.expectEqual(@as(usize, 1), session.getEntries().len);
 }
 
 test "SessionManager appendMessage creates typed entries with correct parentId chain" {
