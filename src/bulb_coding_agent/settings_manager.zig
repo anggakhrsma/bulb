@@ -205,6 +205,20 @@ pub const SettingsManager = struct {
 
     pub fn getPackagesAlloc(self: *const SettingsManager, allocator: std.mem.Allocator) ![]PackageSource {
         const value = fieldValue(self.settings, "packages") orelse return allocator.alloc(PackageSource, 0);
+        return packageSourcesFromValueAlloc(allocator, value);
+    }
+
+    pub fn getGlobalPackagesAlloc(self: *const SettingsManager, allocator: std.mem.Allocator) ![]PackageSource {
+        const value = fieldValue(self.global_settings, "packages") orelse return allocator.alloc(PackageSource, 0);
+        return packageSourcesFromValueAlloc(allocator, value);
+    }
+
+    pub fn getProjectPackagesAlloc(self: *const SettingsManager, allocator: std.mem.Allocator) ![]PackageSource {
+        const value = fieldValue(self.project_settings, "packages") orelse return allocator.alloc(PackageSource, 0);
+        return packageSourcesFromValueAlloc(allocator, value);
+    }
+
+    fn packageSourcesFromValueAlloc(allocator: std.mem.Allocator, value: std.json.Value) ![]PackageSource {
         if (value != .array) return allocator.alloc(PackageSource, 0);
 
         var packages: std.ArrayList(PackageSource) = .empty;
@@ -241,6 +255,14 @@ pub const SettingsManager = struct {
         return optionalStringArrayAlloc(allocator, fieldValue(self.settings, "extensions"));
     }
 
+    pub fn getGlobalExtensionPathsAlloc(self: *const SettingsManager, allocator: std.mem.Allocator) ![]const []const u8 {
+        return optionalStringArrayAlloc(allocator, fieldValue(self.global_settings, "extensions"));
+    }
+
+    pub fn getProjectExtensionPathsAlloc(self: *const SettingsManager, allocator: std.mem.Allocator) ![]const []const u8 {
+        return optionalStringArrayAlloc(allocator, fieldValue(self.project_settings, "extensions"));
+    }
+
     pub fn setExtensionPaths(self: *SettingsManager, extension_paths: []const []const u8) !void {
         try putStringArray(self.arena.allocator(), &self.global_settings, "extensions", extension_paths);
         try self.markModified("extensions");
@@ -255,6 +277,74 @@ pub const SettingsManager = struct {
 
     pub fn getProjectPromptTemplatePathsAlloc(self: *const SettingsManager, allocator: std.mem.Allocator) ![]const []const u8 {
         return optionalStringArrayAlloc(allocator, fieldValue(self.project_settings, "prompts"));
+    }
+
+    pub fn getSkillPathsAlloc(self: *const SettingsManager, allocator: std.mem.Allocator) ![]const []const u8 {
+        return optionalStringArrayAlloc(allocator, fieldValue(self.settings, "skills"));
+    }
+
+    pub fn getGlobalSkillPathsAlloc(self: *const SettingsManager, allocator: std.mem.Allocator) ![]const []const u8 {
+        return optionalStringArrayAlloc(allocator, fieldValue(self.global_settings, "skills"));
+    }
+
+    pub fn getProjectSkillPathsAlloc(self: *const SettingsManager, allocator: std.mem.Allocator) ![]const []const u8 {
+        return optionalStringArrayAlloc(allocator, fieldValue(self.project_settings, "skills"));
+    }
+
+    pub fn setSkillPaths(self: *SettingsManager, skill_paths: []const []const u8) !void {
+        try putStringArray(self.arena.allocator(), &self.global_settings, "skills", skill_paths);
+        try self.markModified("skills");
+        try self.saveGlobal();
+    }
+
+    pub fn setProjectSkillPaths(self: *SettingsManager, skill_paths: []const []const u8) !void {
+        try putStringArray(self.arena.allocator(), &self.project_settings, "skills", skill_paths);
+        try self.markProjectModified("skills");
+        try self.saveProject();
+    }
+
+    pub fn getPromptTemplatePathsAlloc(self: *const SettingsManager, allocator: std.mem.Allocator) ![]const []const u8 {
+        return optionalStringArrayAlloc(allocator, fieldValue(self.settings, "prompts"));
+    }
+
+    pub fn getGlobalPromptTemplatePathsAlloc(self: *const SettingsManager, allocator: std.mem.Allocator) ![]const []const u8 {
+        return optionalStringArrayAlloc(allocator, fieldValue(self.global_settings, "prompts"));
+    }
+
+    pub fn setPromptTemplatePaths(self: *SettingsManager, prompt_paths: []const []const u8) !void {
+        try putStringArray(self.arena.allocator(), &self.global_settings, "prompts", prompt_paths);
+        try self.markModified("prompts");
+        try self.saveGlobal();
+    }
+
+    pub fn setProjectPromptTemplatePaths(self: *SettingsManager, prompt_paths: []const []const u8) !void {
+        try putStringArray(self.arena.allocator(), &self.project_settings, "prompts", prompt_paths);
+        try self.markProjectModified("prompts");
+        try self.saveProject();
+    }
+
+    pub fn getThemePathsAlloc(self: *const SettingsManager, allocator: std.mem.Allocator) ![]const []const u8 {
+        return optionalStringArrayAlloc(allocator, fieldValue(self.settings, "themes"));
+    }
+
+    pub fn getGlobalThemePathsAlloc(self: *const SettingsManager, allocator: std.mem.Allocator) ![]const []const u8 {
+        return optionalStringArrayAlloc(allocator, fieldValue(self.global_settings, "themes"));
+    }
+
+    pub fn getProjectThemePathsAlloc(self: *const SettingsManager, allocator: std.mem.Allocator) ![]const []const u8 {
+        return optionalStringArrayAlloc(allocator, fieldValue(self.project_settings, "themes"));
+    }
+
+    pub fn setThemePaths(self: *SettingsManager, theme_paths: []const []const u8) !void {
+        try putStringArray(self.arena.allocator(), &self.global_settings, "themes", theme_paths);
+        try self.markModified("themes");
+        try self.saveGlobal();
+    }
+
+    pub fn setProjectThemePaths(self: *SettingsManager, theme_paths: []const []const u8) !void {
+        try putStringArray(self.arena.allocator(), &self.project_settings, "themes", theme_paths);
+        try self.markProjectModified("themes");
+        try self.saveProject();
     }
 
     fn loadScopedSettings(self: *SettingsManager, scope: SettingsScope) !LoadResult {

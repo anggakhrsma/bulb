@@ -4,6 +4,7 @@ pub const tui = @import("bulb_tui");
 pub const extension_sdk = @import("bulb_extension_sdk");
 pub const config = @import("config.zig");
 pub const resolve_config_value = @import("resolve_config_value.zig");
+pub const resource_loader = @import("resource_loader.zig");
 pub const session_cwd = @import("session_cwd.zig");
 pub const session_manager = @import("session_manager.zig");
 pub const settings_manager = @import("settings_manager.zig");
@@ -24,6 +25,7 @@ pub const model_resolver = @import("model_resolver.zig");
 pub const messages = @import("messages.zig");
 pub const oauth_selector = @import("oauth_selector.zig");
 pub const output_guard = @import("output_guard.zig");
+pub const package_manager = @import("package_manager.zig");
 pub const paths = @import("paths.zig");
 pub const path_utils = @import("path_utils.zig");
 pub const plan_mode_utils = @import("plan_mode_utils.zig");
@@ -34,6 +36,7 @@ pub const skills = @import("skills.zig");
 pub const sleep = @import("sleep.zig");
 pub const source_info = @import("source_info.zig");
 pub const startup_session_name = @import("startup_session_name.zig");
+pub const theme = @import("theme.zig");
 pub const user_agent = @import("user_agent.zig");
 pub const version_check = @import("version_check.zig");
 
@@ -44,6 +47,7 @@ pub const version = build_options.version;
 test {
     _ = @import("config.zig");
     _ = @import("resolve_config_value.zig");
+    _ = @import("resource_loader.zig");
     _ = @import("session_cwd.zig");
     _ = @import("session_manager.zig");
     _ = @import("settings_manager.zig");
@@ -64,6 +68,7 @@ test {
     _ = @import("messages.zig");
     _ = @import("oauth_selector.zig");
     _ = @import("output_guard.zig");
+    _ = @import("package_manager.zig");
     _ = @import("paths.zig");
     _ = @import("path_utils.zig");
     _ = @import("plan_mode_utils.zig");
@@ -74,6 +79,7 @@ test {
     _ = @import("sleep.zig");
     _ = @import("source_info.zig");
     _ = @import("startup_session_name.zig");
+    _ = @import("theme.zig");
     _ = @import("user_agent.zig");
     _ = @import("version_check.zig");
 }

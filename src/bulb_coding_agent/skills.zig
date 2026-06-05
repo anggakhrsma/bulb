@@ -21,7 +21,7 @@ pub const ResourceCollision = struct {
     winner_path: []u8,
     loser_path: []u8,
 
-    fn initAlloc(
+    pub fn initAlloc(
         allocator: std.mem.Allocator,
         resource_type: []const u8,
         name: []const u8,
