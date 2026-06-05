@@ -454,7 +454,7 @@ packages/coding-agent/src/core/sdk.ts	bulb_coding_agent	source	pending
 packages/coding-agent/src/core/session-cwd.ts	bulb_coding_agent	source	implemented	src/bulb_coding_agent/session_cwd.zig	Native session cwd source contract, persisted-session missing-directory detection, exact error and prompt formatting, issue payload, and controlled assertion ported
 packages/coding-agent/src/core/session-manager.ts	bulb_coding_agent	source	in_progress	src/bulb_coding_agent/session_manager.zig	Native allocator-owned raw JSONL loading with malformed-line skipping, validated session headers, Pi-compatible ID validation, fresh in-memory and persisted session creation, UUIDv7/custom IDs, deferred file naming, Bulb-native default session directory encoding/creation, usesDefaultSessionDir, explicit missing/corrupted session-file recovery, valid persisted-session open/cwd override behavior, v1/v2/v3 session migrations with rewrite-on-open, recent-session lookup/continue with cwd filtering, JSON message/session-info/custom/label append persistence with deferred first-assistant flush, typed appendMessage serialization for user/assistant/toolResult/bashExecution/custom messages with summary-message rejection, resolved labels and label timestamps, SessionInfo extraction, scoped list/listAll, getters, cwd-source adapter, raw entry lookup, direct child lookup, branch path extraction, branch summaries with root fallback and extension details/fromHook metadata, labelled timestamp-sorted tree nodes, typed thinking/model/compaction/custom-message append APIs, Pi-style typed AgentMessage SessionContext with standalone leaf fallback/orphan/compaction/summary/custom conversion, raw source-context helper, branched-session label preservation, branched-session persistence, and forkFrom ported; remaining session selector and file-operation edge cases stay incremental
 packages/coding-agent/src/core/settings-manager.ts	bulb_coding_agent	source	in_progress	src/bulb_coding_agent/settings_manager.zig	Native .bulb global/project settings storage, merge precedence, migrations, modified-field persistence preserving external edits, reload/error drains, package and extension accessors, project writes, sessionDir normalization, shellCommandPrefix, and httpIdleTimeout basics ported; remaining getter/setter surface and resource integration stay incremental
-packages/coding-agent/src/core/skills.ts	bulb_coding_agent	source	pending		
+packages/coding-agent/src/core/skills.ts	bulb_coding_agent	source	implemented	src/bulb_coding_agent/skills.zig	Native skill frontmatter validation, SKILL.md and root Markdown discovery, ignore-file filtering, source info mapping, explicit/default path loading, duplicate and collision handling, prompt XML formatting, and Bulb .bulb skill path translation ported
 packages/coding-agent/src/core/slash-commands.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/core/source-info.ts	bulb_coding_agent	source	implemented	src/bulb_coding_agent/source_info.zig	Source scope and origin metadata plus regular and synthetic constructors ported
 packages/coding-agent/src/core/system-prompt.ts	bulb_coding_agent	source	pending		
@@ -597,22 +597,22 @@ packages/coding-agent/test/fixtures/before-compaction.jsonl	bulb_coding_agent	fi
 packages/coding-agent/test/fixtures/empty-agent/.gitkeep	bulb_coding_agent	fixture	pending		
 packages/coding-agent/test/fixtures/empty-cwd/.gitkeep	bulb_coding_agent	fixture	pending		
 packages/coding-agent/test/fixtures/large-session.jsonl	bulb_coding_agent	fixture	pending		
-packages/coding-agent/test/fixtures/skills-collision/first/calendar/SKILL.md	bulb_coding_agent	fixture	pending		
-packages/coding-agent/test/fixtures/skills-collision/second/calendar/SKILL.md	bulb_coding_agent	fixture	pending		
-packages/coding-agent/test/fixtures/skills/consecutive-hyphens/SKILL.md	bulb_coding_agent	fixture	pending		
-packages/coding-agent/test/fixtures/skills/disable-model-invocation/SKILL.md	bulb_coding_agent	fixture	pending		
-packages/coding-agent/test/fixtures/skills/invalid-name-chars/SKILL.md	bulb_coding_agent	fixture	pending		
-packages/coding-agent/test/fixtures/skills/invalid-yaml/SKILL.md	bulb_coding_agent	fixture	pending		
-packages/coding-agent/test/fixtures/skills/long-name/SKILL.md	bulb_coding_agent	fixture	pending		
-packages/coding-agent/test/fixtures/skills/missing-description/SKILL.md	bulb_coding_agent	fixture	pending		
-packages/coding-agent/test/fixtures/skills/multiline-description/SKILL.md	bulb_coding_agent	fixture	pending		
-packages/coding-agent/test/fixtures/skills/name-mismatch/SKILL.md	bulb_coding_agent	fixture	pending		
-packages/coding-agent/test/fixtures/skills/nested/child-skill/SKILL.md	bulb_coding_agent	fixture	pending		
-packages/coding-agent/test/fixtures/skills/no-frontmatter/SKILL.md	bulb_coding_agent	fixture	pending		
-packages/coding-agent/test/fixtures/skills/root-skill-preferred/SKILL.md	bulb_coding_agent	fixture	pending		
-packages/coding-agent/test/fixtures/skills/root-skill-preferred/nested-child/SKILL.md	bulb_coding_agent	fixture	pending		
-packages/coding-agent/test/fixtures/skills/unknown-field/SKILL.md	bulb_coding_agent	fixture	pending		
-packages/coding-agent/test/fixtures/skills/valid-skill/SKILL.md	bulb_coding_agent	fixture	pending		
+packages/coding-agent/test/fixtures/skills-collision/first/calendar/SKILL.md	bulb_coding_agent	fixture	implemented	src/bulb_coding_agent/skills.zig	Fixture content translated into colocated native skills tests
+packages/coding-agent/test/fixtures/skills-collision/second/calendar/SKILL.md	bulb_coding_agent	fixture	implemented	src/bulb_coding_agent/skills.zig	Fixture content translated into colocated native skills tests
+packages/coding-agent/test/fixtures/skills/consecutive-hyphens/SKILL.md	bulb_coding_agent	fixture	implemented	src/bulb_coding_agent/skills.zig	Fixture content translated into colocated native skills tests
+packages/coding-agent/test/fixtures/skills/disable-model-invocation/SKILL.md	bulb_coding_agent	fixture	implemented	src/bulb_coding_agent/skills.zig	Fixture content translated into colocated native skills tests
+packages/coding-agent/test/fixtures/skills/invalid-name-chars/SKILL.md	bulb_coding_agent	fixture	implemented	src/bulb_coding_agent/skills.zig	Fixture content translated into colocated native skills tests
+packages/coding-agent/test/fixtures/skills/invalid-yaml/SKILL.md	bulb_coding_agent	fixture	implemented	src/bulb_coding_agent/skills.zig	Fixture content translated into colocated native skills tests
+packages/coding-agent/test/fixtures/skills/long-name/SKILL.md	bulb_coding_agent	fixture	implemented	src/bulb_coding_agent/skills.zig	Fixture content translated into colocated native skills tests
+packages/coding-agent/test/fixtures/skills/missing-description/SKILL.md	bulb_coding_agent	fixture	implemented	src/bulb_coding_agent/skills.zig	Fixture content translated into colocated native skills tests
+packages/coding-agent/test/fixtures/skills/multiline-description/SKILL.md	bulb_coding_agent	fixture	implemented	src/bulb_coding_agent/skills.zig	Fixture content translated into colocated native skills tests
+packages/coding-agent/test/fixtures/skills/name-mismatch/SKILL.md	bulb_coding_agent	fixture	implemented	src/bulb_coding_agent/skills.zig	Fixture content translated into colocated native skills tests
+packages/coding-agent/test/fixtures/skills/nested/child-skill/SKILL.md	bulb_coding_agent	fixture	implemented	src/bulb_coding_agent/skills.zig	Fixture content translated into colocated native skills tests
+packages/coding-agent/test/fixtures/skills/no-frontmatter/SKILL.md	bulb_coding_agent	fixture	implemented	src/bulb_coding_agent/skills.zig	Fixture content translated into colocated native skills tests
+packages/coding-agent/test/fixtures/skills/root-skill-preferred/SKILL.md	bulb_coding_agent	fixture	implemented	src/bulb_coding_agent/skills.zig	Fixture content translated into colocated native skills tests
+packages/coding-agent/test/fixtures/skills/root-skill-preferred/nested-child/SKILL.md	bulb_coding_agent	fixture	implemented	src/bulb_coding_agent/skills.zig	Fixture content translated into colocated native skills tests
+packages/coding-agent/test/fixtures/skills/unknown-field/SKILL.md	bulb_coding_agent	fixture	implemented	src/bulb_coding_agent/skills.zig	Fixture content translated into colocated native skills tests
+packages/coding-agent/test/fixtures/skills/valid-skill/SKILL.md	bulb_coding_agent	fixture	implemented	src/bulb_coding_agent/skills.zig	Fixture content translated into colocated native skills tests
 packages/coding-agent/test/footer-data-provider.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/footer-width.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/format-resume-command.test.ts	bulb_coding_agent	test	implemented	src/bulb_coding_agent/interactive_mode.zig	Upstream default/custom session-dir, shell quoting, non-TTY, in-memory, missing-file, and unset-file resume command regressions translated to Bulb command naming
@@ -672,7 +672,7 @@ packages/coding-agent/test/session-selector-rename.test.ts	bulb_coding_agent	tes
 packages/coding-agent/test/session-selector-search.test.ts	bulb_coding_agent	test	implemented	src/bulb_coding_agent/session_selector_search.zig	Upstream quoted phrase whitespace normalization, case-insensitive word-boundary regex filtering, recent input-order preservation, relevance score ordering and modified tie-breaks, invalid regex empty results, and name-filter regressions ported
 packages/coding-agent/test/settings-manager-bug.test.ts	bulb_coding_agent	test	implemented	src/bulb_coding_agent/settings_manager.zig	Upstream external-edit preservation regressions ported for global packages/extensions arrays and project extension/prompt field merging with Bulb .bulb paths
 packages/coding-agent/test/settings-manager.test.ts	bulb_coding_agent	test	implemented	src/bulb_coding_agent/settings_manager.zig	Upstream settings-manager preservation, packages filtering, reload/error drain, lazy project directory creation, httpIdleTimeoutMs, shellCommandPrefix, and sessionDir regressions translated to native Zig and Bulb .bulb paths
-packages/coding-agent/test/skills.test.ts	bulb_coding_agent	test	pending		
+packages/coding-agent/test/skills.test.ts	bulb_coding_agent	test	implemented	src/bulb_coding_agent/skills.zig	Upstream loadSkillsFromDir, formatSkillsForPrompt, explicit path, tilde expansion, duplicate suppression, and collision regressions translated to native Zig tests with Bulb .bulb paths
 packages/coding-agent/test/startup-session-name.test.ts	bulb_coding_agent	test	implemented	src/bulb_coding_agent/startup_session_name.zig	Upstream startup --name regression ported: trimmed names append session_info before later model validation failure and empty names append nothing
 packages/coding-agent/test/stdout-cleanliness.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/streaming-render-debug.ts	bulb_coding_agent	test	pending		

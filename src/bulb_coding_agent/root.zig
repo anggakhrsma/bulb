@@ -30,6 +30,7 @@ pub const plan_mode_utils = @import("plan_mode_utils.zig");
 pub const provider_display_names = @import("provider_display_names.zig");
 pub const prompt_templates = @import("prompt_templates.zig");
 pub const shell = @import("shell.zig");
+pub const skills = @import("skills.zig");
 pub const sleep = @import("sleep.zig");
 pub const source_info = @import("source_info.zig");
 pub const startup_session_name = @import("startup_session_name.zig");
@@ -69,6 +70,7 @@ test {
     _ = @import("provider_display_names.zig");
     _ = @import("prompt_templates.zig");
     _ = @import("shell.zig");
+    _ = @import("skills.zig");
     _ = @import("sleep.zig");
     _ = @import("source_info.zig");
     _ = @import("startup_session_name.zig");
