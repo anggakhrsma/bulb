@@ -457,7 +457,7 @@ packages/coding-agent/src/core/settings-manager.ts	bulb_coding_agent	source	in_p
 packages/coding-agent/src/core/skills.ts	bulb_coding_agent	source	implemented	src/bulb_coding_agent/skills.zig	Native skill frontmatter validation, SKILL.md and root Markdown discovery, ignore-file filtering, source info mapping, explicit/default path loading, duplicate and collision handling, prompt XML formatting, and Bulb .bulb skill path translation ported
 packages/coding-agent/src/core/slash-commands.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/core/source-info.ts	bulb_coding_agent	source	implemented	src/bulb_coding_agent/source_info.zig	Source scope and origin metadata plus regular and synthetic constructors ported
-packages/coding-agent/src/core/system-prompt.ts	bulb_coding_agent	source	pending		
+packages/coding-agent/src/core/system-prompt.ts	bulb_coding_agent	source	implemented	src/bulb_coding_agent/system_prompt.zig	Native system prompt builder ported with custom/default prompt assembly, selected tool snippet filtering, guideline dedupe, project context injection, skill prompt injection, Bulb docs path resolution, date/cwd footer, and Bulb product/docs naming
 packages/coding-agent/src/core/telemetry.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/core/timings.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/core/tools/bash.ts	bulb_coding_agent	source	pending		
@@ -705,7 +705,7 @@ packages/coding-agent/test/suite/regressions/4167-thinking-toggle-pending-tool-r
 packages/coding-agent/test/suite/regressions/5080-signal-shutdown-extension-cleanup.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/suite/regressions/5109-exclude-tools.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/syntax-highlight.test.ts	bulb_coding_agent	test	pending		
-packages/coding-agent/test/system-prompt.test.ts	bulb_coding_agent	test	pending		
+packages/coding-agent/test/system-prompt.test.ts	bulb_coding_agent	test	implemented	src/bulb_coding_agent/system_prompt.zig	Upstream empty/default/custom tool snippet and prompt guideline tests translated to native Zig with Bulb docs/product text
 packages/coding-agent/test/test-harness.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/test-harness.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/test-theme-colors.ts	bulb_coding_agent	test	pending		
