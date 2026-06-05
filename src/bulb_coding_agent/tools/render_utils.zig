@@ -8,17 +8,30 @@ const shell = @import("../shell.zig");
 
 pub const ThemeColor = enum {
     accent,
+    dim,
     @"error",
+    muted,
+    tool_title,
     tool_output,
+    warning,
 };
 
 pub const RenderTheme = struct {
     ptr: ?*anyopaque = null,
+    bold_fn: *const fn (?*anyopaque, std.mem.Allocator, []const u8) anyerror![]u8 = defaultBoldAlloc,
     fg_fn: *const fn (?*anyopaque, std.mem.Allocator, ThemeColor, []const u8) anyerror![]u8 = defaultFgAlloc,
+
+    pub fn boldAlloc(self: RenderTheme, allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+        return self.bold_fn(self.ptr, allocator, text);
+    }
 
     pub fn fgAlloc(self: RenderTheme, allocator: std.mem.Allocator, color: ThemeColor, text: []const u8) ![]u8 {
         return self.fg_fn(self.ptr, allocator, color, text);
     }
+};
+
+pub const ToolRenderResultOptions = struct {
+    expanded: bool = false,
 };
 
 pub const RenderToolPathOptions = struct {
@@ -218,6 +231,10 @@ fn defaultFgAlloc(_: ?*anyopaque, allocator: std.mem.Allocator, _: ThemeColor, t
     return allocator.dupe(u8, text);
 }
 
+fn defaultBoldAlloc(_: ?*anyopaque, allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    return allocator.dupe(u8, text);
+}
+
 fn needsLeadingSlashForFileUrl(path: []const u8) bool {
     if (path.len == 0) return true;
     if (path[0] == '/' or path[0] == '\\') return false;
@@ -243,8 +260,12 @@ const StyledTestTheme = struct {
 fn colorName(color: ThemeColor) []const u8 {
     return switch (color) {
         .accent => "accent",
+        .dim => "dim",
         .@"error" => "error",
+        .muted => "muted",
+        .tool_title => "toolTitle",
         .tool_output => "toolOutput",
+        .warning => "warning",
     };
 }
 
