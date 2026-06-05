@@ -10,6 +10,7 @@ pub const session_selector = @import("session_selector.zig");
 pub const session_selector_search = @import("session_selector_search.zig");
 pub const auth_storage = @import("auth_storage.zig");
 pub const ansi = @import("ansi.zig");
+pub const cli_args = @import("cli_args.zig");
 pub const frontmatter = @import("frontmatter.zig");
 pub const git = @import("git.zig");
 pub const initial_message = @import("initial_message.zig");
@@ -46,6 +47,7 @@ test {
     _ = @import("session_selector_search.zig");
     _ = @import("auth_storage.zig");
     _ = @import("ansi.zig");
+    _ = @import("cli_args.zig");
     _ = @import("frontmatter.zig");
     _ = @import("git.zig");
     _ = @import("initial_message.zig");

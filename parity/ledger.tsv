@@ -403,13 +403,13 @@ packages/coding-agent/src/bun/cli.ts	bulb_coding_agent	source	pending
 packages/coding-agent/src/bun/register-bedrock.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/bun/restore-sandbox-env.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/cli.ts	bulb_coding_agent	source	pending		
-packages/coding-agent/src/cli/args.ts	bulb_coding_agent	source	pending		
+packages/coding-agent/src/cli/args.ts	bulb_coding_agent	source	implemented	src/bulb_coding_agent/cli_args.zig	Native CLI argument parser, value flags, diagnostics, unknown extension flags, list-models/search, read-only session-reservation helper, and Bulb help/environment text ported
 packages/coding-agent/src/cli/config-selector.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/cli/file-processor.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/cli/initial-message.ts	bulb_coding_agent	source	implemented	src/bulb_coding_agent/initial_message.zig	Native stdin file-text and first CLI message merge helper ported with borrowed file-image passthrough
 packages/coding-agent/src/cli/list-models.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/cli/session-picker.ts	bulb_coding_agent	source	pending		
-packages/coding-agent/src/config.ts	bulb_coding_agent	source	in_progress	src/bulb_coding_agent/config.zig	Bulb-native product constants, release service URL override, ~/.bulb/agent default, BULB_CODING_AGENT_DIR override, tilde expansion, and auth path helper ported; broader native release and resource paths remain
+packages/coding-agent/src/config.ts	bulb_coding_agent	source	in_progress	src/bulb_coding_agent/config.zig	Bulb-native product constants, release service URL override, ~/.bulb/agent default, BULB_CODING_AGENT_DIR and BULB_CODING_AGENT_SESSION_DIR overrides, tilde expansion, and auth path helper ported; broader native release and resource paths remain
 packages/coding-agent/src/core/agent-session-runtime.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/core/agent-session-services.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/core/agent-session.ts	bulb_coding_agent	source	pending		
@@ -566,7 +566,7 @@ packages/coding-agent/test/agent-session-runtime-events.test.ts	bulb_coding_agen
 packages/coding-agent/test/agent-session-stats.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/agent-session-tree-navigation.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/ansi-utils.test.ts	bulb_coding_agent	test	implemented	src/bulb_coding_agent/ansi.zig	Upstream common OSC/CSI, RIS, single-byte ESC, C1 CSI, incomplete control-string, and compatibility regressions ported; Zig typing makes non-string inputs unrepresentable
-packages/coding-agent/test/args.test.ts	bulb_coding_agent	test	pending		
+packages/coding-agent/test/args.test.ts	bulb_coding_agent	test	implemented	src/bulb_coding_agent/cli_args.zig	Upstream parseArgs version/help/print/resume/value/name/resource/tool/message/file/unknown-flag and complex-combination coverage ported
 packages/coding-agent/test/assistant-message.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/auth-storage.test.ts	bulb_coding_agent	test	in_progress	src/bulb_coding_agent/auth_storage.zig	Runtime/stored/environment/fallback precedence, command-cache storage integration, merge-preserving persistence, malformed-file protection, drained reload errors, secret-free auth status, stale persisted OAuth reread, lock compromise retry, and login/logout regressions ported; remaining exact API-key literal/env command cases continue through resolve-config-value coverage
 packages/coding-agent/test/bash-close-hang-windows.test.ts	bulb_coding_agent	test	pending		
@@ -658,7 +658,7 @@ packages/coding-agent/test/sdk-session-manager.test.ts	bulb_coding_agent	test	pe
 packages/coding-agent/test/sdk-skills.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/sdk-stream-options.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/session-cwd.test.ts	bulb_coding_agent	test	in_progress	src/bulb_coding_agent/session_cwd.zig	Missing stored cwd detection, real SessionManager JSONL open and effective-cwd override integration, and pre-runtime controlled rejection ported; agent-session-runtime factory integration remains
-packages/coding-agent/test/session-id-readonly.test.ts	bulb_coding_agent	test	pending		
+packages/coding-agent/test/session-id-readonly.test.ts	bulb_coding_agent	test	in_progress	src/bulb_coding_agent/cli_args.zig	Read-only --session-id behavior for --help and --list-models is covered through the native parser pre-session helper; fork target duplicate rejection and full CLI process diagnostics remain
 packages/coding-agent/test/session-info-modified-timestamp.test.ts	bulb_coding_agent	test	implemented	src/bulb_coding_agent/session_manager.zig	Upstream SessionInfo.modified regression ported: listing prefers the latest user/assistant message timestamp over file mtime
 packages/coding-agent/test/session-manager/build-context.test.ts	bulb_coding_agent	test	implemented	src/bulb_coding_agent/session_manager.zig	Upstream empty/simple context, thinking/model tracking, assistant model override, compaction summary/kept-message ordering, keep-from-first compaction, latest compaction selection, specified leaf traversal, missing-leaf fallback, orphan parent handling, branch summary inclusion, complex branch/compaction paths, custom-message inclusion, current-branch filtering, and exact AgentMessage conversion regressions ported
 packages/coding-agent/test/session-manager/custom-session-id.test.ts	bulb_coding_agent	test	implemented	src/bulb_coding_agent/session_manager.zig	Custom ID validation and propagation, header inclusion, UUIDv7 generation, in-memory defaults, parent option, persisted create/deferred filename, branched-session UUID, generated fork ID, and custom fork ID regressions ported

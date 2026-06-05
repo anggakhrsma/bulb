@@ -7,6 +7,7 @@ pub const global_config_dir = ".bulb/agent";
 pub const project_config_dir = ".bulb";
 pub const service_base_url_env = "BULB_SERVICE_BASE_URL";
 pub const agent_dir_env = "BULB_CODING_AGENT_DIR";
+pub const session_dir_env = "BULB_CODING_AGENT_SESSION_DIR";
 pub const compiled_service_base_url = build_options.service_base_url;
 
 pub fn serviceBaseUrl(environ: std.process.Environ.Map) []const u8 {
@@ -60,4 +61,5 @@ test "Bulb agent paths use native config directory and environment override" {
     const overridden = try authPathAlloc(allocator, &env);
     defer allocator.free(overridden);
     try std.testing.expectEqualStrings("/home/bulb/custom-agent/auth.json", overridden);
+    try std.testing.expectEqualStrings("BULB_CODING_AGENT_SESSION_DIR", session_dir_env);
 }
