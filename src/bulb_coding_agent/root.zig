@@ -29,6 +29,7 @@ pub const prompt_templates = @import("prompt_templates.zig");
 pub const shell = @import("shell.zig");
 pub const sleep = @import("sleep.zig");
 pub const source_info = @import("source_info.zig");
+pub const startup_session_name = @import("startup_session_name.zig");
 pub const user_agent = @import("user_agent.zig");
 pub const version_check = @import("version_check.zig");
 
@@ -64,6 +65,7 @@ test {
     _ = @import("shell.zig");
     _ = @import("sleep.zig");
     _ = @import("source_info.zig");
+    _ = @import("startup_session_name.zig");
     _ = @import("user_agent.zig");
     _ = @import("version_check.zig");
 }

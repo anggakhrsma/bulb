@@ -476,7 +476,7 @@ packages/coding-agent/src/core/tools/tool-definition-wrapper.ts	bulb_coding_agen
 packages/coding-agent/src/core/tools/truncate.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/core/tools/write.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/index.ts	bulb_coding_agent	source	pending		
-packages/coding-agent/src/main.ts	bulb_coding_agent	source	pending		
+packages/coding-agent/src/main.ts	bulb_coding_agent	source	in_progress	src/bulb_coding_agent/startup_session_name.zig	Startup --name trimming, empty-name rejection, and pre-runtime session_info append ordering ported as a native helper; broader CLI/runtime startup remains
 packages/coding-agent/src/migrations.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/modes/index.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/modes/interactive/assets/clankolas.png	bulb_coding_agent	source	pending		
@@ -673,7 +673,7 @@ packages/coding-agent/test/session-selector-search.test.ts	bulb_coding_agent	tes
 packages/coding-agent/test/settings-manager-bug.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/settings-manager.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/skills.test.ts	bulb_coding_agent	test	pending		
-packages/coding-agent/test/startup-session-name.test.ts	bulb_coding_agent	test	pending		
+packages/coding-agent/test/startup-session-name.test.ts	bulb_coding_agent	test	implemented	src/bulb_coding_agent/startup_session_name.zig	Upstream startup --name regression ported: trimmed names append session_info before later model validation failure and empty names append nothing
 packages/coding-agent/test/stdout-cleanliness.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/streaming-render-debug.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/suite/README.md	bulb_coding_agent	test	pending		
