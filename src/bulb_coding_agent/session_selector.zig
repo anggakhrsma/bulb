@@ -2,8 +2,21 @@ const std = @import("std");
 const builtin = @import("builtin");
 const paths = @import("paths.zig");
 const session_manager = @import("session_manager.zig");
+const session_selector_search = @import("session_selector_search.zig");
 
 pub const SessionInfo = session_manager.SessionInfo;
+pub const SortMode = session_selector_search.SortMode;
+pub const NameFilter = session_selector_search.NameFilter;
+
+pub const SessionScope = enum {
+    current,
+    all,
+};
+
+pub const SessionSelectorMode = enum {
+    list,
+    rename,
+};
 
 pub const SessionTreeNode = struct {
     session: SessionInfo,
@@ -34,6 +47,516 @@ pub const FlatSessionTree = struct {
     pub fn deinit(self: *FlatSessionTree) void {
         self.arena.deinit();
         self.* = undefined;
+    }
+};
+
+pub const SessionListAction = union(enum) {
+    none,
+    toggle_scope,
+    toggle_sort,
+    toggle_name_filter,
+    toggle_path: bool,
+    delete_confirmation_changed: ?[]const u8,
+    delete_session: []const u8,
+    rename_session: []const u8,
+    select: []const u8,
+    cancel,
+    failure: []const u8,
+};
+
+pub const SessionSelectorAction = union(enum) {
+    none,
+    load_all: u64,
+    select: []const u8,
+    cancel,
+    delete_session: []const u8,
+    enter_rename: []const u8,
+    rename_submitted: RenameRequest,
+    failure: []const u8,
+};
+
+pub const RenameRequest = struct {
+    path: []const u8,
+    name: []const u8,
+};
+
+pub const SessionSelectorOptions = struct {
+    can_rename: bool = false,
+    show_rename_hint: ?bool = null,
+    sort_mode: SortMode = .threaded,
+    name_filter: NameFilter = .all,
+};
+
+pub const SessionListState = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    sessions: []const SessionInfo = &.{},
+    filtered_sessions: []FlatSessionNode = &.{},
+    query: std.ArrayList(u8) = .empty,
+    filter_arena: std.heap.ArenaAllocator,
+    show_cwd: bool,
+    sort_mode: SortMode,
+    name_filter: NameFilter,
+    selected_index: usize = 0,
+    show_path: bool = false,
+    confirming_delete_path: ?[]const u8 = null,
+    current_session_canonical_path: ?[]u8 = null,
+    max_visible: usize = 10,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        sessions: []const SessionInfo,
+        show_cwd: bool,
+        sort_mode: SortMode,
+        name_filter: NameFilter,
+        current_session_file_path: ?[]const u8,
+    ) !SessionListState {
+        var self = SessionListState{
+            .allocator = allocator,
+            .io = io,
+            .filter_arena = std.heap.ArenaAllocator.init(allocator),
+            .show_cwd = show_cwd,
+            .sort_mode = sort_mode,
+            .name_filter = name_filter,
+        };
+        errdefer self.deinit();
+
+        if (current_session_file_path) |path| {
+            self.current_session_canonical_path = try paths.canonicalizePathAlloc(allocator, io, path);
+        }
+        try self.setSessions(sessions, show_cwd);
+        return self;
+    }
+
+    pub fn deinit(self: *SessionListState) void {
+        self.query.deinit(self.allocator);
+        self.filter_arena.deinit();
+        if (self.current_session_canonical_path) |path| self.allocator.free(path);
+        self.* = undefined;
+    }
+
+    pub fn setSessions(self: *SessionListState, sessions: []const SessionInfo, show_cwd: bool) !void {
+        self.sessions = sessions;
+        self.show_cwd = show_cwd;
+        try self.filterSessions();
+    }
+
+    pub fn setSortMode(self: *SessionListState, sort_mode: SortMode) !void {
+        self.sort_mode = sort_mode;
+        try self.filterSessions();
+    }
+
+    pub fn setNameFilter(self: *SessionListState, name_filter: NameFilter) !void {
+        self.name_filter = name_filter;
+        try self.filterSessions();
+    }
+
+    pub fn selectedSession(self: *const SessionListState) ?FlatSessionNode {
+        if (self.filtered_sessions.len == 0) return null;
+        return self.filtered_sessions[@min(self.selected_index, self.filtered_sessions.len - 1)];
+    }
+
+    pub fn queryValue(self: *const SessionListState) []const u8 {
+        return self.query.items;
+    }
+
+    pub fn confirmingDeletePath(self: *const SessionListState) ?[]const u8 {
+        return self.confirming_delete_path;
+    }
+
+    pub fn handleInput(self: *SessionListState, key_data: []const u8) !SessionListAction {
+        if (self.confirming_delete_path) |path| {
+            if (isConfirmKey(key_data)) {
+                self.confirming_delete_path = null;
+                return .{ .delete_session = path };
+            }
+            if (isCancelKey(key_data)) {
+                self.confirming_delete_path = null;
+                return .{ .delete_confirmation_changed = null };
+            }
+            return .none;
+        }
+
+        if (std.mem.eql(u8, key_data, "\t")) return .toggle_scope;
+        if (std.mem.eql(u8, key_data, "\x13")) return .toggle_sort;
+        if (std.mem.eql(u8, key_data, "\x0e")) return .toggle_name_filter;
+        if (std.mem.eql(u8, key_data, "\x10")) {
+            self.show_path = !self.show_path;
+            return .{ .toggle_path = self.show_path };
+        }
+        if (std.mem.eql(u8, key_data, "\x04")) return self.startDeleteConfirmationForSelectedSession();
+        if (isRenameKey(key_data)) {
+            const selected = self.selectedSession() orelse return .none;
+            return .{ .rename_session = selected.session.path };
+        }
+        if (isCtrlBackspace(key_data)) {
+            if (self.query.items.len > 0) {
+                self.deleteQueryWordBackward();
+                try self.filterSessions();
+                return .none;
+            }
+            return self.startDeleteConfirmationForSelectedSession();
+        }
+
+        if (std.mem.eql(u8, key_data, "\x1b[A")) {
+            if (self.selected_index > 0) self.selected_index -= 1;
+            return .none;
+        }
+        if (std.mem.eql(u8, key_data, "\x1b[B")) {
+            if (self.filtered_sessions.len > 0) {
+                self.selected_index = @min(self.filtered_sessions.len - 1, self.selected_index + 1);
+            }
+            return .none;
+        }
+        if (std.mem.eql(u8, key_data, "\x1b[5~")) {
+            self.selected_index = if (self.selected_index > self.max_visible) self.selected_index - self.max_visible else 0;
+            return .none;
+        }
+        if (std.mem.eql(u8, key_data, "\x1b[6~")) {
+            if (self.filtered_sessions.len > 0) {
+                self.selected_index = @min(self.filtered_sessions.len - 1, self.selected_index + self.max_visible);
+            }
+            return .none;
+        }
+        if (isConfirmKey(key_data)) {
+            const selected = self.selectedSession() orelse return .none;
+            return .{ .select = selected.session.path };
+        }
+        if (isCancelKey(key_data)) return .cancel;
+
+        if (std.mem.eql(u8, key_data, "\x7f")) {
+            if (self.query.items.len > 0) {
+                self.query.shrinkRetainingCapacity(self.query.items.len - 1);
+                try self.filterSessions();
+            }
+            return .none;
+        }
+
+        if (isTextInput(key_data)) {
+            try self.query.appendSlice(self.allocator, key_data);
+            try self.filterSessions();
+        }
+        return .none;
+    }
+
+    fn startDeleteConfirmationForSelectedSession(self: *SessionListState) !SessionListAction {
+        const selected = self.selectedSession() orelse return .none;
+        if (try self.isCurrentSessionPath(selected.session.path)) {
+            return .{ .failure = "Cannot delete the currently active session" };
+        }
+        self.confirming_delete_path = selected.session.path;
+        return .{ .delete_confirmation_changed = selected.session.path };
+    }
+
+    fn isCurrentSessionPath(self: *const SessionListState, path: []const u8) !bool {
+        const current = self.current_session_canonical_path orelse return false;
+        const canonical = try paths.canonicalizePathAlloc(self.allocator, self.io, path);
+        defer self.allocator.free(canonical);
+        return std.mem.eql(u8, current, canonical);
+    }
+
+    fn deleteQueryWordBackward(self: *SessionListState) void {
+        var end = self.query.items.len;
+        while (end > 0 and std.ascii.isWhitespace(self.query.items[end - 1])) end -= 1;
+        while (end > 0 and !std.ascii.isWhitespace(self.query.items[end - 1])) end -= 1;
+        self.query.shrinkRetainingCapacity(end);
+    }
+
+    fn filterSessions(self: *SessionListState) !void {
+        self.resetFilterArena();
+        const arena_allocator = self.filter_arena.allocator();
+
+        var name_filtered: std.ArrayList(SessionInfo) = .empty;
+        for (self.sessions) |session| {
+            if (self.name_filter == .all or session_selector_search.hasSessionName(session)) {
+                try name_filtered.append(arena_allocator, session);
+            }
+        }
+
+        const trimmed = std.mem.trim(u8, self.query.items, " \t\r\n");
+        if (self.sort_mode == .threaded and trimmed.len == 0) {
+            var tree = try buildSessionTree(self.allocator, self.io, name_filtered.items);
+            defer tree.deinit();
+            var flat = try flattenSessionTree(self.allocator, tree.roots);
+            defer flat.deinit();
+            self.filtered_sessions = try copyFlatNodes(arena_allocator, flat.nodes);
+        } else {
+            const filtered = try session_selector_search.filterAndSortSessions(
+                arena_allocator,
+                name_filtered.items,
+                self.query.items,
+                self.sort_mode,
+                .all,
+            );
+            self.filtered_sessions = try arena_allocator.alloc(FlatSessionNode, filtered.len);
+            for (filtered, 0..) |session, index| {
+                self.filtered_sessions[index] = .{
+                    .session = session,
+                    .depth = 0,
+                    .is_last = true,
+                    .ancestor_continues = &.{},
+                };
+            }
+        }
+
+        if (self.filtered_sessions.len == 0) {
+            self.selected_index = 0;
+        } else {
+            self.selected_index = @min(self.selected_index, self.filtered_sessions.len - 1);
+        }
+    }
+
+    fn resetFilterArena(self: *SessionListState) void {
+        self.filter_arena.deinit();
+        self.filter_arena = std.heap.ArenaAllocator.init(self.allocator);
+        self.filtered_sessions = &.{};
+    }
+};
+
+pub const SessionSelectorController = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    scope: SessionScope = .current,
+    sort_mode: SortMode,
+    name_filter: NameFilter,
+    current_sessions: []SessionInfo,
+    all_sessions: []SessionInfo = &.{},
+    has_all_sessions: bool = false,
+    current_loading: bool = false,
+    all_loading: bool = false,
+    all_load_seq: u64 = 0,
+    show_path: bool = false,
+    can_rename: bool,
+    show_rename_hint: bool,
+    mode: SessionSelectorMode = .list,
+    list: SessionListState,
+    rename_value: std.ArrayList(u8) = .empty,
+    rename_cursor: usize = 0,
+    rename_target_path: ?[]const u8 = null,
+
+    pub fn initLoadedCurrent(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        current_sessions: []const SessionInfo,
+        current_session_file_path: ?[]const u8,
+        options: SessionSelectorOptions,
+    ) !SessionSelectorController {
+        const owned_current = try allocator.dupe(SessionInfo, current_sessions);
+        errdefer allocator.free(owned_current);
+
+        var list = try SessionListState.init(
+            allocator,
+            io,
+            owned_current,
+            false,
+            options.sort_mode,
+            options.name_filter,
+            current_session_file_path,
+        );
+        errdefer list.deinit();
+
+        const can_rename = options.can_rename;
+        return .{
+            .allocator = allocator,
+            .io = io,
+            .sort_mode = options.sort_mode,
+            .name_filter = options.name_filter,
+            .current_sessions = owned_current,
+            .can_rename = can_rename,
+            .show_rename_hint = options.show_rename_hint orelse can_rename,
+            .list = list,
+        };
+    }
+
+    pub fn deinit(self: *SessionSelectorController) void {
+        self.list.deinit();
+        self.allocator.free(self.current_sessions);
+        if (self.has_all_sessions) self.allocator.free(self.all_sessions);
+        self.rename_value.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    pub fn handleInput(self: *SessionSelectorController, key_data: []const u8) !SessionSelectorAction {
+        if (self.mode == .rename) return self.handleRenameInput(key_data);
+
+        const action = try self.list.handleInput(key_data);
+        switch (action) {
+            .none => return .none,
+            .toggle_scope => return self.toggleScope(),
+            .toggle_sort => {
+                self.sort_mode = switch (self.sort_mode) {
+                    .threaded => .recent,
+                    .recent => .relevance,
+                    .relevance => .threaded,
+                };
+                try self.list.setSortMode(self.sort_mode);
+                return .none;
+            },
+            .toggle_name_filter => {
+                self.name_filter = if (self.name_filter == .all) .named else .all;
+                try self.list.setNameFilter(self.name_filter);
+                return .none;
+            },
+            .toggle_path => |show| {
+                self.show_path = show;
+                return .none;
+            },
+            .delete_confirmation_changed => return .none,
+            .delete_session => |path| return .{ .delete_session = path },
+            .rename_session => |path| {
+                if (!self.can_rename) return .none;
+                if ((self.scope == .current and self.current_loading) or
+                    (self.scope == .all and self.all_loading))
+                {
+                    return .none;
+                }
+                try self.enterRenameMode(path);
+                return .{ .enter_rename = path };
+            },
+            .select => |path| return .{ .select = path },
+            .cancel => return .cancel,
+            .failure => |message| return .{ .failure = message },
+        }
+    }
+
+    pub fn completeAllLoad(
+        self: *SessionSelectorController,
+        seq: u64,
+        sessions: []const SessionInfo,
+    ) !SessionSelectorAction {
+        if (self.has_all_sessions) self.allocator.free(self.all_sessions);
+        self.all_sessions = try self.allocator.dupe(SessionInfo, sessions);
+        self.has_all_sessions = true;
+        self.all_loading = false;
+
+        if (self.scope != .all or seq != self.all_load_seq) return .none;
+
+        try self.list.setSessions(self.all_sessions, true);
+        if (self.all_sessions.len == 0 and self.current_sessions.len == 0) return .cancel;
+        return .none;
+    }
+
+    pub fn applyDeletedSession(self: *SessionSelectorController, session_path: []const u8) !void {
+        self.current_sessions = try removeSessionByPath(self.allocator, self.current_sessions, session_path);
+        if (self.has_all_sessions) {
+            self.all_sessions = try removeSessionByPath(self.allocator, self.all_sessions, session_path);
+        }
+        try self.list.setSessions(if (self.scope == .all) self.all_sessions else self.current_sessions, self.scope == .all);
+    }
+
+    pub fn modeTitle(self: *const SessionSelectorController) []const u8 {
+        if (self.mode == .rename) return "Rename Session";
+        return if (self.scope == .current) "Resume Session (Current Folder)" else "Resume Session (All)";
+    }
+
+    pub fn headerHintsAlloc(self: *const SessionSelectorController, allocator: std.mem.Allocator) ![]u8 {
+        const path_state = if (self.show_path) "on" else "off";
+        if (self.show_rename_hint) {
+            return std.fmt.allocPrint(
+                allocator,
+                "ctrl+s sort · ctrl+n named · ctrl+d delete · ctrl+p path ({s}) · ctrl+r rename",
+                .{path_state},
+            );
+        }
+        return std.fmt.allocPrint(
+            allocator,
+            "ctrl+s sort · ctrl+n named · ctrl+d delete · ctrl+p path ({s})",
+            .{path_state},
+        );
+    }
+
+    pub fn renameValue(self: *const SessionSelectorController) []const u8 {
+        return self.rename_value.items;
+    }
+
+    fn toggleScope(self: *SessionSelectorController) !SessionSelectorAction {
+        if (self.scope == .current) {
+            self.scope = .all;
+            if (self.has_all_sessions) {
+                self.all_loading = false;
+                try self.list.setSessions(self.all_sessions, true);
+                return .none;
+            }
+            if (!self.all_loading) {
+                self.all_loading = true;
+                self.all_load_seq += 1;
+                return .{ .load_all = self.all_load_seq };
+            }
+            return .none;
+        }
+
+        self.scope = .current;
+        try self.list.setSessions(self.current_sessions, false);
+        return .none;
+    }
+
+    fn enterRenameMode(self: *SessionSelectorController, session_path: []const u8) !void {
+        self.mode = .rename;
+        self.rename_target_path = session_path;
+        self.rename_value.clearRetainingCapacity();
+        if (self.findSessionName(session_path)) |name| try self.rename_value.appendSlice(self.allocator, name);
+        self.rename_cursor = 0;
+    }
+
+    fn exitRenameMode(self: *SessionSelectorController) void {
+        self.mode = .list;
+        self.rename_target_path = null;
+        self.rename_value.clearRetainingCapacity();
+        self.rename_cursor = 0;
+    }
+
+    fn handleRenameInput(self: *SessionSelectorController, key_data: []const u8) !SessionSelectorAction {
+        if (isCancelKey(key_data)) {
+            self.exitRenameMode();
+            return .none;
+        }
+        if (isConfirmKey(key_data)) {
+            const next = std.mem.trim(u8, self.rename_value.items, " \t\r\n");
+            if (next.len == 0) return .none;
+            const target = self.rename_target_path orelse {
+                self.exitRenameMode();
+                return .none;
+            };
+            const request: RenameRequest = .{ .path = target, .name = next };
+            self.mode = .list;
+            self.rename_target_path = null;
+            self.rename_cursor = 0;
+            return .{ .rename_submitted = request };
+        }
+        if (std.mem.eql(u8, key_data, "\x7f")) {
+            if (self.rename_cursor > 0) {
+                const old = self.rename_value.items;
+                var next: std.ArrayList(u8) = .empty;
+                defer next.deinit(self.allocator);
+                try next.appendSlice(self.allocator, old[0 .. self.rename_cursor - 1]);
+                try next.appendSlice(self.allocator, old[self.rename_cursor..]);
+                self.rename_value.clearRetainingCapacity();
+                try self.rename_value.appendSlice(self.allocator, next.items);
+                self.rename_cursor -= 1;
+            }
+            return .none;
+        }
+        if (isTextInput(key_data)) {
+            const old = self.rename_value.items;
+            var next: std.ArrayList(u8) = .empty;
+            defer next.deinit(self.allocator);
+            try next.appendSlice(self.allocator, old[0..self.rename_cursor]);
+            try next.appendSlice(self.allocator, key_data);
+            try next.appendSlice(self.allocator, old[self.rename_cursor..]);
+            self.rename_value.clearRetainingCapacity();
+            try self.rename_value.appendSlice(self.allocator, next.items);
+            self.rename_cursor += key_data.len;
+        }
+        return .none;
+    }
+
+    fn findSessionName(self: *const SessionSelectorController, session_path: []const u8) ?[]const u8 {
+        const sessions = if (self.scope == .all and self.has_all_sessions) self.all_sessions else self.current_sessions;
+        for (sessions) |session| {
+            if (std.mem.eql(u8, session.path, session_path)) return session.name;
+        }
+        return null;
     }
 };
 
@@ -195,6 +718,57 @@ fn newerSessionFirst(_: void, lhs: *SessionTreeNode, rhs: *SessionTreeNode) bool
     return lhs.session.modified_ms > rhs.session.modified_ms;
 }
 
+fn copyFlatNodes(allocator: std.mem.Allocator, nodes: []const FlatSessionNode) ![]FlatSessionNode {
+    const result = try allocator.alloc(FlatSessionNode, nodes.len);
+    for (nodes, 0..) |node, index| {
+        result[index] = .{
+            .session = node.session,
+            .depth = node.depth,
+            .is_last = node.is_last,
+            .ancestor_continues = try allocator.dupe(bool, node.ancestor_continues),
+        };
+    }
+    return result;
+}
+
+fn removeSessionByPath(
+    allocator: std.mem.Allocator,
+    sessions: []SessionInfo,
+    session_path: []const u8,
+) ![]SessionInfo {
+    var kept: std.ArrayList(SessionInfo) = .empty;
+    errdefer kept.deinit(allocator);
+    for (sessions) |session| {
+        if (!std.mem.eql(u8, session.path, session_path)) try kept.append(allocator, session);
+    }
+    allocator.free(sessions);
+    return kept.toOwnedSlice(allocator);
+}
+
+fn isConfirmKey(key_data: []const u8) bool {
+    return std.mem.eql(u8, key_data, "\r");
+}
+
+fn isCancelKey(key_data: []const u8) bool {
+    return std.mem.eql(u8, key_data, "\x1b");
+}
+
+fn isRenameKey(key_data: []const u8) bool {
+    return std.mem.eql(u8, key_data, "\x12") or std.mem.eql(u8, key_data, "\x1b[114;5u");
+}
+
+fn isCtrlBackspace(key_data: []const u8) bool {
+    return std.mem.eql(u8, key_data, "\x1b[127;5u");
+}
+
+fn isTextInput(key_data: []const u8) bool {
+    if (key_data.len == 0) return false;
+    for (key_data) |byte| {
+        if (byte < 0x20 or byte == 0x7f) return false;
+    }
+    return true;
+}
+
 fn makeSession(overrides: struct {
     id: []const u8,
     path: ?[]const u8 = null,
@@ -221,6 +795,22 @@ fn expectFlatIds(nodes: []const FlatSessionNode, expected: []const []const u8) !
     for (expected, 0..) |id, index| {
         try std.testing.expectEqualStrings(id, nodes[index].session.id);
     }
+}
+
+fn expectListActionTag(action: SessionListAction, tag: std.meta.Tag(SessionListAction)) !void {
+    try std.testing.expectEqual(tag, std.meta.activeTag(action));
+}
+
+fn expectSelectorActionTag(action: SessionSelectorAction, tag: std.meta.Tag(SessionSelectorAction)) !void {
+    try std.testing.expectEqual(tag, std.meta.activeTag(action));
+}
+
+fn expectContains(haystack: []const u8, needle: []const u8) !void {
+    try std.testing.expect(std.mem.indexOf(u8, haystack, needle) != null);
+}
+
+fn expectNotContains(haystack: []const u8, needle: []const u8) !void {
+    try std.testing.expect(std.mem.indexOf(u8, haystack, needle) == null);
 }
 
 fn tempDirPathAlloc(allocator: std.mem.Allocator, tmp: *const std.testing.TmpDir) ![]u8 {
@@ -348,6 +938,196 @@ test "session selector tree builds renderable branch prefixes" {
     try std.testing.expectEqualStrings("   └─ ", last_child_prefix);
 }
 
+test "session selector does not treat Ctrl+Backspace as delete when search query is non-empty" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const sessions = [_]SessionInfo{
+        makeSession(.{ .id = "a", .path = "/tmp/a.jsonl" }),
+        makeSession(.{ .id = "b", .path = "/tmp/b.jsonl" }),
+    };
+
+    var list = try SessionListState.init(allocator, io, &sessions, false, .threaded, .all, null);
+    defer list.deinit();
+
+    try expectListActionTag(try list.handleInput("a"), .none);
+    try expectListActionTag(try list.handleInput("\x1b[127;5u"), .none);
+    try std.testing.expect(list.confirmingDeletePath() == null);
+}
+
+test "session selector enters confirmation mode on Ctrl+D even with a non-empty search query" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const sessions = [_]SessionInfo{
+        makeSession(.{ .id = "a", .path = "/tmp/a.jsonl" }),
+        makeSession(.{ .id = "b", .path = "/tmp/b.jsonl" }),
+    };
+
+    var list = try SessionListState.init(allocator, io, &sessions, false, .threaded, .all, null);
+    defer list.deinit();
+
+    try expectListActionTag(try list.handleInput("a"), .none);
+    const action = try list.handleInput("\x04");
+    switch (action) {
+        .delete_confirmation_changed => |path| try std.testing.expectEqualStrings(sessions[0].path, path.?),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqualStrings(sessions[0].path, list.confirmingDeletePath().?);
+}
+
+test "session selector enters confirmation mode on Ctrl+Backspace when search query is empty" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const sessions = [_]SessionInfo{
+        makeSession(.{ .id = "a", .path = "/tmp/a.jsonl" }),
+        makeSession(.{ .id = "b", .path = "/tmp/b.jsonl" }),
+    };
+
+    var list = try SessionListState.init(allocator, io, &sessions, false, .threaded, .all, null);
+    defer list.deinit();
+
+    const confirmation = try list.handleInput("\x1b[127;5u");
+    switch (confirmation) {
+        .delete_confirmation_changed => |path| try std.testing.expectEqualStrings(sessions[0].path, path.?),
+        else => return error.TestUnexpectedResult,
+    }
+
+    const deleted = try list.handleInput("\r");
+    switch (deleted) {
+        .delete_session => |path| try std.testing.expectEqualStrings(sessions[0].path, path),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(list.confirmingDeletePath() == null);
+}
+
+test "session selector does not switch scope back to All when All load resolves after toggling back to Current" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const current_sessions = [_]SessionInfo{makeSession(.{ .id = "current", .path = "/tmp/current.jsonl" })};
+    const all_sessions = [_]SessionInfo{makeSession(.{ .id = "all", .path = "/tmp/all.jsonl" })};
+
+    var selector = try SessionSelectorController.initLoadedCurrent(allocator, io, &current_sessions, null, .{});
+    defer selector.deinit();
+
+    const load = try selector.handleInput("\t");
+    const seq = switch (load) {
+        .load_all => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(SessionScope.all, selector.scope);
+
+    try expectSelectorActionTag(try selector.handleInput("\t"), .none);
+    try std.testing.expectEqual(SessionScope.current, selector.scope);
+
+    try expectSelectorActionTag(try selector.completeAllLoad(seq, &all_sessions), .none);
+    try std.testing.expectEqual(SessionScope.current, selector.scope);
+    try std.testing.expectEqualStrings("Resume Session (Current Folder)", selector.modeTitle());
+    try std.testing.expectEqualStrings("current", selector.list.selectedSession().?.session.id);
+}
+
+test "session selector does not start redundant All loads while All is already loading" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const current_sessions = [_]SessionInfo{makeSession(.{ .id = "current", .path = "/tmp/current.jsonl" })};
+    const all_sessions = [_]SessionInfo{makeSession(.{ .id = "all", .path = "/tmp/all.jsonl" })};
+
+    var selector = try SessionSelectorController.initLoadedCurrent(allocator, io, &current_sessions, null, .{});
+    defer selector.deinit();
+
+    const load = try selector.handleInput("\t");
+    const seq = switch (load) {
+        .load_all => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    try expectSelectorActionTag(try selector.handleInput("\t"), .none);
+    try expectSelectorActionTag(try selector.handleInput("\t"), .none);
+    try std.testing.expectEqual(@as(u64, 1), selector.all_load_seq);
+
+    try expectSelectorActionTag(try selector.completeAllLoad(seq, &all_sessions), .none);
+    try std.testing.expectEqual(SessionScope.all, selector.scope);
+    try std.testing.expectEqualStrings("all", selector.list.selectedSession().?.session.id);
+}
+
+test "session selector shows rename hint when configured" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const sessions = [_]SessionInfo{makeSession(.{ .id = "a", .path = "/tmp/a.jsonl" })};
+
+    var selector = try SessionSelectorController.initLoadedCurrent(
+        allocator,
+        io,
+        &sessions,
+        null,
+        .{ .show_rename_hint = true },
+    );
+    defer selector.deinit();
+
+    const hints = try selector.headerHintsAlloc(allocator);
+    defer allocator.free(hints);
+    try expectContains(hints, "ctrl+r");
+    try expectContains(hints, "rename");
+}
+
+test "session selector hides rename hint when configured" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const sessions = [_]SessionInfo{makeSession(.{ .id = "a", .path = "/tmp/a.jsonl" })};
+
+    var selector = try SessionSelectorController.initLoadedCurrent(
+        allocator,
+        io,
+        &sessions,
+        null,
+        .{ .show_rename_hint = false },
+    );
+    defer selector.deinit();
+
+    const hints = try selector.headerHintsAlloc(allocator);
+    defer allocator.free(hints);
+    try expectNotContains(hints, "ctrl+r");
+    try expectNotContains(hints, "rename");
+}
+
+test "session selector enters rename mode on Ctrl+R and submits with Enter" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const sessions = [_]SessionInfo{makeSession(.{
+        .id = "a",
+        .path = "/tmp/a.jsonl",
+        .name = "Old",
+    })};
+
+    var selector = try SessionSelectorController.initLoadedCurrent(
+        allocator,
+        io,
+        &sessions,
+        null,
+        .{ .can_rename = true, .show_rename_hint = true },
+    );
+    defer selector.deinit();
+
+    const enter = try selector.handleInput("\x1b[114;5u");
+    switch (enter) {
+        .enter_rename => |path| try std.testing.expectEqualStrings(sessions[0].path, path),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(SessionSelectorMode.rename, selector.mode);
+    try std.testing.expectEqualStrings("Rename Session", selector.modeTitle());
+    try expectNotContains(selector.modeTitle(), "Resume Session");
+
+    try expectSelectorActionTag(try selector.handleInput("X"), .none);
+    try std.testing.expectEqualStrings("XOld", selector.renameValue());
+
+    const submitted = try selector.handleInput("\r");
+    switch (submitted) {
+        .rename_submitted => |request| {
+            try std.testing.expectEqualStrings(sessions[0].path, request.path);
+            try std.testing.expectEqualStrings("XOld", request.name);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(SessionSelectorMode.list, selector.mode);
+}
+
 test "session selector threads sessions when parent and child paths use different symlink aliases" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
@@ -409,4 +1189,19 @@ test "session selector treats current session as active across symlink aliases" 
         null,
         session_paths.parent_alias_b,
     ));
+
+    const sessions = [_]SessionInfo{makeSession(.{
+        .id = "parent",
+        .path = session_paths.parent_alias_b,
+        .name = "Parent",
+    })};
+    var list = try SessionListState.init(allocator, io, &sessions, false, .threaded, .all, session_paths.parent_alias_a);
+    defer list.deinit();
+
+    const action = try list.handleInput("\x04");
+    switch (action) {
+        .failure => |message| try std.testing.expectEqualStrings("Cannot delete the currently active session", message),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(list.confirmingDeletePath() == null);
 }
