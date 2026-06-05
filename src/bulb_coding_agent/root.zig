@@ -6,6 +6,7 @@ pub const config = @import("config.zig");
 pub const resolve_config_value = @import("resolve_config_value.zig");
 pub const session_cwd = @import("session_cwd.zig");
 pub const session_manager = @import("session_manager.zig");
+pub const session_selector_search = @import("session_selector_search.zig");
 pub const auth_storage = @import("auth_storage.zig");
 pub const ansi = @import("ansi.zig");
 pub const frontmatter = @import("frontmatter.zig");
@@ -37,6 +38,7 @@ test {
     _ = @import("resolve_config_value.zig");
     _ = @import("session_cwd.zig");
     _ = @import("session_manager.zig");
+    _ = @import("session_selector_search.zig");
     _ = @import("auth_storage.zig");
     _ = @import("ansi.zig");
     _ = @import("frontmatter.zig");

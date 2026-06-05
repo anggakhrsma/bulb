@@ -504,7 +504,7 @@ packages/coding-agent/src/modes/interactive/components/login-dialog.ts	bulb_codi
 packages/coding-agent/src/modes/interactive/components/model-selector.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/modes/interactive/components/oauth-selector.ts	bulb_coding_agent	source	in_progress	src/bulb_coding_agent/oauth_selector.zig	Native auth selector provider records, search/fuzzy filtering, selected rendering, status indicators, no-provider messages, and selection/cancel input callbacks ported; full interactive-mode theme/DynamicBorder integration remains
 packages/coding-agent/src/modes/interactive/components/scoped-models-selector.ts	bulb_coding_agent	source	pending		
-packages/coding-agent/src/modes/interactive/components/session-selector-search.ts	bulb_coding_agent	source	pending		
+packages/coding-agent/src/modes/interactive/components/session-selector-search.ts	bulb_coding_agent	source	in_progress	src/bulb_coding_agent/session_selector_search.zig	Native session selector search parser, quoted phrase matching with whitespace normalization, name filtering, recent-order filtering, relevance scoring with modified-time tie-breaks, Pi fuzzy matching reuse, and invalid-regex empty result behavior ported; full JavaScript RegExp equivalence and UI integration remain
 packages/coding-agent/src/modes/interactive/components/session-selector.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/modes/interactive/components/settings-selector.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/modes/interactive/components/show-images-selector.ts	bulb_coding_agent	source	pending		
@@ -669,7 +669,7 @@ packages/coding-agent/test/session-manager/save-entry.test.ts	bulb_coding_agent	
 packages/coding-agent/test/session-manager/tree-traversal.test.ts	bulb_coding_agent	test	in_progress	src/bulb_coding_agent/session_manager.zig	Typed appendMessage parent chains, toolResult/bashExecution/custom message serialization, summary-message rejection, raw append parent chains, thinking/model/compaction/custom/custom-message append parent chains, getChildren, branch leaf movement, branch path extraction, branch summaries with extension metadata/root fallback/invalid-metadata rejection, timestamp-sorted getTree branch/deep-branch cases, labelled tree nodes, resolved source and typed AgentMessage context extraction, createBranchedSession path extraction, deferred fork writes, immediate assistant-path writes, label preservation, and duplicate-header/entry-id fork regressions ported; remaining gaps are later tree/session selector edge cases outside the context conversion slice
 packages/coding-agent/test/session-selector-path-delete.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/session-selector-rename.test.ts	bulb_coding_agent	test	pending		
-packages/coding-agent/test/session-selector-search.test.ts	bulb_coding_agent	test	pending		
+packages/coding-agent/test/session-selector-search.test.ts	bulb_coding_agent	test	implemented	src/bulb_coding_agent/session_selector_search.zig	Upstream quoted phrase whitespace normalization, case-insensitive word-boundary regex filtering, recent input-order preservation, relevance score ordering and modified tie-breaks, invalid regex empty results, and name-filter regressions ported
 packages/coding-agent/test/settings-manager-bug.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/settings-manager.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/skills.test.ts	bulb_coding_agent	test	pending		
