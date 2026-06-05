@@ -473,7 +473,7 @@ packages/coding-agent/src/core/tools/path-utils.ts	bulb_coding_agent	source	impl
 packages/coding-agent/src/core/tools/read.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/core/tools/render-utils.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/core/tools/tool-definition-wrapper.ts	bulb_coding_agent	source	pending		
-packages/coding-agent/src/core/tools/truncate.ts	bulb_coding_agent	source	pending		
+packages/coding-agent/src/core/tools/truncate.ts	bulb_coding_agent	source	implemented	src/bulb_coding_agent/tools/truncate.zig	Shared tool truncation constants, size formatting, head/tail truncation metadata, UTF-8 tail-boundary handling, first-line byte-limit detection, and grep line truncation suffix ported
 packages/coding-agent/src/core/tools/write.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/index.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/main.ts	bulb_coding_agent	source	in_progress	src/bulb_coding_agent/startup_session_name.zig	Startup --name trimming, empty-name rejection, and pre-runtime session_info append ordering ported as a native helper; broader CLI/runtime startup remains

@@ -11,6 +11,7 @@ pub const settings_manager = @import("settings_manager.zig");
 pub const session_selector = @import("session_selector.zig");
 pub const session_selector_search = @import("session_selector_search.zig");
 pub const system_prompt = @import("system_prompt.zig");
+pub const tools = @import("tools/root.zig");
 pub const auth_storage = @import("auth_storage.zig");
 pub const ansi = @import("ansi.zig");
 pub const cli_args = @import("cli_args.zig");
@@ -55,6 +56,7 @@ test {
     _ = @import("session_selector.zig");
     _ = @import("session_selector_search.zig");
     _ = @import("system_prompt.zig");
+    _ = @import("tools/root.zig");
     _ = @import("auth_storage.zig");
     _ = @import("ansi.zig");
     _ = @import("cli_args.zig");
