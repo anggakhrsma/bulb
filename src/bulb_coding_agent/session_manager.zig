@@ -1,5 +1,6 @@
 const std = @import("std");
 const agent = @import("bulb_agent");
+const ai = @import("bulb_ai");
 const config = @import("config.zig");
 const messages_mod = @import("messages.zig");
 const paths = @import("paths.zig");
@@ -54,7 +55,7 @@ pub const SessionContextModel = struct {
 
 pub const SessionContext = struct {
     arena: std.heap.ArenaAllocator,
-    messages: []FileEntry,
+    messages: []messages_mod.CodingAgentMessage,
     thinking_level: []const u8 = "off",
     model: ?SessionContextModel = null,
 
@@ -62,6 +63,24 @@ pub const SessionContext = struct {
         self.arena.deinit();
         self.* = undefined;
     }
+};
+
+pub const SessionSourceContext = struct {
+    arena: std.heap.ArenaAllocator,
+    messages: []FileEntry,
+    thinking_level: []const u8 = "off",
+    model: ?SessionContextModel = null,
+
+    pub fn deinit(self: *SessionSourceContext) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
+pub const SessionContextLeaf = union(enum) {
+    last,
+    id: []const u8,
+    before_first,
 };
 
 pub const SessionInfo = struct {
@@ -841,66 +860,16 @@ pub const SessionManager = struct {
         self: *const SessionManager,
         allocator: std.mem.Allocator,
     ) !SessionContext {
-        var arena = std.heap.ArenaAllocator.init(allocator);
-        errdefer arena.deinit();
-        const arena_allocator = arena.allocator();
+        const leaf: SessionContextLeaf = if (self.leaf_id) |id| .{ .id = id } else .before_first;
+        return buildSessionContextFromEntriesAlloc(allocator, self.getEntries(), leaf);
+    }
 
-        const branch_entries = try self.getBranchAlloc(arena_allocator, null);
-        var thinking_level: []const u8 = "off";
-        var model: ?SessionContextModel = null;
-        var compaction_index: ?usize = null;
-        for (branch_entries, 0..) |entry, index| {
-            if (entryTypeEquals(entry, "thinking_level_change")) {
-                thinking_level = (try entryStringFieldAlloc(arena_allocator, entry.raw_json, "thinkingLevel")) orelse "off";
-            } else if (entryTypeEquals(entry, "model_change")) {
-                const provider = try entryStringFieldAlloc(arena_allocator, entry.raw_json, "provider");
-                const model_id = try entryStringFieldAlloc(arena_allocator, entry.raw_json, "modelId");
-                if (provider != null and model_id != null) {
-                    model = .{ .provider = provider.?, .model_id = model_id.? };
-                }
-            } else if (entryTypeEquals(entry, "message")) {
-                if (try assistantModelAlloc(arena_allocator, arena_allocator, entry.raw_json)) |assistant_model| {
-                    model = assistant_model;
-                }
-            } else if (entryTypeEquals(entry, "compaction")) {
-                compaction_index = index;
-            }
-        }
-
-        var messages: std.ArrayList(FileEntry) = .empty;
-        if (compaction_index) |index| {
-            const compaction = branch_entries[index];
-            try messages.append(arena_allocator, try cloneFileEntry(arena_allocator, compaction));
-
-            const first_kept_entry_id = try entryStringFieldAlloc(arena_allocator, compaction.raw_json, "firstKeptEntryId");
-            var found_first_kept = false;
-            for (branch_entries[0..index]) |entry| {
-                if (first_kept_entry_id) |target_id| {
-                    if (entry.id) |entry_id| {
-                        if (std.mem.eql(u8, entry_id, target_id)) {
-                            found_first_kept = true;
-                        }
-                    }
-                }
-                if (found_first_kept) {
-                    try appendContextSourceEntryAlloc(arena_allocator, &messages, entry);
-                }
-            }
-            for (branch_entries[index + 1 ..]) |entry| {
-                try appendContextSourceEntryAlloc(arena_allocator, &messages, entry);
-            }
-        } else {
-            for (branch_entries) |entry| {
-                try appendContextSourceEntryAlloc(arena_allocator, &messages, entry);
-            }
-        }
-
-        return .{
-            .arena = arena,
-            .messages = try messages.toOwnedSlice(arena_allocator),
-            .thinking_level = thinking_level,
-            .model = model,
-        };
+    pub fn buildSessionSourceContextAlloc(
+        self: *const SessionManager,
+        allocator: std.mem.Allocator,
+    ) !SessionSourceContext {
+        const leaf: SessionContextLeaf = if (self.leaf_id) |id| .{ .id = id } else .before_first;
+        return buildSessionSourceContextFromEntriesAlloc(allocator, self.getEntries(), leaf);
     }
 
     pub fn getTreeAlloc(
@@ -1815,6 +1784,162 @@ fn cloneFileEntry(allocator: std.mem.Allocator, entry: FileEntry) !FileEntry {
     };
 }
 
+pub fn buildSessionContextFromEntriesAlloc(
+    allocator: std.mem.Allocator,
+    entries: []const FileEntry,
+    leaf: SessionContextLeaf,
+) !SessionContext {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    const branch_entries = try resolveSessionPathAlloc(arena_allocator, entries, leaf);
+    const settings = try inspectContextSettingsAlloc(arena_allocator, branch_entries);
+
+    var messages: std.ArrayList(messages_mod.CodingAgentMessage) = .empty;
+    if (settings.compaction_index) |index| {
+        const compaction = branch_entries[index];
+        try appendCompactionSummaryMessageAlloc(arena_allocator, &messages, compaction);
+
+        const first_kept_entry_id = try entryStringFieldAlloc(arena_allocator, compaction.raw_json, "firstKeptEntryId");
+        var found_first_kept = false;
+        for (branch_entries[0..index]) |entry| {
+            if (first_kept_entry_id) |target_id| {
+                if (entry.id) |entry_id| {
+                    if (std.mem.eql(u8, entry_id, target_id)) {
+                        found_first_kept = true;
+                    }
+                }
+            }
+            if (found_first_kept) {
+                try appendContextAgentMessageAlloc(arena_allocator, &messages, entry);
+            }
+        }
+        for (branch_entries[index + 1 ..]) |entry| {
+            try appendContextAgentMessageAlloc(arena_allocator, &messages, entry);
+        }
+    } else {
+        for (branch_entries) |entry| {
+            try appendContextAgentMessageAlloc(arena_allocator, &messages, entry);
+        }
+    }
+
+    return .{
+        .arena = arena,
+        .messages = try messages.toOwnedSlice(arena_allocator),
+        .thinking_level = settings.thinking_level,
+        .model = settings.model,
+    };
+}
+
+pub fn buildSessionSourceContextFromEntriesAlloc(
+    allocator: std.mem.Allocator,
+    entries: []const FileEntry,
+    leaf: SessionContextLeaf,
+) !SessionSourceContext {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    const branch_entries = try resolveSessionPathAlloc(arena_allocator, entries, leaf);
+    const settings = try inspectContextSettingsAlloc(arena_allocator, branch_entries);
+
+    var messages: std.ArrayList(FileEntry) = .empty;
+    if (settings.compaction_index) |index| {
+        const compaction = branch_entries[index];
+        try messages.append(arena_allocator, try cloneFileEntry(arena_allocator, compaction));
+
+        const first_kept_entry_id = try entryStringFieldAlloc(arena_allocator, compaction.raw_json, "firstKeptEntryId");
+        var found_first_kept = false;
+        for (branch_entries[0..index]) |entry| {
+            if (first_kept_entry_id) |target_id| {
+                if (entry.id) |entry_id| {
+                    if (std.mem.eql(u8, entry_id, target_id)) {
+                        found_first_kept = true;
+                    }
+                }
+            }
+            if (found_first_kept) {
+                try appendContextSourceEntryAlloc(arena_allocator, &messages, entry);
+            }
+        }
+        for (branch_entries[index + 1 ..]) |entry| {
+            try appendContextSourceEntryAlloc(arena_allocator, &messages, entry);
+        }
+    } else {
+        for (branch_entries) |entry| {
+            try appendContextSourceEntryAlloc(arena_allocator, &messages, entry);
+        }
+    }
+
+    return .{
+        .arena = arena,
+        .messages = try messages.toOwnedSlice(arena_allocator),
+        .thinking_level = settings.thinking_level,
+        .model = settings.model,
+    };
+}
+
+fn resolveSessionPathAlloc(
+    allocator: std.mem.Allocator,
+    entries: []const FileEntry,
+    leaf: SessionContextLeaf,
+) ![]FileEntry {
+    var by_id = std.StringHashMap(FileEntry).init(allocator);
+    for (entries) |entry| {
+        if (entry.id) |id| try by_id.put(id, entry);
+    }
+
+    const leaf_entry: ?FileEntry = switch (leaf) {
+        .before_first => null,
+        .last => if (entries.len == 0) null else entries[entries.len - 1],
+        .id => |id| by_id.get(id) orelse if (entries.len == 0) null else entries[entries.len - 1],
+    };
+    var current = leaf_entry orelse return allocator.alloc(FileEntry, 0);
+
+    var reversed: std.ArrayList(FileEntry) = .empty;
+    while (true) {
+        try reversed.append(allocator, current);
+        const parent_id = try entryParentIdAlloc(allocator, current.raw_json);
+        const next_id = parent_id orelse break;
+        current = by_id.get(next_id) orelse break;
+    }
+
+    std.mem.reverse(FileEntry, reversed.items);
+    return reversed.toOwnedSlice(allocator);
+}
+
+const ContextSettings = struct {
+    thinking_level: []const u8 = "off",
+    model: ?SessionContextModel = null,
+    compaction_index: ?usize = null,
+};
+
+fn inspectContextSettingsAlloc(
+    allocator: std.mem.Allocator,
+    branch_entries: []const FileEntry,
+) !ContextSettings {
+    var settings: ContextSettings = .{};
+    for (branch_entries, 0..) |entry, index| {
+        if (entryTypeEquals(entry, "thinking_level_change")) {
+            settings.thinking_level = (try entryStringFieldAlloc(allocator, entry.raw_json, "thinkingLevel")) orelse "off";
+        } else if (entryTypeEquals(entry, "model_change")) {
+            const provider = try entryStringFieldAlloc(allocator, entry.raw_json, "provider");
+            const model_id = try entryStringFieldAlloc(allocator, entry.raw_json, "modelId");
+            if (provider != null and model_id != null) {
+                settings.model = .{ .provider = provider.?, .model_id = model_id.? };
+            }
+        } else if (entryTypeEquals(entry, "message")) {
+            if (try assistantModelAlloc(allocator, allocator, entry.raw_json)) |assistant_model| {
+                settings.model = assistant_model;
+            }
+        } else if (entryTypeEquals(entry, "compaction")) {
+            settings.compaction_index = index;
+        }
+    }
+    return settings;
+}
+
 fn appendContextSourceEntryAlloc(
     allocator: std.mem.Allocator,
     messages: *std.ArrayList(FileEntry),
@@ -1828,6 +1953,325 @@ fn entryParticipatesInContext(entry: FileEntry) bool {
     return entryTypeEquals(entry, "message") or
         entryTypeEquals(entry, "custom_message") or
         entryTypeEquals(entry, "branch_summary");
+}
+
+fn appendContextAgentMessageAlloc(
+    allocator: std.mem.Allocator,
+    messages: *std.ArrayList(messages_mod.CodingAgentMessage),
+    entry: FileEntry,
+) !void {
+    if (entryTypeEquals(entry, "message")) {
+        if (try agentMessageFromMessageEntryAlloc(allocator, entry.raw_json)) |message| {
+            try messages.append(allocator, message);
+        }
+    } else if (entryTypeEquals(entry, "custom_message")) {
+        if (try customMessageFromEntryAlloc(allocator, entry.raw_json)) |message| {
+            try messages.append(allocator, .{ .custom = message });
+        }
+    } else if (entryTypeEquals(entry, "branch_summary")) {
+        if (try branchSummaryMessageFromEntryAlloc(allocator, entry.raw_json)) |message| {
+            try messages.append(allocator, .{ .branch_summary = message });
+        }
+    }
+}
+
+fn appendCompactionSummaryMessageAlloc(
+    allocator: std.mem.Allocator,
+    messages: *std.ArrayList(messages_mod.CodingAgentMessage),
+    entry: FileEntry,
+) !void {
+    if (try compactionSummaryMessageFromEntryAlloc(allocator, entry.raw_json)) |message| {
+        try messages.append(allocator, .{ .compaction_summary = message });
+    }
+}
+
+fn agentMessageFromMessageEntryAlloc(
+    allocator: std.mem.Allocator,
+    raw_json: []const u8,
+) !?messages_mod.CodingAgentMessage {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, raw_json, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return null,
+    };
+    if (parsed.value != .object) return null;
+    const message_value = parsed.value.object.get("message") orelse return null;
+    if (message_value != .object) return null;
+    return try agentMessageFromObjectAlloc(allocator, message_value.object);
+}
+
+fn agentMessageFromObjectAlloc(
+    allocator: std.mem.Allocator,
+    object: std.json.ObjectMap,
+) !?messages_mod.CodingAgentMessage {
+    const role = optionalString(object, "role") orelse return null;
+    if (std.mem.eql(u8, role, "user")) {
+        const content_value = object.get("content") orelse return null;
+        return .{ .user = .{
+            .content = try parseUserContentValueAlloc(allocator, content_value),
+            .timestamp_ms = optionalI64(object, "timestamp") orelse 0,
+        } };
+    }
+    if (std.mem.eql(u8, role, "assistant")) {
+        const content_value = object.get("content") orelse return null;
+        return .{ .assistant = .{
+            .content = try parseAssistantContentValueAlloc(allocator, content_value),
+            .api = try allocator.dupe(u8, optionalString(object, "api") orelse "anthropic-messages"),
+            .provider = try allocator.dupe(u8, optionalString(object, "provider") orelse ""),
+            .model = try allocator.dupe(u8, optionalString(object, "model") orelse ""),
+            .response_model = if (optionalString(object, "responseModel")) |value| try allocator.dupe(u8, value) else null,
+            .usage = parseUsage(object.get("usage")),
+            .stop_reason = parseStopReason(optionalString(object, "stopReason")),
+            .error_message = if (optionalString(object, "errorMessage")) |value| try allocator.dupe(u8, value) else null,
+            .response_id = if (optionalString(object, "responseId")) |value| try allocator.dupe(u8, value) else null,
+            .timestamp_ms = optionalI64(object, "timestamp") orelse 0,
+        } };
+    }
+    if (std.mem.eql(u8, role, "toolResult")) {
+        const content_value = object.get("content") orelse return null;
+        return .{ .tool_result = .{
+            .tool_call_id = try allocator.dupe(u8, optionalString(object, "toolCallId") orelse ""),
+            .tool_name = try allocator.dupe(u8, optionalString(object, "toolName") orelse ""),
+            .content = try parseUserContentValueAlloc(allocator, content_value),
+            .is_error = optionalBool(object, "isError") orelse false,
+            .timestamp_ms = optionalI64(object, "timestamp") orelse 0,
+        } };
+    }
+    if (std.mem.eql(u8, role, "bashExecution")) {
+        return .{ .bash_execution = .{
+            .command = try allocator.dupe(u8, optionalString(object, "command") orelse ""),
+            .output = try allocator.dupe(u8, optionalString(object, "output") orelse ""),
+            .exit_code = optionalI64(object, "exitCode"),
+            .cancelled = optionalBool(object, "cancelled") orelse false,
+            .truncated = optionalBool(object, "truncated") orelse false,
+            .full_output_path = if (optionalString(object, "fullOutputPath")) |value| try allocator.dupe(u8, value) else null,
+            .timestamp_ms = optionalI64(object, "timestamp") orelse 0,
+            .exclude_from_context = optionalBool(object, "excludeFromContext") orelse false,
+        } };
+    }
+    if (std.mem.eql(u8, role, "custom")) {
+        return .{ .custom = .{
+            .custom_type = try allocator.dupe(u8, optionalString(object, "customType") orelse ""),
+            .content = try parseCustomContentValueAlloc(allocator, object.get("content") orelse return null),
+            .display = optionalBool(object, "display") orelse false,
+            .details_json = if (object.get("details")) |details| try jsonValueToStringAlloc(allocator, details) else null,
+            .timestamp_ms = optionalI64(object, "timestamp") orelse 0,
+        } };
+    }
+    return null;
+}
+
+fn customMessageFromEntryAlloc(
+    allocator: std.mem.Allocator,
+    raw_json: []const u8,
+) !?messages_mod.CustomMessage {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, raw_json, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return null,
+    };
+    if (parsed.value != .object) return null;
+    const object = parsed.value.object;
+    const custom_type = optionalString(object, "customType") orelse return null;
+    const content = object.get("content") orelse return null;
+    const timestamp = optionalString(object, "timestamp") orelse return null;
+    return try messages_mod.createCustomMessage(
+        try allocator.dupe(u8, custom_type),
+        try parseCustomContentValueAlloc(allocator, content),
+        optionalBool(object, "display") orelse false,
+        if (object.get("details")) |details| try jsonValueToStringAlloc(allocator, details) else null,
+        timestamp,
+    );
+}
+
+fn branchSummaryMessageFromEntryAlloc(
+    allocator: std.mem.Allocator,
+    raw_json: []const u8,
+) !?messages_mod.BranchSummaryMessage {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, raw_json, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return null,
+    };
+    if (parsed.value != .object) return null;
+    const object = parsed.value.object;
+    return try messages_mod.createBranchSummaryMessage(
+        optionalString(object, "summary") orelse return null,
+        optionalString(object, "fromId") orelse return null,
+        optionalString(object, "timestamp") orelse return null,
+    );
+}
+
+fn compactionSummaryMessageFromEntryAlloc(
+    allocator: std.mem.Allocator,
+    raw_json: []const u8,
+) !?messages_mod.CompactionSummaryMessage {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, raw_json, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return null,
+    };
+    if (parsed.value != .object) return null;
+    const object = parsed.value.object;
+    return try messages_mod.createCompactionSummaryMessage(
+        optionalString(object, "summary") orelse return null,
+        optionalU64(object, "tokensBefore") orelse 0,
+        optionalString(object, "timestamp") orelse return null,
+    );
+}
+
+fn parseCustomContentValueAlloc(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+) !messages_mod.CustomContent {
+    return switch (value) {
+        .string => |text| .{ .text = try allocator.dupe(u8, text) },
+        .array => .{ .parts = try parseUserContentArrayAlloc(allocator, value.array.items) },
+        else => error.InvalidMessageContent,
+    };
+}
+
+fn parseUserContentValueAlloc(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+) ![]ai.UserContent {
+    return switch (value) {
+        .string => |text| blk: {
+            const content = try allocator.alloc(ai.UserContent, 1);
+            content[0] = .{ .text = .{ .text = try allocator.dupe(u8, text) } };
+            break :blk content;
+        },
+        .array => try parseUserContentArrayAlloc(allocator, value.array.items),
+        else => error.InvalidMessageContent,
+    };
+}
+
+fn parseUserContentArrayAlloc(
+    allocator: std.mem.Allocator,
+    items: []const std.json.Value,
+) ![]ai.UserContent {
+    const content = try allocator.alloc(ai.UserContent, items.len);
+    for (items, 0..) |item, index| {
+        content[index] = try parseUserContentPartAlloc(allocator, item);
+    }
+    return content;
+}
+
+fn parseUserContentPartAlloc(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+) !ai.UserContent {
+    if (value != .object) return error.InvalidMessageContent;
+    const object = value.object;
+    const content_type = optionalString(object, "type") orelse return error.InvalidMessageContent;
+    if (std.mem.eql(u8, content_type, "text")) {
+        return .{ .text = .{
+            .text = try allocator.dupe(u8, optionalString(object, "text") orelse ""),
+            .text_signature = if (optionalString(object, "textSignature")) |signature| try allocator.dupe(u8, signature) else null,
+        } };
+    }
+    if (std.mem.eql(u8, content_type, "image")) {
+        return .{ .image = .{
+            .data = try allocator.dupe(u8, optionalString(object, "data") orelse ""),
+            .mime_type = try allocator.dupe(u8, optionalString(object, "mimeType") orelse ""),
+        } };
+    }
+    return error.InvalidMessageContent;
+}
+
+fn parseAssistantContentValueAlloc(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+) ![]ai.AssistantContent {
+    return switch (value) {
+        .string => |text| blk: {
+            const content = try allocator.alloc(ai.AssistantContent, 1);
+            content[0] = .{ .text = .{ .text = try allocator.dupe(u8, text) } };
+            break :blk content;
+        },
+        .array => blk: {
+            const content = try allocator.alloc(ai.AssistantContent, value.array.items.len);
+            for (value.array.items, 0..) |item, index| {
+                content[index] = try parseAssistantContentPartAlloc(allocator, item);
+            }
+            break :blk content;
+        },
+        else => error.InvalidMessageContent,
+    };
+}
+
+fn parseAssistantContentPartAlloc(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+) !ai.AssistantContent {
+    if (value != .object) return error.InvalidMessageContent;
+    const object = value.object;
+    const content_type = optionalString(object, "type") orelse return error.InvalidMessageContent;
+    if (std.mem.eql(u8, content_type, "text")) {
+        return .{ .text = .{
+            .text = try allocator.dupe(u8, optionalString(object, "text") orelse ""),
+            .text_signature = if (optionalString(object, "textSignature")) |signature| try allocator.dupe(u8, signature) else null,
+        } };
+    }
+    if (std.mem.eql(u8, content_type, "thinking")) {
+        return .{ .thinking = .{
+            .thinking = try allocator.dupe(u8, optionalString(object, "thinking") orelse ""),
+            .thinking_signature = if (optionalString(object, "thinkingSignature")) |signature| try allocator.dupe(u8, signature) else null,
+            .redacted = optionalBool(object, "redacted") orelse false,
+        } };
+    }
+    if (std.mem.eql(u8, content_type, "toolCall")) {
+        return .{ .tool_call = .{
+            .id = try allocator.dupe(u8, optionalString(object, "id") orelse ""),
+            .name = try allocator.dupe(u8, optionalString(object, "name") orelse ""),
+            .arguments_json = if (object.get("arguments")) |arguments|
+                try jsonValueToStringAlloc(allocator, arguments)
+            else
+                try allocator.dupe(u8, "{}"),
+            .thought_signature = if (optionalString(object, "thoughtSignature")) |signature| try allocator.dupe(u8, signature) else null,
+        } };
+    }
+    return error.InvalidMessageContent;
+}
+
+fn jsonValueToStringAlloc(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    var json: std.json.Stringify = .{ .writer = &output.writer };
+    try json.write(value);
+    return output.toOwnedSlice();
+}
+
+fn parseUsage(value: ?std.json.Value) ai.Usage {
+    const usage_value = value orelse return .{};
+    if (usage_value != .object) return .{};
+    const object = usage_value.object;
+    return .{
+        .input = optionalU64(object, "input") orelse 0,
+        .output = optionalU64(object, "output") orelse 0,
+        .cache_read = optionalU64(object, "cacheRead") orelse 0,
+        .cache_write = optionalU64(object, "cacheWrite") orelse 0,
+        .total_tokens = optionalU64(object, "totalTokens") orelse 0,
+        .cost = parseCost(object.get("cost")),
+    };
+}
+
+fn parseCost(value: ?std.json.Value) ai.Cost {
+    const cost_value = value orelse return .{};
+    if (cost_value != .object) return .{};
+    const object = cost_value.object;
+    return .{
+        .input = optionalF64(object, "input") orelse 0,
+        .output = optionalF64(object, "output") orelse 0,
+        .cache_read = optionalF64(object, "cacheRead") orelse 0,
+        .cache_write = optionalF64(object, "cacheWrite") orelse 0,
+        .total = optionalF64(object, "total") orelse 0,
+    };
+}
+
+fn parseStopReason(value: ?[]const u8) ai.StopReason {
+    const reason = value orelse return .stop;
+    if (std.mem.eql(u8, reason, "length")) return .length;
+    if (std.mem.eql(u8, reason, "toolUse") or std.mem.eql(u8, reason, "tool_use")) return .tool_use;
+    if (std.mem.eql(u8, reason, "error")) return .@"error";
+    if (std.mem.eql(u8, reason, "aborted")) return .aborted;
+    return .stop;
 }
 
 fn assistantModelAlloc(
@@ -2763,10 +3207,51 @@ fn optionalStringDup(
     return try allocator.dupe(u8, value);
 }
 
+fn optionalBool(object: std.json.ObjectMap, key: []const u8) ?bool {
+    const value = object.get(key) orelse return null;
+    return if (value == .bool) value.bool else null;
+}
+
+fn optionalI64(object: std.json.ObjectMap, key: []const u8) ?i64 {
+    return valueToI64(object.get(key));
+}
+
+fn optionalU64(object: std.json.ObjectMap, key: []const u8) ?u64 {
+    return valueToU64(object.get(key));
+}
+
+fn optionalF64(object: std.json.ObjectMap, key: []const u8) ?f64 {
+    return valueToF64(object.get(key));
+}
+
 fn optionalU32(object: std.json.ObjectMap, key: []const u8) ?u32 {
     const value = object.get(key) orelse return null;
     if (value != .integer or value.integer < 0 or value.integer > std.math.maxInt(u32)) return null;
     return @intCast(value.integer);
+}
+
+fn valueToU64(value: ?std.json.Value) ?u64 {
+    const v = value orelse return null;
+    return switch (v) {
+        .integer => |integer| if (integer >= 0) @as(u64, @intCast(integer)) else null,
+        .float => |float| {
+            if (!std.math.isFinite(float) or float < 0 or @floor(float) != float) return null;
+            if (float > @as(f64, @floatFromInt(std.math.maxInt(u64)))) return null;
+            return @intFromFloat(float);
+        },
+        .number_string => |number| std.fmt.parseInt(u64, number, 10) catch null,
+        else => null,
+    };
+}
+
+fn valueToF64(value: ?std.json.Value) ?f64 {
+    const v = value orelse return null;
+    return switch (v) {
+        .integer => |integer| @floatFromInt(integer),
+        .float => |float| if (std.math.isFinite(float)) float else null,
+        .number_string => |number| std.fmt.parseFloat(f64, number) catch null,
+        else => null,
+    };
 }
 
 fn tempDirPathAlloc(allocator: std.mem.Allocator, tmp: *const std.testing.TmpDir) ![]u8 {
@@ -2902,6 +3387,82 @@ fn testAssistantMessageJsonAlloc(allocator: std.mem.Allocator, content: []const 
     try json.write("claude-test");
     try json.endObject();
     return output.toOwnedSlice();
+}
+
+fn testMessageEntryAlloc(
+    allocator: std.mem.Allocator,
+    id: []const u8,
+    parent_id: ?[]const u8,
+    role: MessageRole,
+    content: []const u8,
+    timestamp_ms: i64,
+) !FileEntry {
+    const message_json = switch (role) {
+        .user => try testUserMessageJsonAlloc(allocator, content, timestamp_ms),
+        .assistant => try testAssistantMessageJsonAlloc(allocator, content, timestamp_ms),
+        .other => return error.InvalidMessageRole,
+    };
+    const raw_json = try messageEntryJsonAlloc(allocator, id, parent_id, "2025-01-01T00:00:00Z", message_json);
+    return .{ .raw_json = raw_json, .entry_type = "message", .id = id };
+}
+
+fn testCompactionEntryAlloc(
+    allocator: std.mem.Allocator,
+    id: []const u8,
+    parent_id: ?[]const u8,
+    summary: []const u8,
+    first_kept_entry_id: []const u8,
+) !FileEntry {
+    const raw_json = try compactionEntryJsonAlloc(
+        allocator,
+        id,
+        parent_id,
+        "2025-01-01T00:00:00Z",
+        summary,
+        first_kept_entry_id,
+        1000,
+        null,
+        null,
+    );
+    return .{ .raw_json = raw_json, .entry_type = "compaction", .id = id };
+}
+
+fn testBranchSummaryEntryAlloc(
+    allocator: std.mem.Allocator,
+    id: []const u8,
+    parent_id: ?[]const u8,
+    summary: []const u8,
+    from_id: []const u8,
+) !FileEntry {
+    const raw_json = try branchSummaryEntryJsonAlloc(
+        allocator,
+        id,
+        parent_id,
+        "2025-01-01T00:00:00Z",
+        from_id,
+        summary,
+    );
+    return .{ .raw_json = raw_json, .entry_type = "branch_summary", .id = id };
+}
+
+fn testCustomMessageEntryAlloc(
+    allocator: std.mem.Allocator,
+    id: []const u8,
+    parent_id: ?[]const u8,
+    custom_type: []const u8,
+    content_json: []const u8,
+) !FileEntry {
+    const raw_json = try customMessageEntryJsonAlloc(
+        allocator,
+        id,
+        parent_id,
+        "2025-01-01T00:00:00Z",
+        custom_type,
+        content_json,
+        false,
+        "{\"source\":\"test\"}",
+    );
+    return .{ .raw_json = raw_json, .entry_type = "custom_message", .id = id };
 }
 
 fn createPersistedTestSession(
@@ -3061,6 +3622,46 @@ fn expectMessageRole(
     try std.testing.expect(message == .object);
     const role = optionalString(message.object, "role") orelse return error.MissingRole;
     try std.testing.expectEqualStrings(expected, role);
+}
+
+fn expectContextMessageTag(
+    message: messages_mod.CodingAgentMessage,
+    expected: std.meta.Tag(messages_mod.CodingAgentMessage),
+) !void {
+    try std.testing.expectEqual(expected, std.meta.activeTag(message));
+}
+
+fn expectContextMessageText(
+    message: messages_mod.CodingAgentMessage,
+    expected: []const u8,
+) !void {
+    switch (message) {
+        .user => |user| {
+            try std.testing.expect(user.content.len > 0);
+            switch (user.content[0]) {
+                .text => |text| try std.testing.expectEqualStrings(expected, text.text),
+                else => return error.ExpectedTextContent,
+            }
+        },
+        .assistant => |assistant| {
+            try std.testing.expect(assistant.content.len > 0);
+            switch (assistant.content[0]) {
+                .text => |text| try std.testing.expectEqualStrings(expected, text.text),
+                else => return error.ExpectedTextContent,
+            }
+        },
+        .custom => |custom| switch (custom.content) {
+            .text => |text| try std.testing.expectEqualStrings(expected, text),
+            .parts => |parts| {
+                try std.testing.expect(parts.len > 0);
+                switch (parts[0]) {
+                    .text => |text| try std.testing.expectEqualStrings(expected, text.text),
+                    else => return error.ExpectedTextContent,
+                }
+            },
+        },
+        else => return error.ExpectedTextMessage,
+    }
 }
 
 // Ported from packages/coding-agent/src/core/session-manager.ts default directory helpers.
@@ -4237,13 +4838,14 @@ test "SessionManager buildSessionContext resolves settings summaries and custom 
     try std.testing.expectEqualStrings("anthropic", context.model.?.provider);
     try std.testing.expectEqualStrings("claude-test", context.model.?.model_id);
     try std.testing.expectEqual(@as(usize, 5), context.messages.len);
-    try std.testing.expect(entryTypeEquals(context.messages[0], "compaction"));
-    try expectEntryStringField(allocator, context.messages[0], "summary", "Summary of first two turns");
-    try expectMessageText(allocator, context.messages[1], "second");
-    try std.testing.expect(entryTypeEquals(context.messages[2], "custom_message"));
-    try expectEntryStringField(allocator, context.messages[2], "customType", "visible_context");
-    try expectMessageText(allocator, context.messages[3], "response2");
-    try expectMessageText(allocator, context.messages[4], "third");
+    try expectContextMessageTag(context.messages[0], .compaction_summary);
+    try std.testing.expectEqualStrings("Summary of first two turns", context.messages[0].compaction_summary.summary);
+    try expectContextMessageText(context.messages[1], "second");
+    try expectContextMessageTag(context.messages[2], .custom);
+    try std.testing.expectEqualStrings("visible_context", context.messages[2].custom.custom_type);
+    try expectContextMessageText(context.messages[2], "extension says hi");
+    try expectContextMessageText(context.messages[3], "response2");
+    try expectContextMessageText(context.messages[4], "third");
 }
 
 test "SessionManager buildSessionContext includes branch summaries and follows current branch" {
@@ -4263,18 +4865,207 @@ test "SessionManager buildSessionContext includes branch summaries and follows c
     _ = try session.appendMessageJson(std.testing.io, msg1);
     const response_id = try session.appendMessageJson(std.testing.io, msg2);
     _ = try session.appendMessageJson(std.testing.io, wrong);
-    const summary_id = try session.branchWithSummary(std.testing.io, response_id, "Summary of abandoned work");
+    _ = try session.branchWithSummary(std.testing.io, response_id, "Summary of abandoned work");
     _ = try session.appendMessageJson(std.testing.io, resumed);
 
     var context = try session.buildSessionContextAlloc(allocator);
     defer context.deinit();
     try std.testing.expectEqual(@as(usize, 4), context.messages.len);
-    try expectMessageText(allocator, context.messages[0], "start");
-    try expectMessageText(allocator, context.messages[1], "response");
-    try std.testing.expect(entryTypeEquals(context.messages[2], "branch_summary"));
-    try std.testing.expectEqualStrings(summary_id, context.messages[2].id.?);
-    try expectEntryStringField(allocator, context.messages[2], "summary", "Summary of abandoned work");
-    try expectMessageText(allocator, context.messages[3], "new direction");
+    try expectContextMessageText(context.messages[0], "start");
+    try expectContextMessageText(context.messages[1], "response");
+    try expectContextMessageTag(context.messages[2], .branch_summary);
+    try std.testing.expectEqualStrings(response_id, context.messages[2].branch_summary.from_id);
+    try std.testing.expectEqualStrings("Summary of abandoned work", context.messages[2].branch_summary.summary);
+    try expectContextMessageText(context.messages[3], "new direction");
+}
+
+// Ported from packages/coding-agent/test/session-manager/build-context.test.ts.
+test "buildSessionContextFromEntries handles empty and simple conversations as agent messages" {
+    const allocator = std.testing.allocator;
+
+    var empty = try buildSessionContextFromEntriesAlloc(allocator, &.{}, .last);
+    defer empty.deinit();
+    try std.testing.expectEqual(@as(usize, 0), empty.messages.len);
+    try std.testing.expectEqualStrings("off", empty.thinking_level);
+    try std.testing.expectEqual(null, empty.model);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+    const entries = [_]FileEntry{
+        try testMessageEntryAlloc(arena_allocator, "1", null, .user, "hello", 1),
+        try testMessageEntryAlloc(arena_allocator, "2", "1", .assistant, "hi there", 2),
+        try testMessageEntryAlloc(arena_allocator, "3", "2", .user, "how are you", 3),
+        try testMessageEntryAlloc(arena_allocator, "4", "3", .assistant, "great", 4),
+    };
+
+    var context = try buildSessionContextFromEntriesAlloc(allocator, &entries, .last);
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 4), context.messages.len);
+    try expectContextMessageTag(context.messages[0], .user);
+    try expectContextMessageTag(context.messages[1], .assistant);
+    try expectContextMessageTag(context.messages[2], .user);
+    try expectContextMessageTag(context.messages[3], .assistant);
+    try expectContextMessageText(context.messages[3], "great");
+    try std.testing.expect(context.model != null);
+    try std.testing.expectEqualStrings("anthropic", context.model.?.provider);
+    try std.testing.expectEqualStrings("claude-test", context.model.?.model_id);
+}
+
+test "buildSessionContextFromEntries uses latest compaction and kept message ordering" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    const entries = [_]FileEntry{
+        try testMessageEntryAlloc(arena_allocator, "1", null, .user, "a", 1),
+        try testMessageEntryAlloc(arena_allocator, "2", "1", .assistant, "b", 2),
+        try testCompactionEntryAlloc(arena_allocator, "3", "2", "First summary", "1"),
+        try testMessageEntryAlloc(arena_allocator, "4", "3", .user, "c", 3),
+        try testMessageEntryAlloc(arena_allocator, "5", "4", .assistant, "d", 4),
+        try testCompactionEntryAlloc(arena_allocator, "6", "5", "Second summary", "4"),
+        try testMessageEntryAlloc(arena_allocator, "7", "6", .user, "e", 5),
+    };
+
+    var context = try buildSessionContextFromEntriesAlloc(allocator, &entries, .last);
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 4), context.messages.len);
+    try expectContextMessageTag(context.messages[0], .compaction_summary);
+    try std.testing.expectEqualStrings("Second summary", context.messages[0].compaction_summary.summary);
+    try expectContextMessageText(context.messages[1], "c");
+    try expectContextMessageText(context.messages[2], "d");
+    try expectContextMessageText(context.messages[3], "e");
+}
+
+test "buildSessionContextFromEntries keeps messages from the first compacted entry" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    const entries = [_]FileEntry{
+        try testMessageEntryAlloc(arena_allocator, "1", null, .user, "first", 1),
+        try testMessageEntryAlloc(arena_allocator, "2", "1", .assistant, "response", 2),
+        try testCompactionEntryAlloc(arena_allocator, "3", "2", "Empty summary", "1"),
+        try testMessageEntryAlloc(arena_allocator, "4", "3", .user, "second", 3),
+    };
+
+    var context = try buildSessionContextFromEntriesAlloc(allocator, &entries, .last);
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 4), context.messages.len);
+    try expectContextMessageTag(context.messages[0], .compaction_summary);
+    try std.testing.expectEqualStrings("Empty summary", context.messages[0].compaction_summary.summary);
+    try expectContextMessageText(context.messages[1], "first");
+    try expectContextMessageText(context.messages[2], "response");
+    try expectContextMessageText(context.messages[3], "second");
+}
+
+test "buildSessionContextFromEntries handles complex branch and compaction paths" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    const entries = [_]FileEntry{
+        try testMessageEntryAlloc(arena_allocator, "1", null, .user, "start", 1),
+        try testMessageEntryAlloc(arena_allocator, "2", "1", .assistant, "r1", 2),
+        try testMessageEntryAlloc(arena_allocator, "3", "2", .user, "q2", 3),
+        try testMessageEntryAlloc(arena_allocator, "4", "3", .assistant, "r2", 4),
+        try testCompactionEntryAlloc(arena_allocator, "5", "4", "Compacted history", "3"),
+        try testMessageEntryAlloc(arena_allocator, "6", "5", .user, "q3", 5),
+        try testMessageEntryAlloc(arena_allocator, "7", "6", .assistant, "r3", 6),
+        try testMessageEntryAlloc(arena_allocator, "8", "3", .user, "wrong path", 7),
+        try testMessageEntryAlloc(arena_allocator, "9", "8", .assistant, "wrong response", 8),
+        try testBranchSummaryEntryAlloc(arena_allocator, "10", "3", "Tried wrong approach", "9"),
+        try testMessageEntryAlloc(arena_allocator, "11", "10", .user, "better approach", 9),
+    };
+
+    var main = try buildSessionContextFromEntriesAlloc(allocator, &entries, .{ .id = "7" });
+    defer main.deinit();
+    try std.testing.expectEqual(@as(usize, 5), main.messages.len);
+    try expectContextMessageTag(main.messages[0], .compaction_summary);
+    try std.testing.expectEqualStrings("Compacted history", main.messages[0].compaction_summary.summary);
+    try expectContextMessageText(main.messages[1], "q2");
+    try expectContextMessageText(main.messages[2], "r2");
+    try expectContextMessageText(main.messages[3], "q3");
+    try expectContextMessageText(main.messages[4], "r3");
+
+    var branch = try buildSessionContextFromEntriesAlloc(allocator, &entries, .{ .id = "11" });
+    defer branch.deinit();
+    try std.testing.expectEqual(@as(usize, 5), branch.messages.len);
+    try expectContextMessageText(branch.messages[0], "start");
+    try expectContextMessageText(branch.messages[1], "r1");
+    try expectContextMessageText(branch.messages[2], "q2");
+    try expectContextMessageTag(branch.messages[3], .branch_summary);
+    try std.testing.expectEqualStrings("Tried wrong approach", branch.messages[3].branch_summary.summary);
+    try expectContextMessageText(branch.messages[4], "better approach");
+}
+
+test "buildSessionContextFromEntries follows requested leaves and handles fallback edges" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    const branch_entries = [_]FileEntry{
+        try testMessageEntryAlloc(arena_allocator, "1", null, .user, "start", 1),
+        try testMessageEntryAlloc(arena_allocator, "2", "1", .assistant, "response", 2),
+        try testMessageEntryAlloc(arena_allocator, "3", "2", .user, "branch A", 3),
+        try testMessageEntryAlloc(arena_allocator, "4", "2", .user, "branch B", 4),
+    };
+
+    var branch_a = try buildSessionContextFromEntriesAlloc(allocator, &branch_entries, .{ .id = "3" });
+    defer branch_a.deinit();
+    try std.testing.expectEqual(@as(usize, 3), branch_a.messages.len);
+    try expectContextMessageText(branch_a.messages[2], "branch A");
+
+    var branch_b = try buildSessionContextFromEntriesAlloc(allocator, &branch_entries, .{ .id = "4" });
+    defer branch_b.deinit();
+    try std.testing.expectEqual(@as(usize, 3), branch_b.messages.len);
+    try expectContextMessageText(branch_b.messages[2], "branch B");
+
+    var missing_leaf = try buildSessionContextFromEntriesAlloc(allocator, &branch_entries, .{ .id = "nonexistent" });
+    defer missing_leaf.deinit();
+    try std.testing.expectEqual(@as(usize, 3), missing_leaf.messages.len);
+    try expectContextMessageText(missing_leaf.messages[2], "branch B");
+
+    const orphan_entries = [_]FileEntry{
+        try testMessageEntryAlloc(arena_allocator, "orphan-root", null, .user, "hello", 1),
+        try testMessageEntryAlloc(arena_allocator, "orphan", "missing", .assistant, "orphan", 2),
+    };
+    var orphan = try buildSessionContextFromEntriesAlloc(allocator, &orphan_entries, .{ .id = "orphan" });
+    defer orphan.deinit();
+    try std.testing.expectEqual(@as(usize, 1), orphan.messages.len);
+    try expectContextMessageText(orphan.messages[0], "orphan");
+
+    var before_first = try buildSessionContextFromEntriesAlloc(allocator, &branch_entries, .before_first);
+    defer before_first.deinit();
+    try std.testing.expectEqual(@as(usize, 0), before_first.messages.len);
+}
+
+test "buildSessionContextFromEntries converts branch summaries and custom messages" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    const entries = [_]FileEntry{
+        try testMessageEntryAlloc(arena_allocator, "1", null, .user, "start", 1),
+        try testBranchSummaryEntryAlloc(arena_allocator, "2", "1", "Tried wrong approach", "abandoned"),
+        try testCustomMessageEntryAlloc(arena_allocator, "3", "2", "extension-note", "\"extension says hi\""),
+    };
+
+    var context = try buildSessionContextFromEntriesAlloc(allocator, &entries, .last);
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 3), context.messages.len);
+    try expectContextMessageText(context.messages[0], "start");
+    try expectContextMessageTag(context.messages[1], .branch_summary);
+    try std.testing.expectEqualStrings("Tried wrong approach", context.messages[1].branch_summary.summary);
+    try std.testing.expectEqualStrings("abandoned", context.messages[1].branch_summary.from_id);
+    try expectContextMessageTag(context.messages[2], .custom);
+    try std.testing.expectEqualStrings("extension-note", context.messages[2].custom.custom_type);
+    try expectContextMessageText(context.messages[2], "extension says hi");
 }
 
 test "SessionManager createBranchedSession extracts selected path in memory" {
@@ -4387,8 +5178,8 @@ test "SessionManager appendCustomEntryJson saves custom entries and skips them i
     var context = try session.buildSessionContextAlloc(allocator);
     defer context.deinit();
     try std.testing.expectEqual(@as(usize, 2), context.messages.len);
-    try std.testing.expect(entryTypeEquals(context.messages[0], "message"));
-    try std.testing.expect(entryTypeEquals(context.messages[1], "message"));
+    try expectContextMessageTag(context.messages[0], .user);
+    try expectContextMessageTag(context.messages[1], .assistant);
 }
 
 // Ported from packages/coding-agent/test/session-manager/labels.test.ts.
