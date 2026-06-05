@@ -239,6 +239,12 @@ pub const SessionManager = struct {
         var loaded = try loadEntriesFromFile(allocator, io, resolved_path);
         var loaded_released = false;
         errdefer if (!loaded_released) loaded.deinit();
+        var migrated = false;
+        if (try migrateToCurrentVersionAlloc(allocator, io, loaded.entries)) |migrated_entries| {
+            loaded.deinit();
+            loaded = migrated_entries;
+            migrated = true;
+        }
         const header = loaded.header orelse {
             loaded_released = true;
             loaded.deinit();
@@ -279,6 +285,9 @@ pub const SessionManager = struct {
             .leaf_id = findLeafId(loaded.entries),
         };
         loaded_released = true;
+        if (migrated) {
+            try manager.rewriteFile(io);
+        }
         return manager;
     }
 
@@ -2478,6 +2487,213 @@ pub fn loadEntriesFromFile(
     };
 }
 
+/// Exported for tests and compaction fixture translation, matching Pi's migration helper.
+pub fn migrateSessionEntriesAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    entries: []const FileEntry,
+) !LoadedEntries {
+    if (try migrateToCurrentVersionAlloc(allocator, io, entries)) |migrated| {
+        return migrated;
+    }
+    return cloneLoadedEntriesAlloc(allocator, entries);
+}
+
+fn migrateToCurrentVersionAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    entries: []const FileEntry,
+) !?LoadedEntries {
+    if (entries.len == 0) return null;
+    const version = (try sessionVersionAlloc(allocator, entries)) orelse 1;
+    if (version >= current_session_version) return null;
+    return try migrateEntriesToCurrentVersionAlloc(allocator, io, entries, version);
+}
+
+fn migrateEntriesToCurrentVersionAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    entries: []const FileEntry,
+    source_version: u32,
+) !LoadedEntries {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    const generated_ids = try arena_allocator.alloc(?[]const u8, entries.len);
+    const parent_ids = try arena_allocator.alloc(?[]const u8, entries.len);
+    @memset(generated_ids, null);
+    @memset(parent_ids, null);
+
+    if (source_version < 2) {
+        var previous_id: ?[]const u8 = null;
+        for (entries, 0..) |entry, index| {
+            if (entryTypeEquals(entry, "session")) continue;
+            const id = try generateMigrationEntryIdAlloc(arena_allocator, io, generated_ids[0..index]);
+            generated_ids[index] = id;
+            parent_ids[index] = previous_id;
+            previous_id = id;
+        }
+    }
+
+    const migrated_entries = try arena_allocator.alloc(FileEntry, entries.len);
+    for (entries, 0..) |entry, index| {
+        var value = std.json.parseFromSliceLeaky(std.json.Value, arena_allocator, entry.raw_json, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => {
+                migrated_entries[index] = try cloneFileEntry(arena_allocator, entry);
+                continue;
+            },
+        };
+
+        if (value == .object) {
+            const object = &value.object;
+            const entry_type = optionalString(object.*, "type");
+            if (entry_type) |kind| {
+                if (std.mem.eql(u8, kind, "session")) {
+                    try object.put(arena_allocator, "version", .{ .integer = @intCast(current_session_version) });
+                } else {
+                    if (source_version < 2) {
+                        if (generated_ids[index]) |id| {
+                            try object.put(arena_allocator, "id", .{ .string = id });
+                        }
+                        const parent_value: std.json.Value = if (parent_ids[index]) |parent|
+                            .{ .string = parent }
+                        else
+                            .null;
+                        try object.put(arena_allocator, "parentId", parent_value);
+                    }
+
+                    if (source_version < 2 and std.mem.eql(u8, kind, "compaction")) {
+                        if (object.get("firstKeptEntryIndex")) |index_value| {
+                            if (index_value == .integer and index_value.integer >= 0) {
+                                const target_index: usize = @intCast(index_value.integer);
+                                if (target_index < generated_ids.len) {
+                                    if (generated_ids[target_index]) |target_id| {
+                                        try object.put(arena_allocator, "firstKeptEntryId", .{ .string = target_id });
+                                    }
+                                }
+                            }
+                        }
+                        _ = object.orderedRemove("firstKeptEntryIndex");
+                    }
+
+                    if (source_version < 3 and std.mem.eql(u8, kind, "message")) {
+                        if (object.getPtr("message")) |message_value| {
+                            if (message_value.* == .object) {
+                                if (message_value.object.getPtr("role")) |role_value| {
+                                    if (role_value.* == .string and std.mem.eql(u8, role_value.string, "hookMessage")) {
+                                        role_value.* = .{ .string = "custom" };
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        migrated_entries[index] = try fileEntryFromJsonValueAlloc(arena_allocator, value);
+    }
+
+    return .{
+        .arena = arena,
+        .entries = migrated_entries,
+        .header = try headerFromEntriesAlloc(arena_allocator, allocator, migrated_entries),
+    };
+}
+
+fn cloneLoadedEntriesAlloc(
+    allocator: std.mem.Allocator,
+    entries: []const FileEntry,
+) !LoadedEntries {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const arena_allocator = arena.allocator();
+    const cloned_entries = try arena_allocator.alloc(FileEntry, entries.len);
+    for (entries, 0..) |entry, index| {
+        cloned_entries[index] = try cloneFileEntry(arena_allocator, entry);
+    }
+    return .{
+        .arena = arena,
+        .entries = cloned_entries,
+        .header = try headerFromEntriesAlloc(arena_allocator, allocator, cloned_entries),
+    };
+}
+
+fn sessionVersionAlloc(
+    scratch_allocator: std.mem.Allocator,
+    entries: []const FileEntry,
+) !?u32 {
+    for (entries) |entry| {
+        if (!entryTypeEquals(entry, "session")) continue;
+        var parsed = std.json.parseFromSlice(std.json.Value, scratch_allocator, entry.raw_json, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        defer parsed.deinit();
+        if (parsed.value != .object) return null;
+        return optionalU32(parsed.value.object, "version");
+    }
+    return null;
+}
+
+fn headerFromEntriesAlloc(
+    output_allocator: std.mem.Allocator,
+    scratch_allocator: std.mem.Allocator,
+    entries: []const FileEntry,
+) !?SessionHeader {
+    for (entries) |entry| {
+        if (entryTypeEquals(entry, "session")) {
+            return try parseHeaderFromRaw(output_allocator, scratch_allocator, entry.raw_json);
+        }
+    }
+    return null;
+}
+
+fn fileEntryFromJsonValueAlloc(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+) !FileEntry {
+    const raw_json = try std.json.Stringify.valueAlloc(allocator, value, .{});
+    if (value != .object) {
+        return .{
+            .raw_json = raw_json,
+            .entry_type = null,
+            .id = null,
+        };
+    }
+    return .{
+        .raw_json = raw_json,
+        .entry_type = try optionalStringDup(allocator, value.object, "type"),
+        .id = try optionalStringDup(allocator, value.object, "id"),
+    };
+}
+
+fn generateMigrationEntryIdAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    generated_ids: []const ?[]const u8,
+) ![]u8 {
+    for (0..100) |_| {
+        const uuid = agent.uuid.uuidv7(io);
+        const encoded = uuid[24..32];
+        if (!migrationIdExists(generated_ids, encoded)) {
+            return allocator.dupe(u8, encoded);
+        }
+    }
+    return error.EntryIdCollision;
+}
+
+fn migrationIdExists(generated_ids: []const ?[]const u8, id: []const u8) bool {
+    for (generated_ids) |maybe_id| {
+        if (maybe_id) |existing| {
+            if (std.mem.eql(u8, existing, id)) return true;
+        }
+    }
+    return false;
+}
+
 fn parseEntryLine(
     output_allocator: std.mem.Allocator,
     scratch_allocator: std.mem.Allocator,
@@ -2833,6 +3049,20 @@ fn expectMessageText(
     try std.testing.expectEqualStrings(expected, text);
 }
 
+fn expectMessageRole(
+    allocator: std.mem.Allocator,
+    entry: FileEntry,
+    expected: []const u8,
+) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, entry.raw_json, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+    const message = parsed.value.object.get("message") orelse return error.MissingMessage;
+    try std.testing.expect(message == .object);
+    const role = optionalString(message.object, "role") orelse return error.MissingRole;
+    try std.testing.expectEqualStrings(expected, role);
+}
+
 // Ported from packages/coding-agent/src/core/session-manager.ts default directory helpers.
 test "default session directories use Bulb agent dir and Pi-compatible cwd encoding" {
     const allocator = std.testing.allocator;
@@ -3085,6 +3315,110 @@ test "SessionManager forkFrom generates and accepts custom ids" {
     try std.testing.expectEqualStrings("forked-session-id", custom.getHeader().?.id);
     try std.testing.expectEqualStrings(source_path, custom.getHeader().?.parent_session.?);
     try expectTimestampedSessionBasename(custom.getSessionFile().?, "forked-session-id");
+}
+
+// Ported from packages/coding-agent/test/session-manager/migration.test.ts.
+test "migrateSessionEntries adds id parentId and current version to v1 entries" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tempDirPathAlloc(allocator, &tmp);
+    defer allocator.free(tmp_path);
+    const path = try std.fs.path.join(allocator, &.{ tmp_path, "v1.jsonl" });
+    defer allocator.free(path);
+
+    const data =
+        "{\"type\":\"session\",\"id\":\"sess-1\",\"timestamp\":\"2025-01-01T00:00:00Z\",\"cwd\":\"/tmp\"}\n" ++
+        "{\"type\":\"message\",\"timestamp\":\"2025-01-01T00:00:01Z\",\"message\":{\"role\":\"user\",\"content\":\"hi\",\"timestamp\":1}}\n" ++
+        "{\"type\":\"message\",\"timestamp\":\"2025-01-01T00:00:02Z\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"hello\"}],\"api\":\"test\",\"provider\":\"test\",\"model\":\"test\",\"usage\":{\"input\":1,\"output\":1,\"cacheRead\":0,\"cacheWrite\":0},\"stopReason\":\"stop\",\"timestamp\":2}}\n";
+    try writeAbsoluteFile(std.testing.io, path, data);
+
+    var loaded = try loadEntriesFromFile(allocator, std.testing.io, path);
+    defer loaded.deinit();
+    var migrated = try migrateSessionEntriesAlloc(allocator, std.testing.io, loaded.entries);
+    defer migrated.deinit();
+
+    try std.testing.expectEqual(current_session_version, migrated.header.?.version.?);
+    const msg1 = migrated.entries[1];
+    const msg2 = migrated.entries[2];
+    try std.testing.expect(msg1.id != null);
+    try std.testing.expectEqual(@as(usize, 8), msg1.id.?.len);
+    try expectEntryParent(allocator, msg1, null);
+    try std.testing.expect(msg2.id != null);
+    try std.testing.expectEqual(@as(usize, 8), msg2.id.?.len);
+    try expectEntryParent(allocator, msg2, msg1.id.?);
+}
+
+test "migrateSessionEntries preserves v2 ids and parent chains" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tempDirPathAlloc(allocator, &tmp);
+    defer allocator.free(tmp_path);
+    const path = try std.fs.path.join(allocator, &.{ tmp_path, "v2.jsonl" });
+    defer allocator.free(path);
+
+    const data =
+        "{\"type\":\"session\",\"id\":\"sess-1\",\"version\":2,\"timestamp\":\"2025-01-01T00:00:00Z\",\"cwd\":\"/tmp\"}\n" ++
+        "{\"type\":\"message\",\"id\":\"abc12345\",\"parentId\":null,\"timestamp\":\"2025-01-01T00:00:01Z\",\"message\":{\"role\":\"user\",\"content\":\"hi\",\"timestamp\":1}}\n" ++
+        "{\"type\":\"message\",\"id\":\"def67890\",\"parentId\":\"abc12345\",\"timestamp\":\"2025-01-01T00:00:02Z\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"hello\"}],\"api\":\"test\",\"provider\":\"test\",\"model\":\"test\",\"usage\":{\"input\":1,\"output\":1,\"cacheRead\":0,\"cacheWrite\":0},\"stopReason\":\"stop\",\"timestamp\":2}}\n";
+    try writeAbsoluteFile(std.testing.io, path, data);
+
+    var loaded = try loadEntriesFromFile(allocator, std.testing.io, path);
+    defer loaded.deinit();
+    var migrated = try migrateSessionEntriesAlloc(allocator, std.testing.io, loaded.entries);
+    defer migrated.deinit();
+
+    try std.testing.expectEqual(current_session_version, migrated.header.?.version.?);
+    try std.testing.expectEqualStrings("abc12345", migrated.entries[1].id.?);
+    try std.testing.expectEqualStrings("def67890", migrated.entries[2].id.?);
+    try expectEntryParent(allocator, migrated.entries[2], "abc12345");
+}
+
+test "migrateSessionEntries converts compaction indexes and hook messages" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tempDirPathAlloc(allocator, &tmp);
+    defer allocator.free(tmp_path);
+
+    {
+        const path = try std.fs.path.join(allocator, &.{ tmp_path, "v1-compaction.jsonl" });
+        defer allocator.free(path);
+        const data =
+            "{\"type\":\"session\",\"id\":\"sess-1\",\"timestamp\":\"2025-01-01T00:00:00Z\",\"cwd\":\"/tmp\"}\n" ++
+            "{\"type\":\"message\",\"timestamp\":\"2025-01-01T00:00:01Z\",\"message\":{\"role\":\"user\",\"content\":\"before\",\"timestamp\":1}}\n" ++
+            "{\"type\":\"message\",\"timestamp\":\"2025-01-01T00:00:02Z\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"kept\"}],\"timestamp\":2}}\n" ++
+            "{\"type\":\"compaction\",\"timestamp\":\"2025-01-01T00:00:03Z\",\"summary\":\"summary\",\"firstKeptEntryIndex\":2,\"tokensBefore\":10}\n";
+        try writeAbsoluteFile(std.testing.io, path, data);
+
+        var loaded = try loadEntriesFromFile(allocator, std.testing.io, path);
+        defer loaded.deinit();
+        var migrated = try migrateSessionEntriesAlloc(allocator, std.testing.io, loaded.entries);
+        defer migrated.deinit();
+
+        try expectEntryStringField(allocator, migrated.entries[3], "firstKeptEntryId", migrated.entries[2].id.?);
+        var compaction = try std.json.parseFromSlice(std.json.Value, allocator, migrated.entries[3].raw_json, .{});
+        defer compaction.deinit();
+        try std.testing.expect(compaction.value == .object);
+        try std.testing.expectEqual(null, compaction.value.object.get("firstKeptEntryIndex"));
+    }
+
+    {
+        const path = try std.fs.path.join(allocator, &.{ tmp_path, "v2-hook-message.jsonl" });
+        defer allocator.free(path);
+        const data =
+            "{\"type\":\"session\",\"id\":\"sess-2\",\"version\":2,\"timestamp\":\"2025-01-01T00:00:00Z\",\"cwd\":\"/tmp\"}\n" ++
+            "{\"type\":\"message\",\"id\":\"abc12345\",\"parentId\":null,\"timestamp\":\"2025-01-01T00:00:01Z\",\"message\":{\"role\":\"hookMessage\",\"content\":\"extension output\",\"timestamp\":1}}\n";
+        try writeAbsoluteFile(std.testing.io, path, data);
+
+        var loaded = try loadEntriesFromFile(allocator, std.testing.io, path);
+        defer loaded.deinit();
+        var migrated = try migrateSessionEntriesAlloc(allocator, std.testing.io, loaded.entries);
+        defer migrated.deinit();
+
+        try expectMessageRole(allocator, migrated.entries[1], "custom");
+    }
 }
 
 // Ported from packages/coding-agent/test/session-manager/file-operations.test.ts.
