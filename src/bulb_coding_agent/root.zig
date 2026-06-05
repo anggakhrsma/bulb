@@ -12,6 +12,7 @@ pub const auth_storage = @import("auth_storage.zig");
 pub const ansi = @import("ansi.zig");
 pub const frontmatter = @import("frontmatter.zig");
 pub const git = @import("git.zig");
+pub const initial_message = @import("initial_message.zig");
 pub const interactive_mode = @import("interactive_mode.zig");
 pub const json = @import("json.zig");
 pub const keybindings = @import("keybindings.zig");
@@ -46,6 +47,7 @@ test {
     _ = @import("ansi.zig");
     _ = @import("frontmatter.zig");
     _ = @import("git.zig");
+    _ = @import("initial_message.zig");
     _ = @import("interactive_mode.zig");
     _ = @import("json.zig");
     _ = @import("keybindings.zig");
