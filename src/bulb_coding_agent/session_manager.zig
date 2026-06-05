@@ -409,6 +409,27 @@ pub const SessionManager = struct {
         return null;
     }
 
+    pub fn getChildrenAlloc(
+        self: *const SessionManager,
+        allocator: std.mem.Allocator,
+        parent_id: []const u8,
+    ) ![]FileEntry {
+        var children: std.ArrayList(FileEntry) = .empty;
+        errdefer children.deinit(allocator);
+
+        for (self.getEntries()) |entry| {
+            const entry_parent_id = try entryParentIdAlloc(allocator, entry.raw_json);
+            defer if (entry_parent_id) |id| allocator.free(id);
+            if (entry_parent_id) |id| {
+                if (std.mem.eql(u8, id, parent_id)) {
+                    try children.append(allocator, entry);
+                }
+            }
+        }
+
+        return children.toOwnedSlice(allocator);
+    }
+
     pub fn getBranchAlloc(
         self: *const SessionManager,
         allocator: std.mem.Allocator,
@@ -943,6 +964,13 @@ pub const SessionManager = struct {
             roots[root_index] = &nodes[index];
             root_index += 1;
         }
+
+        const sort_timestamps = try scratch_allocator.alloc(?i64, entries.len);
+        defer scratch_allocator.free(sort_timestamps);
+        for (entries, 0..) |entry, index| {
+            sort_timestamps[index] = try entryTimestampMsAlloc(scratch_allocator, entry.raw_json);
+        }
+        try sortTreeChildrenByTimestamp(scratch_allocator, nodes, sort_timestamps, roots);
 
         return .{
             .arena = arena,
@@ -2257,6 +2285,58 @@ fn entryStringFieldAlloc(allocator: std.mem.Allocator, raw_json: []const u8, fie
     defer parsed.deinit();
     if (parsed.value != .object) return null;
     return optionalStringDup(allocator, parsed.value.object, field);
+}
+
+fn entryTimestampMsAlloc(allocator: std.mem.Allocator, raw_json: []const u8) !?i64 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw_json, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return null,
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const timestamp = optionalString(parsed.value.object, "timestamp") orelse return null;
+    return messages_mod.parseTimestampMs(timestamp) catch null;
+}
+
+const TreeTimestampSortContext = struct {
+    nodes: []SessionTreeNode,
+    timestamps: []const ?i64,
+
+    fn indexOf(self: TreeTimestampSortContext, node: *const SessionTreeNode) usize {
+        const base = @intFromPtr(self.nodes.ptr);
+        const current = @intFromPtr(node);
+        return @divExact(current - base, @sizeOf(SessionTreeNode));
+    }
+};
+
+fn treeNodeTimestampLessThan(
+    context: TreeTimestampSortContext,
+    left: *SessionTreeNode,
+    right: *SessionTreeNode,
+) bool {
+    const left_timestamp = context.timestamps[context.indexOf(left)] orelse return false;
+    const right_timestamp = context.timestamps[context.indexOf(right)] orelse return false;
+    return left_timestamp < right_timestamp;
+}
+
+fn sortTreeChildrenByTimestamp(
+    allocator: std.mem.Allocator,
+    nodes: []SessionTreeNode,
+    timestamps: []const ?i64,
+    roots: []*SessionTreeNode,
+) !void {
+    const context: TreeTimestampSortContext = .{
+        .nodes = nodes,
+        .timestamps = timestamps,
+    };
+    var stack: std.ArrayList(*SessionTreeNode) = .empty;
+    defer stack.deinit(allocator);
+    try stack.appendSlice(allocator, roots);
+
+    while (stack.pop()) |node| {
+        std.sort.insertion(*SessionTreeNode, node.children, context, treeNodeTimestampLessThan);
+        try stack.appendSlice(allocator, node.children);
+    }
 }
 
 pub fn isValidSessionId(id: []const u8) bool {
@@ -3575,6 +3655,108 @@ test "SessionManager branches update leaf and parent chains" {
     try std.testing.expectEqualStrings(id2, original_branch[1].id.?);
 
     try std.testing.expectError(error.EntryNotFound, session.branch("nonexistent"));
+}
+
+test "SessionManager getChildren and getTree expose branch structure" {
+    const allocator = std.testing.allocator;
+    var session = try SessionManager.inMemory(allocator, std.testing.io, null);
+    defer session.deinit();
+
+    const root_json = try testUserMessageJsonAlloc(allocator, "root", 1);
+    defer allocator.free(root_json);
+    const response_json = try testAssistantMessageJsonAlloc(allocator, "response", 2);
+    defer allocator.free(response_json);
+    const main_json = try testUserMessageJsonAlloc(allocator, "main", 3);
+    defer allocator.free(main_json);
+    const branch_a_json = try testUserMessageJsonAlloc(allocator, "branch-A", 4);
+    defer allocator.free(branch_a_json);
+    const branch_b_json = try testUserMessageJsonAlloc(allocator, "branch-B", 5);
+    defer allocator.free(branch_b_json);
+    const branch_c_json = try testUserMessageJsonAlloc(allocator, "branch-C", 6);
+    defer allocator.free(branch_c_json);
+
+    const root_id = try session.appendMessageJson(std.testing.io, root_json);
+    const response_id = try session.appendMessageJson(std.testing.io, response_json);
+    const main_id = try session.appendMessageJson(std.testing.io, main_json);
+
+    try session.branch(response_id);
+    const branch_a_id = try session.appendMessageJson(std.testing.io, branch_a_json);
+    try session.branch(response_id);
+    const branch_b_id = try session.appendMessageJson(std.testing.io, branch_b_json);
+    try session.branch(response_id);
+    const branch_c_id = try session.appendMessageJson(std.testing.io, branch_c_json);
+
+    const response_children = try session.getChildrenAlloc(allocator, response_id);
+    defer allocator.free(response_children);
+    try std.testing.expectEqual(@as(usize, 4), response_children.len);
+    try std.testing.expectEqualStrings(main_id, response_children[0].id.?);
+    try std.testing.expectEqualStrings(branch_a_id, response_children[1].id.?);
+    try std.testing.expectEqualStrings(branch_b_id, response_children[2].id.?);
+    try std.testing.expectEqualStrings(branch_c_id, response_children[3].id.?);
+
+    const missing_children = try session.getChildrenAlloc(allocator, "nonexistent");
+    defer allocator.free(missing_children);
+    try std.testing.expectEqual(@as(usize, 0), missing_children.len);
+
+    var tree = try session.getTreeAlloc(allocator);
+    defer tree.deinit();
+    try std.testing.expectEqual(@as(usize, 1), tree.roots.len);
+    try std.testing.expectEqualStrings(root_id, tree.roots[0].entry.id.?);
+    try std.testing.expectEqual(@as(usize, 1), tree.roots[0].children.len);
+
+    const response_node = tree.roots[0].children[0];
+    try std.testing.expectEqualStrings(response_id, response_node.entry.id.?);
+    try std.testing.expectEqual(@as(usize, 4), response_node.children.len);
+    try std.testing.expectEqualStrings(main_id, response_node.children[0].entry.id.?);
+    try std.testing.expectEqualStrings(branch_a_id, response_node.children[1].entry.id.?);
+    try std.testing.expectEqualStrings(branch_b_id, response_node.children[2].entry.id.?);
+    try std.testing.expectEqualStrings(branch_c_id, response_node.children[3].entry.id.?);
+}
+
+test "SessionManager getTree handles deep branches and sorts siblings by timestamp" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tempDirPathAlloc(allocator, &tmp);
+    defer allocator.free(tmp_path);
+    const session_path = try std.fs.path.join(allocator, &.{ tmp_path, "tree-sort.jsonl" });
+    defer allocator.free(session_path);
+
+    const data = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"session\",\"version\":3,\"id\":\"tree-sort\",\"timestamp\":\"2025-01-01T00:00:00.000Z\",\"cwd\":\"{s}\"}}\n" ++
+            "{{\"type\":\"message\",\"id\":\"1\",\"parentId\":null,\"timestamp\":\"2025-01-01T00:00:00.000Z\",\"message\":{{\"role\":\"user\",\"content\":\"1\",\"timestamp\":1}}}}\n" ++
+            "{{\"type\":\"message\",\"id\":\"2\",\"parentId\":\"1\",\"timestamp\":\"2025-01-01T00:00:01.000Z\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"2\"}}],\"timestamp\":2}}}}\n" ++
+            "{{\"type\":\"message\",\"id\":\"5\",\"parentId\":\"2\",\"timestamp\":\"2025-01-01T00:00:05.000Z\",\"message\":{{\"role\":\"user\",\"content\":\"5\",\"timestamp\":5}}}}\n" ++
+            "{{\"type\":\"message\",\"id\":\"3\",\"parentId\":\"2\",\"timestamp\":\"2025-01-01T00:00:03.000Z\",\"message\":{{\"role\":\"user\",\"content\":\"3\",\"timestamp\":3}}}}\n" ++
+            "{{\"type\":\"message\",\"id\":\"7\",\"parentId\":\"5\",\"timestamp\":\"2025-01-01T00:00:07.000Z\",\"message\":{{\"role\":\"user\",\"content\":\"7\",\"timestamp\":7}}}}\n" ++
+            "{{\"type\":\"message\",\"id\":\"6\",\"parentId\":\"5\",\"timestamp\":\"2025-01-01T00:00:06.000Z\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"6\"}}],\"timestamp\":6}}}}\n" ++
+            "{{\"type\":\"message\",\"id\":\"4\",\"parentId\":\"3\",\"timestamp\":\"2025-01-01T00:00:04.000Z\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"4\"}}],\"timestamp\":4}}}}\n",
+        .{tmp_path},
+    );
+    defer allocator.free(data);
+    try writeAbsoluteFile(std.testing.io, session_path, data);
+
+    var session = try SessionManager.open(allocator, std.testing.io, session_path, .{});
+    defer session.deinit();
+    var tree = try session.getTreeAlloc(allocator);
+    defer tree.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), tree.roots.len);
+    const node2 = tree.roots[0].children[0];
+    try std.testing.expectEqualStrings("2", node2.entry.id.?);
+    try std.testing.expectEqual(@as(usize, 2), node2.children.len);
+    try std.testing.expectEqualStrings("3", node2.children[0].entry.id.?);
+    try std.testing.expectEqualStrings("5", node2.children[1].entry.id.?);
+
+    const node3 = node2.children[0];
+    try std.testing.expectEqual(@as(usize, 1), node3.children.len);
+    try std.testing.expectEqualStrings("4", node3.children[0].entry.id.?);
+
+    const node5 = node2.children[1];
+    try std.testing.expectEqual(@as(usize, 2), node5.children.len);
+    try std.testing.expectEqualStrings("6", node5.children[0].entry.id.?);
+    try std.testing.expectEqualStrings("7", node5.children[1].entry.id.?);
 }
 
 test "SessionManager branchWithSummary appends summary under branch point" {
