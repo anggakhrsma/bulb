@@ -47,9 +47,16 @@ pub const SessionTree = struct {
     }
 };
 
+pub const SessionContextModel = struct {
+    provider: []const u8,
+    model_id: []const u8,
+};
+
 pub const SessionContext = struct {
     arena: std.heap.ArenaAllocator,
     messages: []FileEntry,
+    thinking_level: []const u8 = "off",
+    model: ?SessionContextModel = null,
 
     pub fn deinit(self: *SessionContext) void {
         self.arena.deinit();
@@ -564,6 +571,163 @@ pub const SessionManager = struct {
         return entry_id;
     }
 
+    pub fn appendThinkingLevelChange(
+        self: *SessionManager,
+        io: std.Io,
+        thinking_level: []const u8,
+    ) ![]const u8 {
+        const arena_allocator = self.arena.allocator();
+        const entry_id = try generateEntryIdAlloc(arena_allocator, io, self.file_entries);
+        errdefer arena_allocator.free(entry_id);
+        const timestamp = try isoTimestampAlloc(
+            arena_allocator,
+            std.Io.Clock.real.now(io).toMilliseconds(),
+        );
+        errdefer arena_allocator.free(timestamp);
+        const raw_json = try thinkingLevelEntryJsonAlloc(arena_allocator, entry_id, self.leaf_id, timestamp, thinking_level);
+        errdefer arena_allocator.free(raw_json);
+        const grown = try arena_allocator.alloc(FileEntry, self.file_entries.len + 1);
+        @memcpy(grown[0..self.file_entries.len], self.file_entries);
+        grown[self.file_entries.len] = .{
+            .raw_json = raw_json,
+            .entry_type = "thinking_level_change",
+            .id = entry_id,
+        };
+        self.file_entries = grown;
+        self.leaf_id = entry_id;
+        try self.persistEntry(io, raw_json);
+        return entry_id;
+    }
+
+    pub fn appendModelChange(
+        self: *SessionManager,
+        io: std.Io,
+        provider: []const u8,
+        model_id: []const u8,
+    ) ![]const u8 {
+        const arena_allocator = self.arena.allocator();
+        const entry_id = try generateEntryIdAlloc(arena_allocator, io, self.file_entries);
+        errdefer arena_allocator.free(entry_id);
+        const timestamp = try isoTimestampAlloc(
+            arena_allocator,
+            std.Io.Clock.real.now(io).toMilliseconds(),
+        );
+        errdefer arena_allocator.free(timestamp);
+        const raw_json = try modelChangeEntryJsonAlloc(arena_allocator, entry_id, self.leaf_id, timestamp, provider, model_id);
+        errdefer arena_allocator.free(raw_json);
+        const grown = try arena_allocator.alloc(FileEntry, self.file_entries.len + 1);
+        @memcpy(grown[0..self.file_entries.len], self.file_entries);
+        grown[self.file_entries.len] = .{
+            .raw_json = raw_json,
+            .entry_type = "model_change",
+            .id = entry_id,
+        };
+        self.file_entries = grown;
+        self.leaf_id = entry_id;
+        try self.persistEntry(io, raw_json);
+        return entry_id;
+    }
+
+    pub fn appendCompactionJson(
+        self: *SessionManager,
+        io: std.Io,
+        summary: []const u8,
+        first_kept_entry_id: []const u8,
+        tokens_before: u64,
+        details_json: ?[]const u8,
+        from_hook: ?bool,
+    ) ![]const u8 {
+        if (details_json) |details| {
+            var parsed = try std.json.parseFromSlice(std.json.Value, self.arena.child_allocator, details, .{});
+            defer parsed.deinit();
+        }
+
+        const arena_allocator = self.arena.allocator();
+        const entry_id = try generateEntryIdAlloc(arena_allocator, io, self.file_entries);
+        errdefer arena_allocator.free(entry_id);
+        const timestamp = try isoTimestampAlloc(
+            arena_allocator,
+            std.Io.Clock.real.now(io).toMilliseconds(),
+        );
+        errdefer arena_allocator.free(timestamp);
+        const raw_json = try compactionEntryJsonAlloc(
+            arena_allocator,
+            entry_id,
+            self.leaf_id,
+            timestamp,
+            summary,
+            first_kept_entry_id,
+            tokens_before,
+            details_json,
+            from_hook,
+        );
+        errdefer arena_allocator.free(raw_json);
+        const grown = try arena_allocator.alloc(FileEntry, self.file_entries.len + 1);
+        @memcpy(grown[0..self.file_entries.len], self.file_entries);
+        grown[self.file_entries.len] = .{
+            .raw_json = raw_json,
+            .entry_type = "compaction",
+            .id = entry_id,
+        };
+        self.file_entries = grown;
+        self.leaf_id = entry_id;
+        try self.persistEntry(io, raw_json);
+        return entry_id;
+    }
+
+    pub fn appendCustomMessageEntryJson(
+        self: *SessionManager,
+        io: std.Io,
+        custom_type: []const u8,
+        content_json: []const u8,
+        display: bool,
+        details_json: ?[]const u8,
+    ) ![]const u8 {
+        {
+            var parsed = try std.json.parseFromSlice(std.json.Value, self.arena.child_allocator, content_json, .{});
+            defer parsed.deinit();
+            switch (parsed.value) {
+                .string, .array => {},
+                else => return error.InvalidCustomMessageContent,
+            }
+        }
+        if (details_json) |details| {
+            var parsed = try std.json.parseFromSlice(std.json.Value, self.arena.child_allocator, details, .{});
+            defer parsed.deinit();
+        }
+
+        const arena_allocator = self.arena.allocator();
+        const entry_id = try generateEntryIdAlloc(arena_allocator, io, self.file_entries);
+        errdefer arena_allocator.free(entry_id);
+        const timestamp = try isoTimestampAlloc(
+            arena_allocator,
+            std.Io.Clock.real.now(io).toMilliseconds(),
+        );
+        errdefer arena_allocator.free(timestamp);
+        const raw_json = try customMessageEntryJsonAlloc(
+            arena_allocator,
+            entry_id,
+            self.leaf_id,
+            timestamp,
+            custom_type,
+            content_json,
+            display,
+            details_json,
+        );
+        errdefer arena_allocator.free(raw_json);
+        const grown = try arena_allocator.alloc(FileEntry, self.file_entries.len + 1);
+        @memcpy(grown[0..self.file_entries.len], self.file_entries);
+        grown[self.file_entries.len] = .{
+            .raw_json = raw_json,
+            .entry_type = "custom_message",
+            .id = entry_id,
+        };
+        self.file_entries = grown;
+        self.leaf_id = entry_id;
+        try self.persistEntry(io, raw_json);
+        return entry_id;
+    }
+
     pub fn appendLabelChange(
         self: *SessionManager,
         io: std.Io,
@@ -652,15 +816,60 @@ pub const SessionManager = struct {
         const arena_allocator = arena.allocator();
 
         const branch_entries = try self.getBranchAlloc(arena_allocator, null);
+        var thinking_level: []const u8 = "off";
+        var model: ?SessionContextModel = null;
+        var compaction_index: ?usize = null;
+        for (branch_entries, 0..) |entry, index| {
+            if (entryTypeEquals(entry, "thinking_level_change")) {
+                thinking_level = (try entryStringFieldAlloc(arena_allocator, entry.raw_json, "thinkingLevel")) orelse "off";
+            } else if (entryTypeEquals(entry, "model_change")) {
+                const provider = try entryStringFieldAlloc(arena_allocator, entry.raw_json, "provider");
+                const model_id = try entryStringFieldAlloc(arena_allocator, entry.raw_json, "modelId");
+                if (provider != null and model_id != null) {
+                    model = .{ .provider = provider.?, .model_id = model_id.? };
+                }
+            } else if (entryTypeEquals(entry, "message")) {
+                if (try assistantModelAlloc(arena_allocator, arena_allocator, entry.raw_json)) |assistant_model| {
+                    model = assistant_model;
+                }
+            } else if (entryTypeEquals(entry, "compaction")) {
+                compaction_index = index;
+            }
+        }
+
         var messages: std.ArrayList(FileEntry) = .empty;
-        for (branch_entries) |entry| {
-            if (!entryTypeEquals(entry, "message")) continue;
-            try messages.append(arena_allocator, try cloneFileEntry(arena_allocator, entry));
+        if (compaction_index) |index| {
+            const compaction = branch_entries[index];
+            try messages.append(arena_allocator, try cloneFileEntry(arena_allocator, compaction));
+
+            const first_kept_entry_id = try entryStringFieldAlloc(arena_allocator, compaction.raw_json, "firstKeptEntryId");
+            var found_first_kept = false;
+            for (branch_entries[0..index]) |entry| {
+                if (first_kept_entry_id) |target_id| {
+                    if (entry.id) |entry_id| {
+                        if (std.mem.eql(u8, entry_id, target_id)) {
+                            found_first_kept = true;
+                        }
+                    }
+                }
+                if (found_first_kept) {
+                    try appendContextSourceEntryAlloc(arena_allocator, &messages, entry);
+                }
+            }
+            for (branch_entries[index + 1 ..]) |entry| {
+                try appendContextSourceEntryAlloc(arena_allocator, &messages, entry);
+            }
+        } else {
+            for (branch_entries) |entry| {
+                try appendContextSourceEntryAlloc(arena_allocator, &messages, entry);
+            }
         }
 
         return .{
             .arena = arena,
             .messages = try messages.toOwnedSlice(arena_allocator),
+            .thinking_level = thinking_level,
+            .model = model,
         };
     }
 
@@ -1569,6 +1778,45 @@ fn cloneFileEntry(allocator: std.mem.Allocator, entry: FileEntry) !FileEntry {
     };
 }
 
+fn appendContextSourceEntryAlloc(
+    allocator: std.mem.Allocator,
+    messages: *std.ArrayList(FileEntry),
+    entry: FileEntry,
+) !void {
+    if (!entryParticipatesInContext(entry)) return;
+    try messages.append(allocator, try cloneFileEntry(allocator, entry));
+}
+
+fn entryParticipatesInContext(entry: FileEntry) bool {
+    return entryTypeEquals(entry, "message") or
+        entryTypeEquals(entry, "custom_message") or
+        entryTypeEquals(entry, "branch_summary");
+}
+
+fn assistantModelAlloc(
+    output_allocator: std.mem.Allocator,
+    scratch_allocator: std.mem.Allocator,
+    raw_json: []const u8,
+) !?SessionContextModel {
+    var parsed = std.json.parseFromSlice(std.json.Value, scratch_allocator, raw_json, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return null,
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const message_value = parsed.value.object.get("message") orelse return null;
+    if (message_value != .object) return null;
+    const message = message_value.object;
+    const role = optionalString(message, "role") orelse return null;
+    if (!std.mem.eql(u8, role, "assistant")) return null;
+    const provider = optionalString(message, "provider") orelse return null;
+    const model_id = optionalString(message, "model") orelse return null;
+    return .{
+        .provider = try output_allocator.dupe(u8, provider),
+        .model_id = try output_allocator.dupe(u8, model_id),
+    };
+}
+
 fn latestLabelForIdAlloc(
     output_allocator: std.mem.Allocator,
     scratch_allocator: std.mem.Allocator,
@@ -1723,6 +1971,158 @@ fn customEntryJsonAlloc(
         try json.objectField("data");
         try json.beginWriteRaw();
         try output.writer.writeAll(data);
+        json.endWriteRaw();
+    }
+    try json.objectField("id");
+    try json.write(id);
+    try json.objectField("parentId");
+    if (parent_id) |parent| {
+        try json.write(parent);
+    } else {
+        try json.write(null);
+    }
+    try json.objectField("timestamp");
+    try json.write(timestamp);
+    try json.endObject();
+    return output.toOwnedSlice();
+}
+
+fn thinkingLevelEntryJsonAlloc(
+    allocator: std.mem.Allocator,
+    id: []const u8,
+    parent_id: ?[]const u8,
+    timestamp: []const u8,
+    thinking_level: []const u8,
+) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    var json: std.json.Stringify = .{ .writer = &output.writer };
+    try json.beginObject();
+    try json.objectField("type");
+    try json.write("thinking_level_change");
+    try json.objectField("id");
+    try json.write(id);
+    try json.objectField("parentId");
+    if (parent_id) |parent| {
+        try json.write(parent);
+    } else {
+        try json.write(null);
+    }
+    try json.objectField("timestamp");
+    try json.write(timestamp);
+    try json.objectField("thinkingLevel");
+    try json.write(thinking_level);
+    try json.endObject();
+    return output.toOwnedSlice();
+}
+
+fn modelChangeEntryJsonAlloc(
+    allocator: std.mem.Allocator,
+    id: []const u8,
+    parent_id: ?[]const u8,
+    timestamp: []const u8,
+    provider: []const u8,
+    model_id: []const u8,
+) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    var json: std.json.Stringify = .{ .writer = &output.writer };
+    try json.beginObject();
+    try json.objectField("type");
+    try json.write("model_change");
+    try json.objectField("id");
+    try json.write(id);
+    try json.objectField("parentId");
+    if (parent_id) |parent| {
+        try json.write(parent);
+    } else {
+        try json.write(null);
+    }
+    try json.objectField("timestamp");
+    try json.write(timestamp);
+    try json.objectField("provider");
+    try json.write(provider);
+    try json.objectField("modelId");
+    try json.write(model_id);
+    try json.endObject();
+    return output.toOwnedSlice();
+}
+
+fn compactionEntryJsonAlloc(
+    allocator: std.mem.Allocator,
+    id: []const u8,
+    parent_id: ?[]const u8,
+    timestamp: []const u8,
+    summary: []const u8,
+    first_kept_entry_id: []const u8,
+    tokens_before: u64,
+    details_json: ?[]const u8,
+    from_hook: ?bool,
+) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    var json: std.json.Stringify = .{ .writer = &output.writer };
+    try json.beginObject();
+    try json.objectField("type");
+    try json.write("compaction");
+    try json.objectField("id");
+    try json.write(id);
+    try json.objectField("parentId");
+    if (parent_id) |parent| {
+        try json.write(parent);
+    } else {
+        try json.write(null);
+    }
+    try json.objectField("timestamp");
+    try json.write(timestamp);
+    try json.objectField("summary");
+    try json.write(summary);
+    try json.objectField("firstKeptEntryId");
+    try json.write(first_kept_entry_id);
+    try json.objectField("tokensBefore");
+    try json.write(tokens_before);
+    if (details_json) |details| {
+        try json.objectField("details");
+        try json.beginWriteRaw();
+        try output.writer.writeAll(details);
+        json.endWriteRaw();
+    }
+    if (from_hook) |value| {
+        try json.objectField("fromHook");
+        try json.write(value);
+    }
+    try json.endObject();
+    return output.toOwnedSlice();
+}
+
+fn customMessageEntryJsonAlloc(
+    allocator: std.mem.Allocator,
+    id: []const u8,
+    parent_id: ?[]const u8,
+    timestamp: []const u8,
+    custom_type: []const u8,
+    content_json: []const u8,
+    display: bool,
+    details_json: ?[]const u8,
+) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    var json: std.json.Stringify = .{ .writer = &output.writer };
+    try json.beginObject();
+    try json.objectField("type");
+    try json.write("custom_message");
+    try json.objectField("customType");
+    try json.write(custom_type);
+    try json.objectField("content");
+    try json.beginWriteRaw();
+    try output.writer.writeAll(content_json);
+    json.endWriteRaw();
+    try json.objectField("display");
+    try json.write(display);
+    if (details_json) |details| {
+        try json.objectField("details");
+        try json.beginWriteRaw();
+        try output.writer.writeAll(details);
         json.endWriteRaw();
     }
     try json.objectField("id");
@@ -2198,6 +2598,12 @@ fn testAssistantMessageJsonAlloc(allocator: std.mem.Allocator, content: []const 
     try json.endArray();
     try json.objectField("timestamp");
     try json.write(timestamp_ms);
+    try json.objectField("api");
+    try json.write("anthropic-messages");
+    try json.objectField("provider");
+    try json.write("anthropic");
+    try json.objectField("model");
+    try json.write("claude-test");
     try json.endObject();
     return output.toOwnedSlice();
 }
@@ -2320,6 +2726,31 @@ fn expectEntryStringField(
     const value = try entryStringFieldAlloc(allocator, entry.raw_json, field);
     defer allocator.free(value.?);
     try std.testing.expectEqualStrings(expected, value.?);
+}
+
+fn expectEntryU64Field(
+    allocator: std.mem.Allocator,
+    entry: FileEntry,
+    field: []const u8,
+    expected: u64,
+) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, entry.raw_json, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+    const value = parsed.value.object.get(field) orelse return error.MissingField;
+    try std.testing.expect(value == .integer);
+    try std.testing.expectEqual(expected, @as(u64, @intCast(value.integer)));
+}
+
+fn expectMessageText(
+    allocator: std.mem.Allocator,
+    entry: FileEntry,
+    expected: []const u8,
+) !void {
+    const inspected = try inspectMessageEntry(allocator, allocator, entry.raw_json);
+    const text = inspected.text orelse return error.MissingMessageText;
+    defer allocator.free(text);
+    try std.testing.expectEqualStrings(expected, text);
 }
 
 // Ported from packages/coding-agent/src/core/session-manager.ts default directory helpers.
@@ -3174,6 +3605,160 @@ test "SessionManager branchWithSummary appends summary under branch point" {
         error.EntryNotFound,
         session.branchWithSummary(std.testing.io, "nonexistent", "summary"),
     );
+}
+
+test "SessionManager append setting and compaction entries integrate into tree" {
+    const allocator = std.testing.allocator;
+
+    {
+        var session = try SessionManager.inMemory(allocator, std.testing.io, null);
+        defer session.deinit();
+
+        const user_json = try testUserMessageJsonAlloc(allocator, "hello", 1);
+        defer allocator.free(user_json);
+        const assistant_json = try testAssistantMessageJsonAlloc(allocator, "response", 2);
+        defer allocator.free(assistant_json);
+
+        const msg_id = try session.appendMessageJson(std.testing.io, user_json);
+        const thinking_id = try session.appendThinkingLevelChange(std.testing.io, "high");
+        _ = try session.appendMessageJson(std.testing.io, assistant_json);
+
+        const entries = session.getEntries();
+        try std.testing.expectEqual(@as(usize, 3), entries.len);
+        const thinking_entry = findEntryByType(entries, "thinking_level_change") orelse return error.MissingThinkingEntry;
+        try std.testing.expectEqualStrings(thinking_id, thinking_entry.id.?);
+        try expectEntryParent(allocator, thinking_entry, msg_id);
+        try expectEntryStringField(allocator, thinking_entry, "thinkingLevel", "high");
+        try expectEntryParent(allocator, entries[2], thinking_id);
+    }
+
+    {
+        var session = try SessionManager.inMemory(allocator, std.testing.io, null);
+        defer session.deinit();
+
+        const user_json = try testUserMessageJsonAlloc(allocator, "hello", 1);
+        defer allocator.free(user_json);
+        const assistant_json = try testAssistantMessageJsonAlloc(allocator, "response", 2);
+        defer allocator.free(assistant_json);
+
+        const msg_id = try session.appendMessageJson(std.testing.io, user_json);
+        const model_id = try session.appendModelChange(std.testing.io, "openai", "gpt-4");
+        _ = try session.appendMessageJson(std.testing.io, assistant_json);
+
+        const entries = session.getEntries();
+        const model_entry = findEntryByType(entries, "model_change") orelse return error.MissingModelEntry;
+        try std.testing.expectEqualStrings(model_id, model_entry.id.?);
+        try expectEntryParent(allocator, model_entry, msg_id);
+        try expectEntryStringField(allocator, model_entry, "provider", "openai");
+        try expectEntryStringField(allocator, model_entry, "modelId", "gpt-4");
+        try expectEntryParent(allocator, entries[2], model_id);
+    }
+
+    {
+        var session = try SessionManager.inMemory(allocator, std.testing.io, null);
+        defer session.deinit();
+
+        const first_json = try testUserMessageJsonAlloc(allocator, "1", 1);
+        defer allocator.free(first_json);
+        const second_json = try testAssistantMessageJsonAlloc(allocator, "2", 2);
+        defer allocator.free(second_json);
+        const third_json = try testUserMessageJsonAlloc(allocator, "3", 3);
+        defer allocator.free(third_json);
+
+        const id1 = try session.appendMessageJson(std.testing.io, first_json);
+        const id2 = try session.appendMessageJson(std.testing.io, second_json);
+        const compaction_id = try session.appendCompactionJson(std.testing.io, "summary", id1, 1000, "{\"kind\":\"test\"}", true);
+        _ = try session.appendMessageJson(std.testing.io, third_json);
+
+        const entries = session.getEntries();
+        const compaction_entry = findEntryByType(entries, "compaction") orelse return error.MissingCompactionEntry;
+        try std.testing.expectEqualStrings(compaction_id, compaction_entry.id.?);
+        try expectEntryParent(allocator, compaction_entry, id2);
+        try expectEntryStringField(allocator, compaction_entry, "summary", "summary");
+        try expectEntryStringField(allocator, compaction_entry, "firstKeptEntryId", id1);
+        try expectEntryU64Field(allocator, compaction_entry, "tokensBefore", 1000);
+        try expectEntryParent(allocator, entries[3], compaction_id);
+    }
+}
+
+test "SessionManager buildSessionContext resolves settings summaries and custom messages" {
+    const allocator = std.testing.allocator;
+    var session = try SessionManager.inMemory(allocator, std.testing.io, null);
+    defer session.deinit();
+
+    const msg1 = try testUserMessageJsonAlloc(allocator, "first", 1);
+    defer allocator.free(msg1);
+    const msg2 = try testAssistantMessageJsonAlloc(allocator, "response1", 2);
+    defer allocator.free(msg2);
+    const msg3 = try testUserMessageJsonAlloc(allocator, "second", 3);
+    defer allocator.free(msg3);
+    const msg4 = try testAssistantMessageJsonAlloc(allocator, "response2", 4);
+    defer allocator.free(msg4);
+    const msg5 = try testUserMessageJsonAlloc(allocator, "third", 5);
+    defer allocator.free(msg5);
+
+    _ = try session.appendMessageJson(std.testing.io, msg1);
+    _ = try session.appendModelChange(std.testing.io, "openai", "gpt-4");
+    _ = try session.appendThinkingLevelChange(std.testing.io, "high");
+    _ = try session.appendMessageJson(std.testing.io, msg2);
+    const kept_id = try session.appendMessageJson(std.testing.io, msg3);
+    _ = try session.appendCustomEntryJson(std.testing.io, "hidden_state", "{\"ignored\":true}");
+    _ = try session.appendCustomMessageEntryJson(
+        std.testing.io,
+        "visible_context",
+        "\"extension says hi\"",
+        false,
+        "{\"source\":\"test\"}",
+    );
+    _ = try session.appendMessageJson(std.testing.io, msg4);
+    _ = try session.appendCompactionJson(std.testing.io, "Summary of first two turns", kept_id, 1000, null, null);
+    _ = try session.appendMessageJson(std.testing.io, msg5);
+
+    var context = try session.buildSessionContextAlloc(allocator);
+    defer context.deinit();
+    try std.testing.expectEqualStrings("high", context.thinking_level);
+    try std.testing.expect(context.model != null);
+    try std.testing.expectEqualStrings("anthropic", context.model.?.provider);
+    try std.testing.expectEqualStrings("claude-test", context.model.?.model_id);
+    try std.testing.expectEqual(@as(usize, 5), context.messages.len);
+    try std.testing.expect(entryTypeEquals(context.messages[0], "compaction"));
+    try expectEntryStringField(allocator, context.messages[0], "summary", "Summary of first two turns");
+    try expectMessageText(allocator, context.messages[1], "second");
+    try std.testing.expect(entryTypeEquals(context.messages[2], "custom_message"));
+    try expectEntryStringField(allocator, context.messages[2], "customType", "visible_context");
+    try expectMessageText(allocator, context.messages[3], "response2");
+    try expectMessageText(allocator, context.messages[4], "third");
+}
+
+test "SessionManager buildSessionContext includes branch summaries and follows current branch" {
+    const allocator = std.testing.allocator;
+    var session = try SessionManager.inMemory(allocator, std.testing.io, null);
+    defer session.deinit();
+
+    const msg1 = try testUserMessageJsonAlloc(allocator, "start", 1);
+    defer allocator.free(msg1);
+    const msg2 = try testAssistantMessageJsonAlloc(allocator, "response", 2);
+    defer allocator.free(msg2);
+    const wrong = try testUserMessageJsonAlloc(allocator, "abandoned path", 3);
+    defer allocator.free(wrong);
+    const resumed = try testUserMessageJsonAlloc(allocator, "new direction", 4);
+    defer allocator.free(resumed);
+
+    _ = try session.appendMessageJson(std.testing.io, msg1);
+    const response_id = try session.appendMessageJson(std.testing.io, msg2);
+    _ = try session.appendMessageJson(std.testing.io, wrong);
+    const summary_id = try session.branchWithSummary(std.testing.io, response_id, "Summary of abandoned work");
+    _ = try session.appendMessageJson(std.testing.io, resumed);
+
+    var context = try session.buildSessionContextAlloc(allocator);
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 4), context.messages.len);
+    try expectMessageText(allocator, context.messages[0], "start");
+    try expectMessageText(allocator, context.messages[1], "response");
+    try std.testing.expect(entryTypeEquals(context.messages[2], "branch_summary"));
+    try std.testing.expectEqualStrings(summary_id, context.messages[2].id.?);
+    try expectEntryStringField(allocator, context.messages[2], "summary", "Summary of abandoned work");
+    try expectMessageText(allocator, context.messages[3], "new direction");
 }
 
 test "SessionManager createBranchedSession extracts selected path in memory" {
