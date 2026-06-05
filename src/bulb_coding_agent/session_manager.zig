@@ -4855,6 +4855,45 @@ test "SessionManager custom flat session directory scopes current-folder APIs wh
     try std.testing.expectEqualStrings(session_a, continued_a.getSessionFile().?);
 }
 
+// Ported from packages/coding-agent/test/session-info-modified-timestamp.test.ts.
+test "SessionInfo modified uses last user or assistant timestamp instead of file mtime" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tempDirPathAlloc(allocator, &tmp);
+    defer allocator.free(tmp_path);
+    const cwd = try std.fs.path.join(allocator, &.{ tmp_path, "project" });
+    defer allocator.free(cwd);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, cwd);
+    const path = try std.fs.path.join(allocator, &.{ tmp_path, "modified.jsonl" });
+    defer allocator.free(path);
+
+    const header = try sessionHeaderJsonAlloc(allocator, "test-session", cwd);
+    defer allocator.free(header);
+    const data = try std.mem.concat(allocator, u8, &.{
+        header,
+        "{\"type\":\"message\",\"id\":\"first\",\"parentId\":null,\"timestamp\":\"1970-01-01T00:00:00.001Z\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"hi\"}],\"timestamp\":1}}\n",
+        "{\"type\":\"message\",\"id\":\"later\",\"parentId\":\"first\",\"timestamp\":\"1970-01-01T00:02:03.456Z\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"later\"}],\"timestamp\":123456}}\n",
+    });
+    defer allocator.free(data);
+    try writeAbsoluteFile(std.testing.io, path, data);
+    const file_stat = try std.Io.Dir.cwd().statFile(std.testing.io, path, .{ .follow_symlinks = true });
+
+    var sessions = try SessionManager.list(
+        allocator,
+        std.testing.io,
+        cwd,
+        tmp_path,
+        tmp_path,
+    );
+    defer sessions.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), sessions.sessions.len);
+    try std.testing.expectEqualStrings(path, sessions.sessions[0].path);
+    try std.testing.expectEqual(@as(i64, 123456), sessions.sessions[0].modified_ms);
+    try std.testing.expect(sessions.sessions[0].modified_ms != file_stat.mtime.toMilliseconds());
+}
+
 test "SessionManager opens persisted sessions and exposes header and entries" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

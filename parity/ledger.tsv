@@ -516,7 +516,7 @@ packages/coding-agent/src/modes/interactive/components/tree-selector.ts	bulb_cod
 packages/coding-agent/src/modes/interactive/components/user-message-selector.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/modes/interactive/components/user-message.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/modes/interactive/components/visual-truncate.ts	bulb_coding_agent	source	pending		
-packages/coding-agent/src/modes/interactive/interactive-mode.ts	bulb_coding_agent	source	in_progress	src/bulb_coding_agent/oauth_selector.zig	isApiKeyLoginProvider built-in/OAuth provider split ported for login selectors; broader interactive mode remains
+packages/coding-agent/src/modes/interactive/interactive-mode.ts	bulb_coding_agent	source	in_progress	src/bulb_coding_agent/interactive_mode.zig	isApiKeyLoginProvider built-in/OAuth provider split ported for login selectors; Pi-compatible formatResumeCommand helper and quoting/null cases ported; broader interactive mode remains
 packages/coding-agent/src/modes/interactive/theme/dark.json	bulb_coding_agent	source	pending		
 packages/coding-agent/src/modes/interactive/theme/light.json	bulb_coding_agent	source	pending		
 packages/coding-agent/src/modes/interactive/theme/theme-schema.json	bulb_coding_agent	source	pending		
@@ -615,7 +615,7 @@ packages/coding-agent/test/fixtures/skills/unknown-field/SKILL.md	bulb_coding_ag
 packages/coding-agent/test/fixtures/skills/valid-skill/SKILL.md	bulb_coding_agent	fixture	pending		
 packages/coding-agent/test/footer-data-provider.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/footer-width.test.ts	bulb_coding_agent	test	pending		
-packages/coding-agent/test/format-resume-command.test.ts	bulb_coding_agent	test	pending		
+packages/coding-agent/test/format-resume-command.test.ts	bulb_coding_agent	test	implemented	src/bulb_coding_agent/interactive_mode.zig	Upstream default/custom session-dir, shell quoting, non-TTY, in-memory, missing-file, and unset-file resume command regressions translated to Bulb command naming
 packages/coding-agent/test/frontmatter.test.ts	bulb_coding_agent	test	implemented	src/bulb_coding_agent/frontmatter.zig	Upstream quoted keys, normalized newlines, invalid YAML line/column, multiline scalar, missing delimiter, comment-only map, strip, and plain-body regressions ported
 packages/coding-agent/test/git-merge-and-resolve-extension.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/git-ssh-url.test.ts	bulb_coding_agent	test	implemented	src/bulb_coding_agent/git.zig	Upstream explicit protocol, git-prefixed shorthand, hosted alias, @/# ref, and unsupported unprefixed shorthand regressions ported
@@ -659,7 +659,7 @@ packages/coding-agent/test/sdk-skills.test.ts	bulb_coding_agent	test	pending
 packages/coding-agent/test/sdk-stream-options.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/session-cwd.test.ts	bulb_coding_agent	test	in_progress	src/bulb_coding_agent/session_cwd.zig	Missing stored cwd detection, real SessionManager JSONL open and effective-cwd override integration, and pre-runtime controlled rejection ported; agent-session-runtime factory integration remains
 packages/coding-agent/test/session-id-readonly.test.ts	bulb_coding_agent	test	pending		
-packages/coding-agent/test/session-info-modified-timestamp.test.ts	bulb_coding_agent	test	pending		
+packages/coding-agent/test/session-info-modified-timestamp.test.ts	bulb_coding_agent	test	implemented	src/bulb_coding_agent/session_manager.zig	Upstream SessionInfo.modified regression ported: listing prefers the latest user/assistant message timestamp over file mtime
 packages/coding-agent/test/session-manager/build-context.test.ts	bulb_coding_agent	test	implemented	src/bulb_coding_agent/session_manager.zig	Upstream empty/simple context, thinking/model tracking, assistant model override, compaction summary/kept-message ordering, keep-from-first compaction, latest compaction selection, specified leaf traversal, missing-leaf fallback, orphan parent handling, branch summary inclusion, complex branch/compaction paths, custom-message inclusion, current-branch filtering, and exact AgentMessage conversion regressions ported
 packages/coding-agent/test/session-manager/custom-session-id.test.ts	bulb_coding_agent	test	implemented	src/bulb_coding_agent/session_manager.zig	Custom ID validation and propagation, header inclusion, UUIDv7 generation, in-memory defaults, parent option, persisted create/deferred filename, branched-session UUID, generated fork ID, and custom fork ID regressions ported
 packages/coding-agent/test/session-manager/file-operations.test.ts	bulb_coding_agent	test	implemented	src/bulb_coding_agent/session_manager.zig	Missing, empty, headerless, malformed, valid, mixed and sparse JSONL loader, recent-session lookup/continue, cwd filtering, valid SessionManager open, corrupted-file rewrite, append-persisted flat-session creation, scoped list, listAll, and continueRecent flat-directory regressions ported
