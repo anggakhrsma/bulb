@@ -561,6 +561,21 @@ pub const SessionManager = struct {
         return entry_id;
     }
 
+    pub fn appendMessage(
+        self: *SessionManager,
+        io: std.Io,
+        message: messages_mod.CodingAgentMessage,
+    ) ![]const u8 {
+        switch (message) {
+            .branch_summary, .compaction_summary => return error.SummaryMessageMustBeTopLevel,
+            else => {},
+        }
+
+        const message_json = try codingAgentMessageJsonAlloc(self.arena.child_allocator, message);
+        defer self.arena.child_allocator.free(message_json);
+        return self.appendMessageJson(io, message_json);
+    }
+
     pub fn appendSessionInfo(self: *SessionManager, io: std.Io, name: []const u8) ![]const u8 {
         const arena_allocator = self.arena.allocator();
         const entry_id = try generateEntryIdAlloc(arena_allocator, io, self.file_entries);
@@ -2403,6 +2418,312 @@ fn messageEntryJsonAlloc(
     return output.toOwnedSlice();
 }
 
+fn codingAgentMessageJsonAlloc(
+    allocator: std.mem.Allocator,
+    message: messages_mod.CodingAgentMessage,
+) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    var json: std.json.Stringify = .{ .writer = &output.writer };
+    try writeCodingAgentMessage(&json, &output.writer, message);
+    return output.toOwnedSlice();
+}
+
+fn writeCodingAgentMessage(
+    json: *std.json.Stringify,
+    writer: *std.Io.Writer,
+    message: messages_mod.CodingAgentMessage,
+) !void {
+    try json.beginObject();
+    switch (message) {
+        .user => |user| {
+            try json.objectField("role");
+            try json.write("user");
+            try json.objectField("content");
+            try writeUserContentArray(json, user.content);
+            try json.objectField("timestamp");
+            try json.write(user.timestamp_ms);
+        },
+        .assistant => |assistant| {
+            try json.objectField("role");
+            try json.write("assistant");
+            try json.objectField("content");
+            try writeAssistantContentArray(json, writer, assistant.content);
+            try json.objectField("api");
+            try json.write(assistant.api);
+            try json.objectField("provider");
+            try json.write(assistant.provider);
+            try json.objectField("model");
+            try json.write(assistant.model);
+            if (assistant.response_model) |response_model| {
+                try json.objectField("responseModel");
+                try json.write(response_model);
+            }
+            try json.objectField("usage");
+            try writeUsage(json, assistant.usage);
+            try json.objectField("stopReason");
+            try json.write(stopReasonJsonString(assistant.stop_reason));
+            if (assistant.error_message) |error_message| {
+                try json.objectField("errorMessage");
+                try json.write(error_message);
+            }
+            if (assistant.response_id) |response_id| {
+                try json.objectField("responseId");
+                try json.write(response_id);
+            }
+            if (assistant.diagnostics.len > 0) {
+                try json.objectField("diagnostics");
+                try writeDiagnosticsArray(json, writer, assistant.diagnostics);
+            }
+            try json.objectField("timestamp");
+            try json.write(assistant.timestamp_ms);
+        },
+        .tool_result => |tool_result| {
+            try json.objectField("role");
+            try json.write("toolResult");
+            try json.objectField("toolCallId");
+            try json.write(tool_result.tool_call_id);
+            try json.objectField("toolName");
+            try json.write(tool_result.tool_name);
+            try json.objectField("content");
+            try writeUserContentArray(json, tool_result.content);
+            try json.objectField("isError");
+            try json.write(tool_result.is_error);
+            try json.objectField("timestamp");
+            try json.write(tool_result.timestamp_ms);
+        },
+        .bash_execution => |bash| {
+            try json.objectField("role");
+            try json.write("bashExecution");
+            try json.objectField("command");
+            try json.write(bash.command);
+            try json.objectField("output");
+            try json.write(bash.output);
+            try json.objectField("exitCode");
+            if (bash.exit_code) |exit_code| {
+                try json.write(exit_code);
+            } else {
+                try json.write(null);
+            }
+            try json.objectField("cancelled");
+            try json.write(bash.cancelled);
+            try json.objectField("truncated");
+            try json.write(bash.truncated);
+            if (bash.full_output_path) |path| {
+                try json.objectField("fullOutputPath");
+                try json.write(path);
+            }
+            try json.objectField("timestamp");
+            try json.write(bash.timestamp_ms);
+            if (bash.exclude_from_context) {
+                try json.objectField("excludeFromContext");
+                try json.write(true);
+            }
+        },
+        .custom => |custom| {
+            try json.objectField("role");
+            try json.write("custom");
+            try json.objectField("customType");
+            try json.write(custom.custom_type);
+            try json.objectField("content");
+            switch (custom.content) {
+                .text => |text| try json.write(text),
+                .parts => |parts| try writeUserContentArray(json, parts),
+            }
+            try json.objectField("display");
+            try json.write(custom.display);
+            if (custom.details_json) |details| {
+                try json.objectField("details");
+                try json.beginWriteRaw();
+                try writer.writeAll(details);
+                json.endWriteRaw();
+            }
+            try json.objectField("timestamp");
+            try json.write(custom.timestamp_ms);
+        },
+        .branch_summary, .compaction_summary => return error.SummaryMessageMustBeTopLevel,
+    }
+    try json.endObject();
+}
+
+fn writeUserContentArray(json: *std.json.Stringify, content: []const ai.UserContent) !void {
+    try json.beginArray();
+    for (content) |part| {
+        try json.beginObject();
+        switch (part) {
+            .text => |text| {
+                try json.objectField("type");
+                try json.write("text");
+                try json.objectField("text");
+                try json.write(text.text);
+                if (text.text_signature) |signature| {
+                    try json.objectField("textSignature");
+                    try json.write(signature);
+                }
+            },
+            .image => |image| {
+                try json.objectField("type");
+                try json.write("image");
+                try json.objectField("data");
+                try json.write(image.data);
+                try json.objectField("mimeType");
+                try json.write(image.mime_type);
+            },
+        }
+        try json.endObject();
+    }
+    try json.endArray();
+}
+
+fn writeAssistantContentArray(
+    json: *std.json.Stringify,
+    writer: *std.Io.Writer,
+    content: []const ai.AssistantContent,
+) !void {
+    try json.beginArray();
+    for (content) |part| {
+        try json.beginObject();
+        switch (part) {
+            .text => |text| {
+                try json.objectField("type");
+                try json.write("text");
+                try json.objectField("text");
+                try json.write(text.text);
+                if (text.text_signature) |signature| {
+                    try json.objectField("textSignature");
+                    try json.write(signature);
+                }
+            },
+            .thinking => |thinking| {
+                try json.objectField("type");
+                try json.write("thinking");
+                try json.objectField("thinking");
+                try json.write(thinking.thinking);
+                if (thinking.thinking_signature) |signature| {
+                    try json.objectField("thinkingSignature");
+                    try json.write(signature);
+                }
+                if (thinking.redacted) {
+                    try json.objectField("redacted");
+                    try json.write(true);
+                }
+            },
+            .tool_call => |tool_call| {
+                try json.objectField("type");
+                try json.write("toolCall");
+                try json.objectField("id");
+                try json.write(tool_call.id);
+                try json.objectField("name");
+                try json.write(tool_call.name);
+                try json.objectField("arguments");
+                try json.beginWriteRaw();
+                try writer.writeAll(tool_call.arguments_json);
+                json.endWriteRaw();
+                if (tool_call.thought_signature) |signature| {
+                    try json.objectField("thoughtSignature");
+                    try json.write(signature);
+                }
+            },
+        }
+        try json.endObject();
+    }
+    try json.endArray();
+}
+
+fn writeUsage(json: *std.json.Stringify, usage: ai.Usage) !void {
+    try json.beginObject();
+    try json.objectField("input");
+    try json.write(usage.input);
+    try json.objectField("output");
+    try json.write(usage.output);
+    try json.objectField("cacheRead");
+    try json.write(usage.cache_read);
+    try json.objectField("cacheWrite");
+    try json.write(usage.cache_write);
+    try json.objectField("totalTokens");
+    try json.write(usage.total_tokens);
+    try json.objectField("cost");
+    try writeCost(json, usage.cost);
+    try json.endObject();
+}
+
+fn writeCost(json: *std.json.Stringify, cost: ai.Cost) !void {
+    try json.beginObject();
+    try json.objectField("input");
+    try json.write(cost.input);
+    try json.objectField("output");
+    try json.write(cost.output);
+    try json.objectField("cacheRead");
+    try json.write(cost.cache_read);
+    try json.objectField("cacheWrite");
+    try json.write(cost.cache_write);
+    try json.objectField("total");
+    try json.write(cost.total);
+    try json.endObject();
+}
+
+fn writeDiagnosticsArray(
+    json: *std.json.Stringify,
+    writer: *std.Io.Writer,
+    diagnostics: []const ai.AssistantMessageDiagnostic,
+) !void {
+    try json.beginArray();
+    for (diagnostics) |diagnostic| {
+        try json.beginObject();
+        try json.objectField("type");
+        try json.write(diagnostic.type);
+        try json.objectField("timestamp");
+        try json.write(diagnostic.timestamp_ms);
+        if (diagnostic.@"error") |diagnostic_error| {
+            try json.objectField("error");
+            try writeDiagnosticError(json, diagnostic_error);
+        }
+        if (diagnostic.details_json) |details| {
+            try json.objectField("details");
+            try json.beginWriteRaw();
+            try writer.writeAll(details);
+            json.endWriteRaw();
+        }
+        try json.endObject();
+    }
+    try json.endArray();
+}
+
+fn writeDiagnosticError(
+    json: *std.json.Stringify,
+    diagnostic_error: ai.DiagnosticErrorInfo,
+) !void {
+    try json.beginObject();
+    if (diagnostic_error.name) |name| {
+        try json.objectField("name");
+        try json.write(name);
+    }
+    try json.objectField("message");
+    try json.write(diagnostic_error.message);
+    if (diagnostic_error.stack) |stack| {
+        try json.objectField("stack");
+        try json.write(stack);
+    }
+    if (diagnostic_error.code) |code| {
+        try json.objectField("code");
+        switch (code) {
+            .string => |value| try json.write(value),
+            .number => |value| try json.write(value),
+        }
+    }
+    try json.endObject();
+}
+
+fn stopReasonJsonString(reason: ai.StopReason) []const u8 {
+    return switch (reason) {
+        .stop => "stop",
+        .length => "length",
+        .tool_use => "toolUse",
+        .@"error" => "error",
+        .aborted => "aborted",
+    };
+}
+
 fn sessionInfoEntryJsonAlloc(
     allocator: std.mem.Allocator,
     id: []const u8,
@@ -3624,6 +3945,51 @@ fn expectMessageRole(
     try std.testing.expectEqualStrings(expected, role);
 }
 
+fn expectMessageStringField(
+    allocator: std.mem.Allocator,
+    entry: FileEntry,
+    field: []const u8,
+    expected: []const u8,
+) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, entry.raw_json, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+    const message = parsed.value.object.get("message") orelse return error.MissingMessage;
+    try std.testing.expect(message == .object);
+    const value = optionalString(message.object, field) orelse return error.MissingField;
+    try std.testing.expectEqualStrings(expected, value);
+}
+
+fn expectMessageBoolField(
+    allocator: std.mem.Allocator,
+    entry: FileEntry,
+    field: []const u8,
+    expected: bool,
+) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, entry.raw_json, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+    const message = parsed.value.object.get("message") orelse return error.MissingMessage;
+    try std.testing.expect(message == .object);
+    const value = optionalBool(message.object, field) orelse return error.MissingField;
+    try std.testing.expectEqual(expected, value);
+}
+
+fn expectMessageI64Field(
+    allocator: std.mem.Allocator,
+    entry: FileEntry,
+    field: []const u8,
+    expected: i64,
+) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, entry.raw_json, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+    const message = parsed.value.object.get("message") orelse return error.MissingMessage;
+    try std.testing.expect(message == .object);
+    const value = optionalI64(message.object, field) orelse return error.MissingField;
+    try std.testing.expectEqual(expected, value);
+}
+
 fn expectContextMessageTag(
     message: messages_mod.CodingAgentMessage,
     expected: std.meta.Tag(messages_mod.CodingAgentMessage),
@@ -4722,6 +5088,146 @@ test "SessionManager branchWithSummary appends summary under branch point" {
         error.EntryNotFound,
         session.branchWithSummary(std.testing.io, "nonexistent", "summary"),
     );
+}
+
+test "SessionManager appendMessage creates typed entries with correct parentId chain" {
+    const allocator = std.testing.allocator;
+    var session = try SessionManager.inMemory(allocator, std.testing.io, null);
+    defer session.deinit();
+
+    const first_content = [_]ai.UserContent{.{ .text = .{ .text = "first" } }};
+    const second_content = [_]ai.AssistantContent{.{ .text = .{ .text = "second" } }};
+    const third_content = [_]ai.UserContent{.{ .text = .{ .text = "third" } }};
+
+    const id1 = try session.appendMessage(std.testing.io, .{ .user = .{
+        .content = first_content[0..],
+        .timestamp_ms = 1,
+    } });
+    const id2 = try session.appendMessage(std.testing.io, .{ .assistant = .{
+        .content = second_content[0..],
+        .api = "anthropic-messages",
+        .provider = "anthropic",
+        .model = "test",
+        .usage = .{
+            .input = 1,
+            .output = 1,
+            .total_tokens = 2,
+        },
+        .timestamp_ms = 2,
+    } });
+    const id3 = try session.appendMessage(std.testing.io, .{ .user = .{
+        .content = third_content[0..],
+        .timestamp_ms = 3,
+    } });
+
+    const entries = session.getEntries();
+    try std.testing.expectEqual(@as(usize, 3), entries.len);
+    try std.testing.expectEqualStrings(id1, entries[0].id.?);
+    try expectEntryParent(allocator, entries[0], null);
+    try std.testing.expect(entryTypeEquals(entries[0], "message"));
+    try expectMessageRole(allocator, entries[0], "user");
+    try expectMessageText(allocator, entries[0], "first");
+
+    try std.testing.expectEqualStrings(id2, entries[1].id.?);
+    try expectEntryParent(allocator, entries[1], id1);
+    try expectMessageRole(allocator, entries[1], "assistant");
+    try expectMessageStringField(allocator, entries[1], "provider", "anthropic");
+    try expectMessageStringField(allocator, entries[1], "model", "test");
+    try expectMessageText(allocator, entries[1], "second");
+
+    try std.testing.expectEqualStrings(id3, entries[2].id.?);
+    try expectEntryParent(allocator, entries[2], id2);
+    try expectMessageRole(allocator, entries[2], "user");
+    try std.testing.expectEqualStrings(id3, session.getLeafId().?);
+}
+
+test "SessionManager appendMessage serializes tool bash and custom variants" {
+    const allocator = std.testing.allocator;
+    var session = try SessionManager.inMemory(allocator, std.testing.io, null);
+    defer session.deinit();
+
+    const tool_content = [_]ai.UserContent{.{ .text = .{ .text = "tool output" } }};
+    const tool_id = try session.appendMessage(std.testing.io, .{ .tool_result = .{
+        .tool_call_id = "call-1",
+        .tool_name = "read",
+        .content = tool_content[0..],
+        .is_error = true,
+        .timestamp_ms = 4,
+    } });
+    const bash_id = try session.appendMessage(std.testing.io, .{ .bash_execution = .{
+        .command = "zig build",
+        .output = "ok",
+        .exit_code = 0,
+        .cancelled = false,
+        .truncated = true,
+        .full_output_path = "/tmp/bulb-output.txt",
+        .timestamp_ms = 5,
+        .exclude_from_context = true,
+    } });
+    const custom_id = try session.appendMessage(std.testing.io, .{ .custom = .{
+        .custom_type = "example",
+        .content = .{ .text = "custom context" },
+        .display = true,
+        .details_json = "{\"foo\":\"bar\"}",
+        .timestamp_ms = 6,
+    } });
+
+    const entries = session.getEntries();
+    try std.testing.expectEqual(@as(usize, 3), entries.len);
+    try std.testing.expectEqualStrings(tool_id, entries[0].id.?);
+    try expectEntryParent(allocator, entries[0], null);
+    try expectMessageRole(allocator, entries[0], "toolResult");
+    try expectMessageStringField(allocator, entries[0], "toolCallId", "call-1");
+    try expectMessageStringField(allocator, entries[0], "toolName", "read");
+    try expectMessageBoolField(allocator, entries[0], "isError", true);
+
+    try std.testing.expectEqualStrings(bash_id, entries[1].id.?);
+    try expectEntryParent(allocator, entries[1], tool_id);
+    try expectMessageRole(allocator, entries[1], "bashExecution");
+    try expectMessageStringField(allocator, entries[1], "command", "zig build");
+    try expectMessageStringField(allocator, entries[1], "fullOutputPath", "/tmp/bulb-output.txt");
+    try expectMessageI64Field(allocator, entries[1], "exitCode", 0);
+    try expectMessageBoolField(allocator, entries[1], "truncated", true);
+    try expectMessageBoolField(allocator, entries[1], "excludeFromContext", true);
+
+    try std.testing.expectEqualStrings(custom_id, entries[2].id.?);
+    try expectEntryParent(allocator, entries[2], bash_id);
+    try expectMessageRole(allocator, entries[2], "custom");
+    try expectMessageStringField(allocator, entries[2], "customType", "example");
+    try expectMessageBoolField(allocator, entries[2], "display", true);
+    try std.testing.expectEqualStrings(custom_id, session.getLeafId().?);
+
+    var context = try session.buildSessionContextAlloc(allocator);
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 3), context.messages.len);
+    try expectContextMessageTag(context.messages[0], .tool_result);
+    try expectContextMessageTag(context.messages[1], .bash_execution);
+    try expectContextMessageTag(context.messages[2], .custom);
+    try expectContextMessageText(context.messages[2], "custom context");
+}
+
+test "SessionManager appendMessage rejects top-level summary message variants" {
+    const allocator = std.testing.allocator;
+    var session = try SessionManager.inMemory(allocator, std.testing.io, null);
+    defer session.deinit();
+
+    try std.testing.expectError(
+        error.SummaryMessageMustBeTopLevel,
+        session.appendMessage(std.testing.io, .{ .branch_summary = .{
+            .summary = "branch",
+            .from_id = "root",
+            .timestamp_ms = 1,
+        } }),
+    );
+    try std.testing.expectError(
+        error.SummaryMessageMustBeTopLevel,
+        session.appendMessage(std.testing.io, .{ .compaction_summary = .{
+            .summary = "compacted",
+            .tokens_before = 100,
+            .timestamp_ms = 2,
+        } }),
+    );
+    try std.testing.expectEqual(@as(usize, 0), session.getEntries().len);
 }
 
 test "SessionManager append setting and compaction entries integrate into tree" {
