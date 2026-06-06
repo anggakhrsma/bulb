@@ -14,6 +14,7 @@ pub const system_prompt = @import("system_prompt.zig");
 pub const tools = @import("tools/root.zig");
 pub const auth_storage = @import("auth_storage.zig");
 pub const ansi = @import("ansi.zig");
+pub const bash_executor = @import("bash_executor.zig");
 pub const cli_args = @import("cli_args.zig");
 pub const frontmatter = @import("frontmatter.zig");
 pub const git = @import("git.zig");
@@ -59,6 +60,7 @@ test {
     _ = @import("tools/root.zig");
     _ = @import("auth_storage.zig");
     _ = @import("ansi.zig");
+    _ = @import("bash_executor.zig");
     _ = @import("cli_args.zig");
     _ = @import("frontmatter.zig");
     _ = @import("git.zig");
