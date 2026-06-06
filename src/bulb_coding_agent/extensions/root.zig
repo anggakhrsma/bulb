@@ -47,6 +47,7 @@ pub const ExtensionWidgetOptions = types.ExtensionWidgetOptions;
 pub const FindToolCallEvent = types.FindToolCallEvent;
 pub const GrepToolCallEvent = types.GrepToolCallEvent;
 pub const InputEvent = types.InputEvent;
+pub const InputEmitResult = runner.InputEmitResult;
 pub const InputEventResult = types.InputEventResult;
 pub const InputSource = types.InputSource;
 pub const KeybindingsManager = types.KeybindingsManager;

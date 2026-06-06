@@ -100,6 +100,32 @@ pub const OwnedUserContentList = struct {
     }
 };
 
+pub const OwnedImageContentList = struct {
+    allocator: std.mem.Allocator,
+    items: []ai.ImageContent,
+    owned_strings: [][]u8 = &.{},
+
+    pub fn deinit(self: *OwnedImageContentList) void {
+        for (self.owned_strings) |value| self.allocator.free(value);
+        if (self.owned_strings.len > 0) self.allocator.free(self.owned_strings);
+        self.allocator.free(self.items);
+        self.* = undefined;
+    }
+};
+
+pub const InputEmitResult = struct {
+    allocator: std.mem.Allocator,
+    action: types.InputEventResult,
+    owned_text: ?[]u8 = null,
+    owned_images: ?OwnedImageContentList = null,
+
+    pub fn deinit(self: *InputEmitResult) void {
+        if (self.owned_text) |text| self.allocator.free(text);
+        if (self.owned_images) |*images| images.deinit();
+        self.* = .{ .allocator = self.allocator, .action = .{ .@"continue" = {} } };
+    }
+};
+
 pub const ToolResultEmitResult = struct {
     allocator: std.mem.Allocator,
     content: ?OwnedUserContentList = null,
@@ -605,6 +631,97 @@ pub const ExtensionRunner = struct {
         return result;
     }
 
+    pub fn emitInputAlloc(
+        self: *ExtensionRunner,
+        allocator: std.mem.Allocator,
+        text: []const u8,
+        images: []const ai.ImageContent,
+        source: types.InputSource,
+        streaming_behavior: ?types.StreamingBehavior,
+    ) !InputEmitResult {
+        var ctx = try self.createContext();
+        var current_text = text;
+        var current_images = images;
+        var owned_text: ?[]u8 = null;
+        errdefer if (owned_text) |value| allocator.free(value);
+        var owned_images: ?OwnedImageContentList = null;
+        errdefer if (owned_images) |*value| value.deinit();
+        var images_replaced = false;
+
+        for (self.extensions) |extension| {
+            for (extension.handlers) |handler| {
+                if (handler.event_name != .input) continue;
+                const event = types.ExtensionEvent{ .input = .{
+                    .text = current_text,
+                    .images = current_images,
+                    .source = source,
+                    .streaming_behavior = streaming_behavior,
+                } };
+                const handler_result = handler.call(event, &ctx) catch |err| {
+                    try self.emitHandlerErrorAlloc(extension.path, .input, err);
+                    continue;
+                };
+                const value = handler_result orelse continue;
+                if (value != .object) continue;
+                const action = jsonString(value, "action") orelse continue;
+
+                if (std.mem.eql(u8, action, "handled")) {
+                    if (owned_text) |owned| allocator.free(owned);
+                    owned_text = null;
+                    if (owned_images) |*owned| owned.deinit();
+                    owned_images = null;
+                    return .{ .allocator = allocator, .action = .{ .handled = {} } };
+                }
+                if (std.mem.eql(u8, action, "continue")) continue;
+                if (!std.mem.eql(u8, action, "transform")) continue;
+
+                const next_text = jsonString(value, "text") orelse {
+                    try self.emitHandlerErrorAlloc(extension.path, .input, error.ExpectedTransformText);
+                    continue;
+                };
+                const owned_next_text = try allocator.dupe(u8, next_text);
+                if (owned_text) |owned| allocator.free(owned);
+                owned_text = owned_next_text;
+                current_text = owned_next_text;
+
+                if (value.object.get("images")) |images_value| {
+                    if (images_value != .null) {
+                        const next_images = parseImageContentListAlloc(allocator, images_value) catch |err| {
+                            try self.emitHandlerErrorAlloc(extension.path, .input, err);
+                            continue;
+                        };
+                        if (owned_images) |*owned| owned.deinit();
+                        owned_images = next_images;
+                        current_images = owned_images.?.items;
+                        images_replaced = true;
+                    }
+                }
+            }
+        }
+
+        if (!std.mem.eql(u8, current_text, text) or images_replaced) {
+            const result_owned_text = owned_text;
+            owned_text = null;
+            const result_owned_images = owned_images;
+            owned_images = null;
+            return .{
+                .allocator = allocator,
+                .action = .{ .transform = .{
+                    .text = current_text,
+                    .images = current_images,
+                } },
+                .owned_text = result_owned_text,
+                .owned_images = result_owned_images,
+            };
+        }
+
+        if (owned_text) |owned| allocator.free(owned);
+        owned_text = null;
+        if (owned_images) |*owned| owned.deinit();
+        owned_images = null;
+        return .{ .allocator = allocator, .action = .{ .@"continue" = {} } };
+    }
+
     pub fn emitResourcesDiscoverAlloc(
         self: *ExtensionRunner,
         allocator: std.mem.Allocator,
@@ -1019,6 +1136,36 @@ fn parseUserContentListAlloc(allocator: std.mem.Allocator, value: std.json.Value
     };
 }
 
+fn parseImageContentListAlloc(allocator: std.mem.Allocator, value: std.json.Value) !OwnedImageContentList {
+    if (value != .array) return error.ExpectedImageContentArray;
+    var images: std.ArrayList(ai.ImageContent) = .empty;
+    errdefer images.deinit(allocator);
+    var owned_strings: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (owned_strings.items) |owned| allocator.free(owned);
+        owned_strings.deinit(allocator);
+    }
+
+    for (value.array.items) |item| {
+        if (item != .object) return error.ExpectedImageContentObject;
+        const data = jsonString(item, "data") orelse return error.ExpectedImageData;
+        const mime_type = jsonString(item, "mimeType") orelse jsonString(item, "mime_type") orelse return error.ExpectedImageMimeType;
+        const owned_data = try allocator.dupe(u8, data);
+        errdefer allocator.free(owned_data);
+        const owned_mime_type = try allocator.dupe(u8, mime_type);
+        errdefer allocator.free(owned_mime_type);
+        try owned_strings.append(allocator, owned_data);
+        try owned_strings.append(allocator, owned_mime_type);
+        try images.append(allocator, .{ .data = owned_data, .mime_type = owned_mime_type });
+    }
+
+    return .{
+        .allocator = allocator,
+        .items = try images.toOwnedSlice(allocator),
+        .owned_strings = try owned_strings.toOwnedSlice(allocator),
+    };
+}
+
 fn appendResourcePathsFromJson(
     allocator: std.mem.Allocator,
     list: *std.ArrayList(ExtensionResourcePath),
@@ -1065,6 +1212,19 @@ fn putJsonBool(allocator: std.mem.Allocator, object: *std.json.Value, key: []con
 
 fn putJsonValue(allocator: std.mem.Allocator, object: *std.json.Value, key: []const u8, value: std.json.Value) !void {
     try object.object.put(allocator, try allocator.dupe(u8, key), value);
+}
+
+fn imageArrayJsonAlloc(allocator: std.mem.Allocator, image_items: []const ai.ImageContent) !std.json.Value {
+    var array = std.json.Array.init(allocator);
+    errdefer array.deinit();
+    for (image_items) |image| {
+        var object = std.json.Value{ .object = .empty };
+        try putJsonString(allocator, &object, "type", "image");
+        try putJsonString(allocator, &object, "data", image.data);
+        try putJsonString(allocator, &object, "mimeType", image.mime_type);
+        try array.append(object);
+    }
+    return .{ .array = array };
 }
 
 const RunnerHarness = struct {
@@ -1592,6 +1752,351 @@ test "extension runner reports invalid queued provider registrations" {
 
     try std.testing.expectEqual(@as(usize, 0), harness.runtime.pending_provider_registrations.items.len);
     try std.testing.expect(state.saw_api_required);
+}
+
+test "extension runner input returns continue for no handlers undefined and explicit continue" {
+    const allocator = std.testing.allocator;
+    var harness = try RunnerHarness.init(allocator);
+    defer harness.deinit();
+
+    var empty_runner = ExtensionRunner.init(allocator, &.{}, harness.runtime, "/tmp", harness.sessions, harness.registry);
+    defer empty_runner.deinit();
+    var no_handlers = try empty_runner.emitInputAlloc(allocator, "x", &.{}, .interactive, null);
+    defer no_handlers.deinit();
+    try std.testing.expectEqual(types.InputEventResult{ .@"continue" = {} }, no_handlers.action);
+
+    const State = struct {
+        action: ?[]const u8 = null,
+        allocator: std.mem.Allocator,
+
+        fn handler(ptr: ?*anyopaque, event_value: types.ExtensionEvent, ctx: *types.ExtensionContext) !?std.json.Value {
+            _ = event_value;
+            _ = ctx;
+            const state: *@This() = @ptrCast(@alignCast(ptr.?));
+            const action = state.action orelse return null;
+            var object = std.json.Value{ .object = .empty };
+            try putJsonString(state.allocator, &object, "action", action);
+            return object;
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var undefined_state = State{ .allocator = arena.allocator() };
+    const undefined_handlers = [_]types.ExtensionHandler{.{
+        .ptr = &undefined_state,
+        .event_name = .input,
+        .handler_fn = State.handler,
+    }};
+    const undefined_extensions = [_]types.Extension{
+        testExtension("/tmp/undefined.zig", &.{}, &.{}, &.{}, &.{}, &.{}, &undefined_handlers),
+    };
+    var undefined_runner = ExtensionRunner.init(allocator, &undefined_extensions, harness.runtime, "/tmp", harness.sessions, harness.registry);
+    defer undefined_runner.deinit();
+    var undefined_result = try undefined_runner.emitInputAlloc(allocator, "x", &.{}, .interactive, null);
+    defer undefined_result.deinit();
+    try std.testing.expectEqual(types.InputEventResult{ .@"continue" = {} }, undefined_result.action);
+
+    var continue_state = State{ .action = "continue", .allocator = arena.allocator() };
+    const continue_handlers = [_]types.ExtensionHandler{.{
+        .ptr = &continue_state,
+        .event_name = .input,
+        .handler_fn = State.handler,
+    }};
+    const continue_extensions = [_]types.Extension{
+        testExtension("/tmp/continue.zig", &.{}, &.{}, &.{}, &.{}, &.{}, &continue_handlers),
+    };
+    var continue_runner = ExtensionRunner.init(allocator, &continue_extensions, harness.runtime, "/tmp", harness.sessions, harness.registry);
+    defer continue_runner.deinit();
+    var continue_result = try continue_runner.emitInputAlloc(allocator, "x", &.{}, .interactive, null);
+    defer continue_result.deinit();
+    try std.testing.expectEqual(types.InputEventResult{ .@"continue" = {} }, continue_result.action);
+}
+
+test "extension runner input transforms text and preserves images when omitted" {
+    const allocator = std.testing.allocator;
+    var harness = try RunnerHarness.init(allocator);
+    defer harness.deinit();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const State = struct {
+        allocator: std.mem.Allocator,
+
+        fn handler(ptr: ?*anyopaque, event_value: types.ExtensionEvent, ctx: *types.ExtensionContext) !?std.json.Value {
+            _ = ctx;
+            const state: *@This() = @ptrCast(@alignCast(ptr.?));
+            const transformed = try std.fmt.allocPrint(state.allocator, "T:{s}", .{event_value.input.text});
+            var object = std.json.Value{ .object = .empty };
+            try putJsonString(state.allocator, &object, "action", "transform");
+            try putJsonString(state.allocator, &object, "text", transformed);
+            return object;
+        }
+    };
+    var state = State{ .allocator = arena.allocator() };
+    const handlers = [_]types.ExtensionHandler{.{
+        .ptr = &state,
+        .event_name = .input,
+        .handler_fn = State.handler,
+    }};
+    const extensions = [_]types.Extension{
+        testExtension("/tmp/input.zig", &.{}, &.{}, &.{}, &.{}, &.{}, &handlers),
+    };
+    var runner = ExtensionRunner.init(allocator, &extensions, harness.runtime, "/tmp", harness.sessions, harness.registry);
+    defer runner.deinit();
+    const images = [_]ai.ImageContent{.{ .data = "orig", .mime_type = "image/png" }};
+
+    var result = try runner.emitInputAlloc(allocator, "hi", &images, .interactive, null);
+    defer result.deinit();
+    try std.testing.expect(result.action == .transform);
+    try std.testing.expectEqualStrings("T:hi", result.action.transform.text);
+    try std.testing.expectEqual(@as(usize, 1), result.action.transform.images.len);
+    try std.testing.expectEqualStrings("orig", result.action.transform.images[0].data);
+    try std.testing.expect(result.owned_images == null);
+}
+
+test "extension runner input transforms and replaces images when provided" {
+    const allocator = std.testing.allocator;
+    var harness = try RunnerHarness.init(allocator);
+    defer harness.deinit();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const State = struct {
+        allocator: std.mem.Allocator,
+
+        fn handler(ptr: ?*anyopaque, event_value: types.ExtensionEvent, ctx: *types.ExtensionContext) !?std.json.Value {
+            _ = event_value;
+            _ = ctx;
+            const state: *@This() = @ptrCast(@alignCast(ptr.?));
+            const next_images = [_]ai.ImageContent{.{ .data = "new", .mime_type = "image/jpeg" }};
+            var object = std.json.Value{ .object = .empty };
+            try putJsonString(state.allocator, &object, "action", "transform");
+            try putJsonString(state.allocator, &object, "text", "X");
+            try putJsonValue(state.allocator, &object, "images", try imageArrayJsonAlloc(state.allocator, &next_images));
+            return object;
+        }
+    };
+    var state = State{ .allocator = arena.allocator() };
+    const handlers = [_]types.ExtensionHandler{.{
+        .ptr = &state,
+        .event_name = .input,
+        .handler_fn = State.handler,
+    }};
+    const extensions = [_]types.Extension{
+        testExtension("/tmp/input-images.zig", &.{}, &.{}, &.{}, &.{}, &.{}, &handlers),
+    };
+    var runner = ExtensionRunner.init(allocator, &extensions, harness.runtime, "/tmp", harness.sessions, harness.registry);
+    defer runner.deinit();
+    const images = [_]ai.ImageContent{.{ .data = "orig", .mime_type = "image/png" }};
+
+    var result = try runner.emitInputAlloc(allocator, "hi", &images, .interactive, null);
+    defer result.deinit();
+    try std.testing.expect(result.action == .transform);
+    try std.testing.expectEqualStrings("X", result.action.transform.text);
+    try std.testing.expectEqual(@as(usize, 1), result.action.transform.images.len);
+    try std.testing.expectEqualStrings("new", result.action.transform.images[0].data);
+    try std.testing.expectEqualStrings("image/jpeg", result.action.transform.images[0].mime_type);
+    try std.testing.expect(result.owned_images != null);
+}
+
+test "extension runner input chains transforms across multiple handlers" {
+    const allocator = std.testing.allocator;
+    var harness = try RunnerHarness.init(allocator);
+    defer harness.deinit();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const State = struct {
+        suffix: []const u8,
+        allocator: std.mem.Allocator,
+
+        fn handler(ptr: ?*anyopaque, event_value: types.ExtensionEvent, ctx: *types.ExtensionContext) !?std.json.Value {
+            _ = ctx;
+            const state: *@This() = @ptrCast(@alignCast(ptr.?));
+            const transformed = try std.fmt.allocPrint(state.allocator, "{s}{s}", .{ event_value.input.text, state.suffix });
+            var object = std.json.Value{ .object = .empty };
+            try putJsonString(state.allocator, &object, "action", "transform");
+            try putJsonString(state.allocator, &object, "text", transformed);
+            return object;
+        }
+    };
+    var first = State{ .suffix = "[1]", .allocator = arena.allocator() };
+    var second = State{ .suffix = "[2]", .allocator = arena.allocator() };
+    const handlers_a = [_]types.ExtensionHandler{.{
+        .ptr = &first,
+        .event_name = .input,
+        .handler_fn = State.handler,
+    }};
+    const handlers_b = [_]types.ExtensionHandler{.{
+        .ptr = &second,
+        .event_name = .input,
+        .handler_fn = State.handler,
+    }};
+    const extensions = [_]types.Extension{
+        testExtension("/tmp/input-a.zig", &.{}, &.{}, &.{}, &.{}, &.{}, &handlers_a),
+        testExtension("/tmp/input-b.zig", &.{}, &.{}, &.{}, &.{}, &.{}, &handlers_b),
+    };
+    var runner = ExtensionRunner.init(allocator, &extensions, harness.runtime, "/tmp", harness.sessions, harness.registry);
+    defer runner.deinit();
+
+    var result = try runner.emitInputAlloc(allocator, "X", &.{}, .interactive, null);
+    defer result.deinit();
+    try std.testing.expect(result.action == .transform);
+    try std.testing.expectEqualStrings("X[1][2]", result.action.transform.text);
+    try std.testing.expectEqual(@as(usize, 0), result.action.transform.images.len);
+}
+
+test "extension runner input handled short-circuits subsequent handlers" {
+    const allocator = std.testing.allocator;
+    var harness = try RunnerHarness.init(allocator);
+    defer harness.deinit();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const State = struct {
+        called: bool = false,
+        allocator: std.mem.Allocator,
+
+        fn handled(ptr: ?*anyopaque, event_value: types.ExtensionEvent, ctx: *types.ExtensionContext) !?std.json.Value {
+            _ = event_value;
+            _ = ctx;
+            const state: *@This() = @ptrCast(@alignCast(ptr.?));
+            var object = std.json.Value{ .object = .empty };
+            try putJsonString(state.allocator, &object, "action", "handled");
+            return object;
+        }
+
+        fn later(ptr: ?*anyopaque, event_value: types.ExtensionEvent, ctx: *types.ExtensionContext) !?std.json.Value {
+            _ = event_value;
+            _ = ctx;
+            const state: *@This() = @ptrCast(@alignCast(ptr.?));
+            state.called = true;
+            return null;
+        }
+    };
+    var state = State{ .allocator = arena.allocator() };
+    const handlers_a = [_]types.ExtensionHandler{.{
+        .ptr = &state,
+        .event_name = .input,
+        .handler_fn = State.handled,
+    }};
+    const handlers_b = [_]types.ExtensionHandler{.{
+        .ptr = &state,
+        .event_name = .input,
+        .handler_fn = State.later,
+    }};
+    const extensions = [_]types.Extension{
+        testExtension("/tmp/input-handled.zig", &.{}, &.{}, &.{}, &.{}, &.{}, &handlers_a),
+        testExtension("/tmp/input-later.zig", &.{}, &.{}, &.{}, &.{}, &.{}, &handlers_b),
+    };
+    var runner = ExtensionRunner.init(allocator, &extensions, harness.runtime, "/tmp", harness.sessions, harness.registry);
+    defer runner.deinit();
+
+    var result = try runner.emitInputAlloc(allocator, "X", &.{}, .interactive, null);
+    defer result.deinit();
+    try std.testing.expectEqual(types.InputEventResult{ .handled = {} }, result.action);
+    try std.testing.expect(!state.called);
+}
+
+test "extension runner input passes source and streaming behavior" {
+    const allocator = std.testing.allocator;
+    var harness = try RunnerHarness.init(allocator);
+    defer harness.deinit();
+
+    const State = struct {
+        source: ?types.InputSource = null,
+        streaming_behavior: ?types.StreamingBehavior = null,
+
+        fn handler(ptr: ?*anyopaque, event_value: types.ExtensionEvent, ctx: *types.ExtensionContext) !?std.json.Value {
+            _ = ctx;
+            const state: *@This() = @ptrCast(@alignCast(ptr.?));
+            state.source = event_value.input.source;
+            state.streaming_behavior = event_value.input.streaming_behavior;
+            return null;
+        }
+    };
+    var state = State{};
+    const handlers = [_]types.ExtensionHandler{.{
+        .ptr = &state,
+        .event_name = .input,
+        .handler_fn = State.handler,
+    }};
+    const extensions = [_]types.Extension{
+        testExtension("/tmp/input-source.zig", &.{}, &.{}, &.{}, &.{}, &.{}, &handlers),
+    };
+    var runner = ExtensionRunner.init(allocator, &extensions, harness.runtime, "/tmp", harness.sessions, harness.registry);
+    defer runner.deinit();
+
+    inline for (.{ types.InputSource.interactive, types.InputSource.rpc, types.InputSource.extension }) |source| {
+        var result = try runner.emitInputAlloc(allocator, "x", &.{}, source, null);
+        defer result.deinit();
+        try std.testing.expectEqual(source, state.source.?);
+        try std.testing.expectEqual(@as(?types.StreamingBehavior, null), state.streaming_behavior);
+    }
+    var steer = try runner.emitInputAlloc(allocator, "x", &.{}, .interactive, .steer);
+    defer steer.deinit();
+    try std.testing.expectEqual(types.StreamingBehavior.steer, state.streaming_behavior.?);
+    var follow_up = try runner.emitInputAlloc(allocator, "x", &.{}, .interactive, .follow_up);
+    defer follow_up.deinit();
+    try std.testing.expectEqual(types.StreamingBehavior.follow_up, state.streaming_behavior.?);
+}
+
+test "extension runner input catches handler errors and continues" {
+    const allocator = std.testing.allocator;
+    var harness = try RunnerHarness.init(allocator);
+    defer harness.deinit();
+
+    const State = struct {
+        errors: usize = 0,
+
+        fn failing(ptr: ?*anyopaque, event_value: types.ExtensionEvent, ctx: *types.ExtensionContext) !?std.json.Value {
+            _ = ptr;
+            _ = event_value;
+            _ = ctx;
+            return error.Boom;
+        }
+
+        fn onError(ptr: ?*anyopaque, err: types.ExtensionError) void {
+            const state: *@This() = @ptrCast(@alignCast(ptr.?));
+            if (std.mem.eql(u8, err.@"error", "Boom")) state.errors += 1;
+        }
+    };
+    var state = State{};
+    const handlers = [_]types.ExtensionHandler{.{
+        .event_name = .input,
+        .handler_fn = State.failing,
+    }};
+    const extensions = [_]types.Extension{
+        testExtension("/tmp/input-error.zig", &.{}, &.{}, &.{}, &.{}, &.{}, &handlers),
+    };
+    var runner = ExtensionRunner.init(allocator, &extensions, harness.runtime, "/tmp", harness.sessions, harness.registry);
+    defer runner.deinit();
+    try runner.onError(.{ .ptr = &state, .call_fn = State.onError });
+
+    var result = try runner.emitInputAlloc(allocator, "x", &.{}, .interactive, null);
+    defer result.deinit();
+    try std.testing.expectEqual(types.InputEventResult{ .@"continue" = {} }, result.action);
+    try std.testing.expectEqual(@as(usize, 1), state.errors);
+}
+
+test "extension runner hasHandlers recognizes input registrations" {
+    const allocator = std.testing.allocator;
+    var harness = try RunnerHarness.init(allocator);
+    defer harness.deinit();
+    var empty_runner = ExtensionRunner.init(allocator, &.{}, harness.runtime, "/tmp", harness.sessions, harness.registry);
+    defer empty_runner.deinit();
+    try std.testing.expect(!empty_runner.hasHandlers(.input));
+
+    const handlers = [_]types.ExtensionHandler{.{
+        .event_name = .input,
+        .handler_fn = TestCallbacks.event,
+    }};
+    const extensions = [_]types.Extension{
+        testExtension("/tmp/input-handler.zig", &.{}, &.{}, &.{}, &.{}, &.{}, &handlers),
+    };
+    var runner = ExtensionRunner.init(allocator, &extensions, harness.runtime, "/tmp", harness.sessions, harness.registry);
+    defer runner.deinit();
+    try std.testing.expect(runner.hasHandlers(.input));
 }
 
 fn missingSimpleStream(
