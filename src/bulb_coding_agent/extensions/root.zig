@@ -1,4 +1,5 @@
 pub const loader = @import("loader.zig");
+pub const runner = @import("runner.zig");
 pub const types = @import("types.zig");
 pub const wrapper = @import("wrapper.zig");
 
@@ -38,6 +39,7 @@ pub const ExtensionHandler = types.ExtensionHandler;
 pub const ExtensionMode = types.ExtensionMode;
 pub const ExtensionRuntime = types.ExtensionRuntime;
 pub const ExtensionRuntimeState = types.ExtensionRuntimeState;
+pub const ExtensionRunner = runner.ExtensionRunner;
 pub const ExtensionShortcut = types.ExtensionShortcut;
 pub const ExtensionUIContext = types.ExtensionUIContext;
 pub const ExtensionUIDialogOptions = types.ExtensionUIDialogOptions;
@@ -115,6 +117,7 @@ pub const wrapRegisteredToolsAlloc = wrapper.wrapRegisteredToolsAlloc;
 
 test {
     _ = @import("loader.zig");
+    _ = @import("runner.zig");
     _ = @import("types.zig");
     _ = @import("wrapper.zig");
 }

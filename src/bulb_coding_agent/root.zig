@@ -79,6 +79,7 @@ pub const EventBus = event_bus.EventBus;
 pub const EventBusController = event_bus.EventBusController;
 pub const createEventBus = event_bus.EventBusController.init;
 pub const createExtensionRuntime = extensions.createExtensionRuntime;
+pub const ExtensionRunner = extensions.ExtensionRunner;
 pub const loadExtensionFromFactoryAlloc = extensions.loadExtensionFromFactoryAlloc;
 pub const loadExtensionsAlloc = extensions.loadExtensionsAlloc;
 pub const wrapRegisteredTool = extensions.wrapRegisteredTool;

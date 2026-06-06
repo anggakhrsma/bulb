@@ -73,6 +73,22 @@ pub const ExtensionRuntimeController = struct {
         }
     }
 
+    pub fn bindProviderActionsReporting(
+        self: *ExtensionRuntimeController,
+        provider_actions: ProviderActions,
+        error_handler: ProviderRegistrationErrorHandler,
+    ) void {
+        self.provider_actions = provider_actions;
+        while (self.pending_provider_registrations.items.len > 0) {
+            const registration = &self.pending_provider_registrations.items[0];
+            self.registerProvider(registration.name, registration.config, registration.extension_path) catch |err| {
+                error_handler.call(registration.name, registration.extension_path, err);
+            };
+            deinitPendingProviderRegistration(self.allocator, registration);
+            _ = self.pending_provider_registrations.orderedRemove(0);
+        }
+    }
+
     pub fn registerProvider(
         self: *ExtensionRuntimeController,
         name: []const u8,
@@ -110,15 +126,28 @@ pub const ExtensionRuntimeController = struct {
         if (self.actions.refresh_tools) |handler| try handler.call();
     }
 
-    fn getFlag(self: *const ExtensionRuntimeController, name: []const u8) ?types.FlagValue {
+    pub fn getFlag(self: *const ExtensionRuntimeController, name: []const u8) ?types.FlagValue {
         for (self.flag_values.items) |entry| {
             if (std.mem.eql(u8, name, entry.name)) return entry.value;
         }
         return null;
     }
 
-    fn setDefaultFlag(self: *ExtensionRuntimeController, name: []const u8, value: types.FlagValue) !void {
+    pub fn setDefaultFlag(self: *ExtensionRuntimeController, name: []const u8, value: types.FlagValue) !void {
         if (self.getFlag(name) != null) return;
+        try self.flag_values.append(self.allocator, try flagEntryAlloc(self.allocator, name, value));
+    }
+
+    pub fn setFlagValue(self: *ExtensionRuntimeController, name: []const u8, value: types.FlagValue) !void {
+        for (self.flag_values.items) |*entry| {
+            if (!std.mem.eql(u8, name, entry.name)) continue;
+            switch (entry.value) {
+                .boolean => {},
+                .string => |string| self.allocator.free(string),
+            }
+            entry.value = try cloneFlagValueAlloc(self.allocator, value);
+            return;
+        }
         try self.flag_values.append(self.allocator, try flagEntryAlloc(self.allocator, name, value));
     }
 };
@@ -126,6 +155,15 @@ pub const ExtensionRuntimeController = struct {
 pub const ProviderActions = struct {
     register_provider: ?types.RegisterProviderHandler = null,
     unregister_provider: ?types.UnregisterProviderHandler = null,
+};
+
+pub const ProviderRegistrationErrorHandler = struct {
+    ptr: ?*anyopaque = null,
+    call_fn: *const fn (?*anyopaque, []const u8, []const u8, anyerror) void,
+
+    pub fn call(self: ProviderRegistrationErrorHandler, name: []const u8, extension_path: []const u8, err: anyerror) void {
+        self.call_fn(self.ptr, name, extension_path, err);
+    }
 };
 
 pub fn createExtensionRuntime(allocator: std.mem.Allocator) ExtensionRuntimeController {
