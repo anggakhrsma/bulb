@@ -9,6 +9,73 @@ const model_registry = @import("model_registry.zig");
 const session_manager = @import("session_manager.zig");
 const source_info = @import("source_info.zig");
 
+pub const AgentEndSessionEvent = struct {
+    messages: []messages.CodingAgentMessage,
+    will_retry: bool,
+};
+
+pub const TurnStartSessionEvent = struct {
+    turn_index: usize,
+    timestamp_ms: i64,
+};
+
+pub const TurnEndSessionEvent = struct {
+    turn_index: usize,
+    message: messages.CodingAgentMessage,
+    tool_results: []ai.ToolResultMessage,
+};
+
+pub const MessageSessionEvent = struct {
+    message: messages.CodingAgentMessage,
+};
+
+pub const MessageUpdateSessionEvent = struct {
+    message: messages.CodingAgentMessage,
+    assistant_message_event: ai.StreamEvent,
+};
+
+pub const ToolExecutionStartSessionEvent = struct {
+    tool_call_id: []const u8,
+    tool_name: []const u8,
+    args: std.json.Value,
+};
+
+pub const ToolExecutionUpdateSessionEvent = struct {
+    tool_call_id: []const u8,
+    tool_name: []const u8,
+    args: std.json.Value,
+    partial_result: std.json.Value,
+};
+
+pub const ToolExecutionEndSessionEvent = struct {
+    tool_call_id: []const u8,
+    tool_name: []const u8,
+    result: std.json.Value,
+    is_error: bool,
+};
+
+pub const SessionEvent = union(enum) {
+    agent_start: void,
+    agent_end: AgentEndSessionEvent,
+    turn_start: TurnStartSessionEvent,
+    turn_end: TurnEndSessionEvent,
+    message_start: MessageSessionEvent,
+    message_update: MessageUpdateSessionEvent,
+    message_end: MessageSessionEvent,
+    tool_execution_start: ToolExecutionStartSessionEvent,
+    tool_execution_update: ToolExecutionUpdateSessionEvent,
+    tool_execution_end: ToolExecutionEndSessionEvent,
+};
+
+pub const SessionEventListener = struct {
+    ptr: ?*anyopaque = null,
+    call_fn: *const fn (?*anyopaque, SessionEvent) void,
+
+    pub fn call(self: SessionEventListener, event: SessionEvent) void {
+        self.call_fn(self.ptr, event);
+    }
+};
+
 pub const MessageEndListener = struct {
     ptr: ?*anyopaque = null,
     call_fn: *const fn (?*anyopaque, messages.CodingAgentMessage) void,
@@ -20,7 +87,9 @@ pub const MessageEndListener = struct {
 
 pub const SessionEventBridge = struct {
     allocator: std.mem.Allocator,
+    turn_index: usize = 0,
     message_end_replacements: std.ArrayList(extensions.MessageEndEmitResult) = .empty,
+    event_listeners: std.ArrayList(SessionEventListener) = .empty,
     message_end_listeners: std.ArrayList(MessageEndListener) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) SessionEventBridge {
@@ -30,12 +99,100 @@ pub const SessionEventBridge = struct {
     pub fn deinit(self: *SessionEventBridge) void {
         for (self.message_end_replacements.items) |*replacement| replacement.deinit();
         self.message_end_replacements.deinit(self.allocator);
+        self.event_listeners.deinit(self.allocator);
         self.message_end_listeners.deinit(self.allocator);
         self.* = undefined;
     }
 
+    pub fn subscribe(self: *SessionEventBridge, listener: SessionEventListener) !void {
+        try self.event_listeners.append(self.allocator, listener);
+    }
+
     pub fn onMessageEnd(self: *SessionEventBridge, listener: MessageEndListener) !void {
         try self.message_end_listeners.append(self.allocator, listener);
+    }
+
+    pub fn handleAgentStart(
+        self: *SessionEventBridge,
+        runner: *extensions.ExtensionRunner,
+    ) !void {
+        self.turn_index = 0;
+        _ = try runner.emit(.{ .agent_start = .{} });
+        self.emitPublic(.{ .agent_start = {} });
+    }
+
+    pub fn handleAgentEnd(
+        self: *SessionEventBridge,
+        runner: *extensions.ExtensionRunner,
+        agent_messages: []messages.CodingAgentMessage,
+        will_retry: bool,
+    ) !void {
+        _ = try runner.emit(.{ .agent_end = .{ .messages = agent_messages } });
+        self.emitPublic(.{ .agent_end = .{
+            .messages = agent_messages,
+            .will_retry = will_retry,
+        } });
+    }
+
+    pub fn handleTurnStart(
+        self: *SessionEventBridge,
+        runner: *extensions.ExtensionRunner,
+        timestamp_ms: i64,
+    ) !void {
+        const event = TurnStartSessionEvent{
+            .turn_index = self.turn_index,
+            .timestamp_ms = timestamp_ms,
+        };
+        _ = try runner.emit(.{ .turn_start = .{
+            .turn_index = event.turn_index,
+            .timestamp_ms = event.timestamp_ms,
+        } });
+        self.emitPublic(.{ .turn_start = event });
+    }
+
+    pub fn handleTurnEnd(
+        self: *SessionEventBridge,
+        runner: *extensions.ExtensionRunner,
+        message: messages.CodingAgentMessage,
+        tool_results: []ai.ToolResultMessage,
+    ) !void {
+        const event = TurnEndSessionEvent{
+            .turn_index = self.turn_index,
+            .message = message,
+            .tool_results = tool_results,
+        };
+        _ = try runner.emit(.{ .turn_end = .{
+            .turn_index = event.turn_index,
+            .message = event.message,
+            .tool_results = event.tool_results,
+        } });
+        self.emitPublic(.{ .turn_end = event });
+        self.turn_index += 1;
+    }
+
+    pub fn handleMessageStart(
+        self: *SessionEventBridge,
+        runner: *extensions.ExtensionRunner,
+        message: messages.CodingAgentMessage,
+    ) !void {
+        _ = try runner.emit(.{ .message_start = .{ .message = message } });
+        self.emitPublic(.{ .message_start = .{ .message = message } });
+    }
+
+    pub fn handleMessageUpdate(
+        self: *SessionEventBridge,
+        runner: *extensions.ExtensionRunner,
+        message: messages.CodingAgentMessage,
+        assistant_message_event: ai.StreamEvent,
+    ) !void {
+        _ = try runner.emit(.{ .message_update = .{
+            .message = message,
+            .assistant_message_event = assistant_message_event,
+        } });
+        self.emitPublic(.{ .message_update = .{
+            .message = message,
+            .assistant_message_event = assistant_message_event,
+        } });
     }
 
     pub fn handleMessageEnd(
@@ -46,8 +203,49 @@ pub const SessionEventBridge = struct {
         message: *messages.CodingAgentMessage,
     ) !void {
         try self.emitMessageEndExtensions(runner, message);
-        self.emitMessageEnd(message.*);
+        self.emitPublic(.{ .message_end = .{ .message = message.* } });
         try persistMessageEnd(io, sessions, self.allocator, message.*);
+    }
+
+    pub fn handleToolExecutionStart(
+        self: *SessionEventBridge,
+        runner: *extensions.ExtensionRunner,
+        event: ToolExecutionStartSessionEvent,
+    ) !void {
+        _ = try runner.emit(.{ .tool_execution_start = .{
+            .tool_call_id = event.tool_call_id,
+            .tool_name = event.tool_name,
+            .args = event.args,
+        } });
+        self.emitPublic(.{ .tool_execution_start = event });
+    }
+
+    pub fn handleToolExecutionUpdate(
+        self: *SessionEventBridge,
+        runner: *extensions.ExtensionRunner,
+        event: ToolExecutionUpdateSessionEvent,
+    ) !void {
+        _ = try runner.emit(.{ .tool_execution_update = .{
+            .tool_call_id = event.tool_call_id,
+            .tool_name = event.tool_name,
+            .args = event.args,
+            .partial_result = event.partial_result,
+        } });
+        self.emitPublic(.{ .tool_execution_update = event });
+    }
+
+    pub fn handleToolExecutionEnd(
+        self: *SessionEventBridge,
+        runner: *extensions.ExtensionRunner,
+        event: ToolExecutionEndSessionEvent,
+    ) !void {
+        _ = try runner.emit(.{ .tool_execution_end = .{
+            .tool_call_id = event.tool_call_id,
+            .tool_name = event.tool_name,
+            .result = event.result,
+            .is_error = event.is_error,
+        } });
+        self.emitPublic(.{ .tool_execution_end = event });
     }
 
     fn emitMessageEndExtensions(
@@ -67,8 +265,14 @@ pub const SessionEventBridge = struct {
         message.* = self.message_end_replacements.items[self.message_end_replacements.items.len - 1].message;
     }
 
-    fn emitMessageEnd(self: *SessionEventBridge, message: messages.CodingAgentMessage) void {
-        for (self.message_end_listeners.items) |listener| listener.call(message);
+    fn emitPublic(self: *SessionEventBridge, event: SessionEvent) void {
+        for (self.event_listeners.items) |listener| listener.call(event);
+        switch (event) {
+            .message_end => |payload| {
+                for (self.message_end_listeners.items) |listener| listener.call(payload.message);
+            },
+            else => {},
+        }
     }
 };
 
@@ -231,6 +435,156 @@ test "AgentSession message_end skips persistence for bash and summary messages" 
     try std.testing.expectEqual(@as(usize, 0), harness.sessions.getEntries().len);
 }
 
+test "AgentSession bridge emits extension message events before public subscribers" {
+    const allocator = std.testing.allocator;
+    var harness = try TestHarness.init(allocator);
+    defer harness.deinit();
+
+    var order: std.ArrayList(MessageOrderObservation) = .empty;
+    defer order.deinit(allocator);
+    var state = MessageOrderState{ .allocator = allocator, .order = &order };
+    const handlers = [_]extensions.ExtensionHandler{
+        .{
+            .ptr = &state,
+            .event_name = .message_start,
+            .handler_fn = MessageOrderState.extensionHandler,
+        },
+        .{
+            .ptr = &state,
+            .event_name = .message_end,
+            .handler_fn = MessageOrderState.extensionHandler,
+        },
+    };
+    const extension_list = [_]extensions.Extension{
+        testExtension("/tmp/message-order.zig", &handlers),
+    };
+    var runner = extensions.ExtensionRunner.init(
+        allocator,
+        &extension_list,
+        harness.runtime,
+        "/tmp",
+        harness.sessions,
+        harness.registry,
+    );
+    defer runner.deinit();
+
+    var bridge = SessionEventBridge.init(allocator);
+    defer bridge.deinit();
+    try bridge.subscribe(.{ .ptr = &state, .call_fn = MessageOrderState.publicListener });
+
+    const user_content = [_]ai.UserContent{.{ .text = .{ .text = "hi" } }};
+    const user_message = messages.CodingAgentMessage{ .user = .{
+        .content = &user_content,
+        .timestamp_ms = 1,
+    } };
+    const assistant_content = [_]ai.AssistantContent{.{ .text = .{ .text = "done" } }};
+    const assistant_message = messages.CodingAgentMessage{ .assistant = .{
+        .content = &assistant_content,
+        .api = ai.types.api.openai_responses,
+        .provider = "openai",
+        .model = "gpt-test",
+        .usage = .{},
+        .timestamp_ms = 2,
+    } };
+
+    var user_end = user_message;
+    var assistant_end = assistant_message;
+    try bridge.handleMessageStart(&runner, user_message);
+    try bridge.handleMessageEnd(std.testing.io, &runner, harness.sessions, &user_end);
+    try bridge.handleMessageStart(&runner, assistant_message);
+    try bridge.handleMessageEnd(std.testing.io, &runner, harness.sessions, &assistant_end);
+
+    const expected = [_]MessageOrderObservation{
+        .{ .phase = .extension, .event = .message_start, .role = .user },
+        .{ .phase = .public, .event = .message_start, .role = .user },
+        .{ .phase = .extension, .event = .message_end, .role = .user },
+        .{ .phase = .public, .event = .message_end, .role = .user },
+        .{ .phase = .extension, .event = .message_start, .role = .assistant },
+        .{ .phase = .public, .event = .message_start, .role = .assistant },
+        .{ .phase = .extension, .event = .message_end, .role = .assistant },
+        .{ .phase = .public, .event = .message_end, .role = .assistant },
+    };
+    try std.testing.expectEqualSlices(MessageOrderObservation, &expected, order.items);
+}
+
+test "AgentSession bridge emits lifecycle events extension-first and advances turn index" {
+    const allocator = std.testing.allocator;
+    var harness = try TestHarness.init(allocator);
+    defer harness.deinit();
+
+    var order: std.ArrayList(LifecycleObservation) = .empty;
+    defer order.deinit(allocator);
+    var state = LifecycleOrderState{ .allocator = allocator, .order = &order };
+    const handlers = [_]extensions.ExtensionHandler{
+        .{
+            .ptr = &state,
+            .event_name = .agent_start,
+            .handler_fn = LifecycleOrderState.extensionHandler,
+        },
+        .{
+            .ptr = &state,
+            .event_name = .turn_start,
+            .handler_fn = LifecycleOrderState.extensionHandler,
+        },
+        .{
+            .ptr = &state,
+            .event_name = .turn_end,
+            .handler_fn = LifecycleOrderState.extensionHandler,
+        },
+        .{
+            .ptr = &state,
+            .event_name = .agent_end,
+            .handler_fn = LifecycleOrderState.extensionHandler,
+        },
+    };
+    const extension_list = [_]extensions.Extension{
+        testExtension("/tmp/lifecycle-order.zig", &handlers),
+    };
+    var runner = extensions.ExtensionRunner.init(
+        allocator,
+        &extension_list,
+        harness.runtime,
+        "/tmp",
+        harness.sessions,
+        harness.registry,
+    );
+    defer runner.deinit();
+
+    var bridge = SessionEventBridge.init(allocator);
+    defer bridge.deinit();
+    try bridge.subscribe(.{ .ptr = &state, .call_fn = LifecycleOrderState.publicListener });
+
+    const assistant_content = [_]ai.AssistantContent{.{ .text = .{ .text = "done" } }};
+    const assistant_message = messages.CodingAgentMessage{ .assistant = .{
+        .content = &assistant_content,
+        .api = ai.types.api.openai_responses,
+        .provider = "openai",
+        .model = "gpt-test",
+        .usage = .{},
+        .timestamp_ms = 2,
+    } };
+    var tool_results: [0]ai.ToolResultMessage = .{};
+    var agent_messages = [_]messages.CodingAgentMessage{assistant_message};
+
+    try bridge.handleAgentStart(&runner);
+    try bridge.handleTurnStart(&runner, 123);
+    try bridge.handleTurnEnd(&runner, assistant_message, tool_results[0..]);
+    try bridge.handleAgentEnd(&runner, agent_messages[0..], true);
+
+    const expected = [_]LifecycleObservation{
+        .{ .phase = .extension, .event = .agent_start },
+        .{ .phase = .public, .event = .agent_start },
+        .{ .phase = .extension, .event = .turn_start, .turn_index = 0 },
+        .{ .phase = .public, .event = .turn_start, .turn_index = 0 },
+        .{ .phase = .extension, .event = .turn_end, .turn_index = 0 },
+        .{ .phase = .public, .event = .turn_end, .turn_index = 0 },
+        .{ .phase = .extension, .event = .agent_end },
+        .{ .phase = .public, .event = .agent_end, .will_retry = true },
+    };
+    try std.testing.expectEqualSlices(LifecycleObservation, &expected, order.items);
+    try std.testing.expectEqual(@as(usize, 1), bridge.turn_index);
+}
+
 const MessageEndReplacementState = struct {
     allocator: std.mem.Allocator,
     calls: usize = 0,
@@ -280,6 +634,140 @@ const MessageEndObserver = struct {
     fn onMessageEnd(ptr: ?*anyopaque, message: messages.CodingAgentMessage) void {
         const observer: *@This() = @ptrCast(@alignCast(ptr.?));
         if (message == .assistant) observer.assistant_cost_total = message.assistant.usage.cost.total;
+    }
+};
+
+const ObservationPhase = enum {
+    extension,
+    public,
+};
+
+const ObservedMessageEvent = enum {
+    message_start,
+    message_end,
+};
+
+const ObservedRole = enum {
+    user,
+    assistant,
+    tool_result,
+    bash_execution,
+    custom,
+    branch_summary,
+    compaction_summary,
+};
+
+const MessageOrderObservation = struct {
+    phase: ObservationPhase,
+    event: ObservedMessageEvent,
+    role: ObservedRole,
+};
+
+const MessageOrderState = struct {
+    allocator: std.mem.Allocator,
+    order: *std.ArrayList(MessageOrderObservation),
+
+    fn extensionHandler(ptr: ?*anyopaque, event_value: extensions.ExtensionEvent, ctx: *extensions.ExtensionContext) !?std.json.Value {
+        _ = ctx;
+        const state: *@This() = @ptrCast(@alignCast(ptr.?));
+        switch (event_value) {
+            .message_start => |event| try state.append(.extension, .message_start, event.message),
+            .message_end => |event| try state.append(.extension, .message_end, event.message),
+            else => {},
+        }
+        return null;
+    }
+
+    fn publicListener(ptr: ?*anyopaque, event: SessionEvent) void {
+        const state: *@This() = @ptrCast(@alignCast(ptr.?));
+        switch (event) {
+            .message_start => |payload| state.append(.public, .message_start, payload.message) catch @panic("out of memory"),
+            .message_end => |payload| state.append(.public, .message_end, payload.message) catch @panic("out of memory"),
+            else => {},
+        }
+    }
+
+    fn append(
+        self: *@This(),
+        phase: ObservationPhase,
+        event: ObservedMessageEvent,
+        message: messages.CodingAgentMessage,
+    ) !void {
+        try self.order.append(self.allocator, .{
+            .phase = phase,
+            .event = event,
+            .role = observedRole(message),
+        });
+    }
+};
+
+fn observedRole(message: messages.CodingAgentMessage) ObservedRole {
+    return switch (message) {
+        .user => .user,
+        .assistant => .assistant,
+        .tool_result => .tool_result,
+        .bash_execution => .bash_execution,
+        .custom => .custom,
+        .branch_summary => .branch_summary,
+        .compaction_summary => .compaction_summary,
+    };
+}
+
+const ObservedLifecycleEvent = enum {
+    agent_start,
+    agent_end,
+    turn_start,
+    turn_end,
+};
+
+const LifecycleObservation = struct {
+    phase: ObservationPhase,
+    event: ObservedLifecycleEvent,
+    turn_index: ?usize = null,
+    will_retry: ?bool = null,
+};
+
+const LifecycleOrderState = struct {
+    allocator: std.mem.Allocator,
+    order: *std.ArrayList(LifecycleObservation),
+
+    fn extensionHandler(ptr: ?*anyopaque, event_value: extensions.ExtensionEvent, ctx: *extensions.ExtensionContext) !?std.json.Value {
+        _ = ctx;
+        const state: *@This() = @ptrCast(@alignCast(ptr.?));
+        switch (event_value) {
+            .agent_start => try state.append(.extension, .agent_start, null, null),
+            .agent_end => try state.append(.extension, .agent_end, null, null),
+            .turn_start => |event| try state.append(.extension, .turn_start, event.turn_index, null),
+            .turn_end => |event| try state.append(.extension, .turn_end, event.turn_index, null),
+            else => {},
+        }
+        return null;
+    }
+
+    fn publicListener(ptr: ?*anyopaque, event: SessionEvent) void {
+        const state: *@This() = @ptrCast(@alignCast(ptr.?));
+        switch (event) {
+            .agent_start => state.append(.public, .agent_start, null, null) catch @panic("out of memory"),
+            .agent_end => |payload| state.append(.public, .agent_end, null, payload.will_retry) catch @panic("out of memory"),
+            .turn_start => |payload| state.append(.public, .turn_start, payload.turn_index, null) catch @panic("out of memory"),
+            .turn_end => |payload| state.append(.public, .turn_end, payload.turn_index, null) catch @panic("out of memory"),
+            else => {},
+        }
+    }
+
+    fn append(
+        self: *@This(),
+        phase: ObservationPhase,
+        event: ObservedLifecycleEvent,
+        turn_index: ?usize,
+        will_retry: ?bool,
+    ) !void {
+        try self.order.append(self.allocator, .{
+            .phase = phase,
+            .event = event,
+            .turn_index = turn_index,
+            .will_retry = will_retry,
+        });
     }
 };
 
