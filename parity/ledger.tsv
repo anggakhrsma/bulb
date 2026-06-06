@@ -412,7 +412,7 @@ packages/coding-agent/src/cli/session-picker.ts	bulb_coding_agent	source	pending
 packages/coding-agent/src/config.ts	bulb_coding_agent	source	in_progress	src/bulb_coding_agent/config.zig	Bulb-native product constants, release service URL override, ~/.bulb/agent default, BULB_CODING_AGENT_DIR and BULB_CODING_AGENT_SESSION_DIR overrides, tilde expansion, and auth path helper ported; broader native release and resource paths remain
 packages/coding-agent/src/core/agent-session-runtime.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/core/agent-session-services.ts	bulb_coding_agent	source	pending		
-packages/coding-agent/src/core/agent-session.ts	bulb_coding_agent	source	pending		
+packages/coding-agent/src/core/agent-session.ts	bulb_coding_agent	source	in_progress	src/bulb_coding_agent/session_events.zig	AgentSession message_end extension ordering, replacement mutation, public listener emission, regular/custom persistence routing, and non-LLM persistence skipping ported through a native session event bridge; full prompt queue, retry, compaction, subscription, and runtime lifecycle remain
 packages/coding-agent/src/core/auth-guidance.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/core/auth-storage.ts	bulb_coding_agent	source	in_progress	src/bulb_coding_agent/auth_storage.zig	Owned API-key and OAuth JSON credentials, secure file and in-memory backends, locked merge-preserving provider writes, malformed-file protection, error drains, runtime/stored/environment/fallback precedence, auth status, provider listing, login/logout, lock-aware OAuth refresh, stale persisted-token reread, and compromised-lock retry behavior ported; externally pluggable storage backend API remains
 packages/coding-agent/src/core/bash-executor.ts	bulb_coding_agent	source	implemented	src/bulb_coding_agent/bash_executor.zig	Reusable BashOperations executor ported with sanitized combined output, abort cancellation result mapping, tail truncation, full-output persistence, and streaming chunk callback coverage
@@ -683,7 +683,7 @@ packages/coding-agent/test/suite/agent-session-model-extension.test.ts	bulb_codi
 packages/coding-agent/test/suite/agent-session-prompt.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/suite/agent-session-queue.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/suite/agent-session-retry-events.test.ts	bulb_coding_agent	test	pending		
-packages/coding-agent/test/suite/agent-session-runtime.test.ts	bulb_coding_agent	test	pending		
+packages/coding-agent/test/suite/agent-session-runtime.test.ts	bulb_coding_agent	test	in_progress	src/bulb_coding_agent/session_events.zig	Upstream message_end assistant replacement persistence case ported through native SessionEventBridge; session_before_switch/session_start, reload/resume, queue, and broader runtime lifecycle cases remain
 packages/coding-agent/test/suite/harness.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/suite/regressions/1717-2113-agent-session-event-settlement.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/suite/regressions/2023-queued-slash-command-followup.test.ts	bulb_coding_agent	test	pending		
@@ -700,7 +700,7 @@ packages/coding-agent/test/suite/regressions/3592-no-builtin-tools-keeps-extensi
 packages/coding-agent/test/suite/regressions/3616-settings-inmemory-reload.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/suite/regressions/3686-session-name-event.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/suite/regressions/3688-tree-cancel-compacting.test.ts	bulb_coding_agent	test	pending		
-packages/coding-agent/test/suite/regressions/3982-message-end-cost-override.test.ts	bulb_coding_agent	test	pending		
+packages/coding-agent/test/suite/regressions/3982-message-end-cost-override.test.ts	bulb_coding_agent	test	implemented	src/bulb_coding_agent/session_events.zig	Upstream message_end cost override regression ported: extension replacement updates in-memory assistant message, public message_end listener payload, and persisted session JSONL cost
 packages/coding-agent/test/suite/regressions/4167-thinking-toggle-pending-tool-render.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/suite/regressions/5080-signal-shutdown-extension-cleanup.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/suite/regressions/5109-exclude-tools.test.ts	bulb_coding_agent	test	pending		
