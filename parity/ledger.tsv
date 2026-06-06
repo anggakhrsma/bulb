@@ -432,10 +432,10 @@ packages/coding-agent/src/core/export-html/template.js	bulb_coding_agent	source	
 packages/coding-agent/src/core/export-html/tool-renderer.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/core/export-html/vendor/highlight.min.js	bulb_coding_agent	source	pending		
 packages/coding-agent/src/core/export-html/vendor/marked.min.js	bulb_coding_agent	source	pending		
-packages/coding-agent/src/core/extensions/index.ts	bulb_coding_agent	source	pending		
+packages/coding-agent/src/core/extensions/index.ts	bulb_coding_agent	source	in_progress	src/bulb_coding_agent/extensions/root.zig	Native extension namespace exports the Zig event/type contract, provider/tool/command records, result helpers, and built-in tool guards; loader, runner, wrapper, and dynamic runtime wiring remain
 packages/coding-agent/src/core/extensions/loader.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/core/extensions/runner.ts	bulb_coding_agent	source	pending		
-packages/coding-agent/src/core/extensions/types.ts	bulb_coding_agent	source	pending		
+packages/coding-agent/src/core/extensions/types.ts	bulb_coding_agent	source	implemented	src/bulb_coding_agent/extensions/types.zig	Native extension contract ported with Pi event names, mode/source/reason enums, UI/context callback tables, command/session action records, tool definition/result/call events, result payloads, provider registration config, loaded-extension records, type guard helpers, and focused contract tests
 packages/coding-agent/src/core/extensions/wrapper.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/core/footer-data-provider.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/core/http-dispatcher.ts	bulb_coding_agent	source	in_progress	src/bulb_coding_agent/settings_manager.zig	DEFAULT_HTTP_IDLE_TIMEOUT_MS and parseHttpIdleTimeoutMs semantics ported for settings consumption; native dispatcher/proxy integration remains
@@ -475,7 +475,7 @@ packages/coding-agent/src/core/tools/render-utils.ts	bulb_coding_agent	source	im
 packages/coding-agent/src/core/tools/tool-definition-wrapper.ts	bulb_coding_agent	source	in_progress	src/bulb_coding_agent/tools/tool_registry.zig	Native ToolDefinition-to-AgentTool wrapping ported with metadata, execution mode, built-in executor dispatch, custom executor round-trip, and AgentTool-to-definition synthesis; ExtensionContext factory forwarding and prepareArguments hooks remain with the extension/runtime integration
 packages/coding-agent/src/core/tools/truncate.ts	bulb_coding_agent	source	implemented	src/bulb_coding_agent/tools/truncate.zig	Shared tool truncation constants, size formatting, head/tail truncation metadata, UTF-8 tail-boundary handling, first-line byte-limit detection, and grep line truncation suffix ported
 packages/coding-agent/src/core/tools/write.ts	bulb_coding_agent	source	in_progress	src/bulb_coding_agent/tools/write.zig	Native write execution, pluggable mkdir/write operations, cwd/home path resolution, parent directory creation, shared mutation-queue locking, abort checks held through in-flight writes, success payloads, and call/result rendering ported; Pi syntax-highlight cache parity remains
-packages/coding-agent/src/index.ts	bulb_coding_agent	source	pending		
+packages/coding-agent/src/index.ts	bulb_coding_agent	source	in_progress	src/bulb_coding_agent/root.zig	Top-level coding-agent public barrel started with direct Args/config/auth/model/settings/session aliases, extension contract exports, tool registry aliases, and Pi-style built-in tool factory wrappers; AgentSession, main, modes, UI component, and remaining utility exports stay incremental
 packages/coding-agent/src/main.ts	bulb_coding_agent	source	in_progress	src/bulb_coding_agent/startup_session_name.zig	Startup --name trimming, empty-name rejection, and pre-runtime session_info append ordering ported as a native helper; broader CLI/runtime startup remains
 packages/coding-agent/src/migrations.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/modes/index.ts	bulb_coding_agent	source	pending		
