@@ -16,6 +16,18 @@ pub const SettingsError = struct {
     message: []const u8,
 };
 
+pub const RetrySettings = struct {
+    enabled: bool = true,
+    max_retries: usize = 3,
+    base_delay_ms: u64 = 2000,
+};
+
+pub const ProviderRetrySettings = struct {
+    timeout_ms: ?u64 = null,
+    max_retries: ?usize = null,
+    max_retry_delay_ms: u64 = 60_000,
+};
+
 pub const PackageSource = union(enum) {
     string: []const u8,
     object: PackageObject,
@@ -186,6 +198,39 @@ pub const SettingsManager = struct {
         try self.saveGlobal();
     }
 
+    pub fn getRetryEnabled(self: *const SettingsManager) bool {
+        const retry = fieldValue(self.settings, "retry") orelse return true;
+        return optionalBool(retry, "enabled") orelse true;
+    }
+
+    pub fn setRetryEnabled(self: *SettingsManager, enabled: bool) !void {
+        var retry = fieldValue(self.global_settings, "retry") orelse objectValue();
+        if (retry != .object) retry = objectValue();
+        try putValue(self.arena.allocator(), &retry, "enabled", .{ .bool = enabled });
+        try putValue(self.arena.allocator(), &self.global_settings, "retry", retry);
+        try self.markModifiedNested("retry", "enabled");
+        try self.saveGlobal();
+    }
+
+    pub fn getRetrySettings(self: *const SettingsManager) RetrySettings {
+        const retry = fieldValue(self.settings, "retry") orelse return .{};
+        return .{
+            .enabled = optionalBool(retry, "enabled") orelse true,
+            .max_retries = optionalUsize(retry, "maxRetries") orelse 3,
+            .base_delay_ms = optionalU64(retry, "baseDelayMs") orelse 2000,
+        };
+    }
+
+    pub fn getProviderRetrySettings(self: *const SettingsManager) ProviderRetrySettings {
+        const retry = fieldValue(self.settings, "retry") orelse return .{};
+        const provider = fieldValue(retry, "provider") orelse return .{};
+        return .{
+            .timeout_ms = optionalU64(provider, "timeoutMs"),
+            .max_retries = optionalUsize(provider, "maxRetries"),
+            .max_retry_delay_ms = optionalU64(provider, "maxRetryDelayMs") orelse 60_000,
+        };
+    }
+
     pub fn getSessionDirAlloc(self: *const SettingsManager, allocator: std.mem.Allocator, home_dir: ?[]const u8) !?[]u8 {
         const session_dir = optionalString(self.settings, "sessionDir") orelse return null;
         const normalized = try paths.normalizePathAlloc(allocator, session_dir, .{ .home_dir = home_dir });
@@ -194,6 +239,10 @@ pub const SettingsManager = struct {
 
     pub fn getHttpIdleTimeoutMs(self: *const SettingsManager) !i64 {
         return (try parseTimeoutSetting(fieldValue(self.settings, "httpIdleTimeoutMs"), "httpIdleTimeoutMs")) orelse default_http_idle_timeout_ms;
+    }
+
+    pub fn getWebSocketConnectTimeoutMs(self: *const SettingsManager) !?i64 {
+        return try parseTimeoutSetting(fieldValue(self.settings, "websocketConnectTimeoutMs"), "websocketConnectTimeoutMs");
     }
 
     pub fn setHttpIdleTimeoutMs(self: *SettingsManager, timeout_ms: i64) !void {
@@ -447,6 +496,10 @@ pub const SettingsManager = struct {
         try self.modified_fields.append(self.allocator, .{ .field = field });
     }
 
+    fn markModifiedNested(self: *SettingsManager, field: []const u8, nested: []const u8) !void {
+        try self.modified_fields.append(self.allocator, .{ .field = field, .nested = nested });
+    }
+
     fn markProjectModified(self: *SettingsManager, field: []const u8) !void {
         try self.modified_project_fields.append(self.allocator, .{ .field = field });
     }
@@ -478,7 +531,10 @@ fn deepMergeSettings(allocator: std.mem.Allocator, base: std.json.Value, overrid
     if (base != .object and overrides != .object) return objectValue();
     if (base != .object) return cloneObjectValue(allocator, overrides);
     if (overrides != .object) return cloneObjectValue(allocator, base);
+    return mergeObjectValues(allocator, base, overrides);
+}
 
+fn mergeObjectValues(allocator: std.mem.Allocator, base: std.json.Value, overrides: std.json.Value) !std.json.Value {
     var result = objectValue();
     var base_it = base.object.iterator();
     while (base_it.next()) |entry| {
@@ -491,26 +547,13 @@ fn deepMergeSettings(allocator: std.mem.Allocator, base: std.json.Value, overrid
         const override_value = entry.value_ptr.*;
         if (base_value) |existing| {
             if (existing == .object and override_value == .object) {
-                try putValue(allocator, &result, entry.key_ptr.*, try shallowMergeObjects(allocator, existing, override_value));
+                try putValue(allocator, &result, entry.key_ptr.*, try mergeObjectValues(allocator, existing, override_value));
                 continue;
             }
         }
         try putValue(allocator, &result, entry.key_ptr.*, override_value);
     }
 
-    return result;
-}
-
-fn shallowMergeObjects(allocator: std.mem.Allocator, base: std.json.Value, overrides: std.json.Value) !std.json.Value {
-    var result = objectValue();
-    var base_it = base.object.iterator();
-    while (base_it.next()) |entry| {
-        try putValue(allocator, &result, entry.key_ptr.*, entry.value_ptr.*);
-    }
-    var override_it = overrides.object.iterator();
-    while (override_it.next()) |entry| {
-        try putValue(allocator, &result, entry.key_ptr.*, entry.value_ptr.*);
-    }
     return result;
 }
 
@@ -620,6 +663,36 @@ fn optionalString(value: std.json.Value, field: []const u8) ?[]const u8 {
     const nested = fieldValue(value, field) orelse return null;
     if (nested != .string) return null;
     return nested.string;
+}
+
+fn optionalBool(value: std.json.Value, field: []const u8) ?bool {
+    const nested = fieldValue(value, field) orelse return null;
+    return switch (nested) {
+        .bool => |boolean| boolean,
+        else => null,
+    };
+}
+
+fn optionalU64(value: std.json.Value, field: []const u8) ?u64 {
+    const nested = fieldValue(value, field) orelse return null;
+    return u64FromJson(nested);
+}
+
+fn optionalUsize(value: std.json.Value, field: []const u8) ?usize {
+    const number = optionalU64(value, field) orelse return null;
+    return std.math.cast(usize, number);
+}
+
+fn u64FromJson(value: std.json.Value) ?u64 {
+    return switch (value) {
+        .integer => |integer| if (integer >= 0) @as(u64, @intCast(integer)) else null,
+        .float => |float| if (std.math.isFinite(float) and float >= 0) @as(u64, @intFromFloat(@floor(float))) else null,
+        .number_string => |number| blk: {
+            const parsed = std.fmt.parseFloat(f64, number) catch break :blk null;
+            break :blk if (std.math.isFinite(parsed) and parsed >= 0) @as(u64, @intFromFloat(@floor(parsed))) else null;
+        },
+        else => null,
+    };
 }
 
 fn optionalStringArrayAlloc(allocator: std.mem.Allocator, maybe_value: ?std.json.Value) ![]const []const u8 {
@@ -1182,4 +1255,62 @@ test "settings manager getSessionDir uses project override and expands home" {
     const expanded = (try manager.getSessionDirAlloc(allocator, "/home/bulb")).?;
     defer allocator.free(expanded);
     try std.testing.expectEqualStrings("/home/bulb/sessions", expanded);
+}
+
+test "settings manager reads retry defaults project overrides and provider migration" {
+    const allocator = std.testing.allocator;
+    var dirs = try settingsTestDirs(allocator);
+    defer dirs.cleanup(allocator);
+
+    var manager = try SettingsManager.create(allocator, std.testing.io, dirs.project, dirs.agent);
+    defer manager.deinit();
+    var retry = manager.getRetrySettings();
+    try std.testing.expect(retry.enabled);
+    try std.testing.expectEqual(@as(usize, 3), retry.max_retries);
+    try std.testing.expectEqual(@as(u64, 2000), retry.base_delay_ms);
+
+    const global_settings_path = try std.fs.path.join(allocator, &.{ dirs.agent, "settings.json" });
+    defer allocator.free(global_settings_path);
+    const project_settings_path = try std.fs.path.join(allocator, &.{ dirs.project, config.project_config_dir, "settings.json" });
+    defer allocator.free(project_settings_path);
+    try writeFile(global_settings_path,
+        \\{"retry":{"enabled":false,"maxRetries":1,"baseDelayMs":9,"maxDelayMs":70000,"provider":{"timeoutMs":120000,"maxRetries":2}}}
+    );
+    try writeFile(project_settings_path,
+        \\{"retry":{"enabled":true,"maxRetries":5,"provider":{"maxRetryDelayMs":30000}}}
+    );
+    try manager.reload();
+
+    retry = manager.getRetrySettings();
+    try std.testing.expect(retry.enabled);
+    try std.testing.expectEqual(@as(usize, 5), retry.max_retries);
+    try std.testing.expectEqual(@as(u64, 9), retry.base_delay_ms);
+
+    const provider_retry = manager.getProviderRetrySettings();
+    try std.testing.expectEqual(@as(u64, 120000), provider_retry.timeout_ms.?);
+    try std.testing.expectEqual(@as(usize, 2), provider_retry.max_retries.?);
+    try std.testing.expectEqual(@as(u64, 30000), provider_retry.max_retry_delay_ms);
+}
+
+test "settings manager setRetryEnabled persists only retry enabled" {
+    const allocator = std.testing.allocator;
+    var dirs = try settingsTestDirs(allocator);
+    defer dirs.cleanup(allocator);
+
+    const settings_path = try std.fs.path.join(allocator, &.{ dirs.agent, "settings.json" });
+    defer allocator.free(settings_path);
+    try writeFile(settings_path, "{\"retry\":{\"enabled\":true,\"maxRetries\":7,\"provider\":{\"maxRetryDelayMs\":12345}},\"theme\":\"dark\"}");
+
+    var manager = try SettingsManager.create(allocator, std.testing.io, dirs.project, dirs.agent);
+    defer manager.deinit();
+    try manager.setRetryEnabled(false);
+    try manager.flush();
+
+    var saved = try readJsonFile(allocator, settings_path);
+    defer saved.deinit();
+    const retry = saved.value.object.get("retry").?;
+    try std.testing.expect(retry.object.get("enabled").?.bool == false);
+    try std.testing.expectEqual(@as(i64, 7), retry.object.get("maxRetries").?.integer);
+    try std.testing.expectEqual(@as(i64, 12345), retry.object.get("provider").?.object.get("maxRetryDelayMs").?.integer);
+    try std.testing.expectEqualStrings("dark", saved.value.object.get("theme").?.string);
 }

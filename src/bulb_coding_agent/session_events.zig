@@ -7,11 +7,25 @@ const extensions = @import("extensions/root.zig");
 const messages = @import("messages.zig");
 const model_registry = @import("model_registry.zig");
 const session_manager = @import("session_manager.zig");
+const settings_manager = @import("settings_manager.zig");
 const source_info = @import("source_info.zig");
 
 pub const AgentEndSessionEvent = struct {
     messages: []messages.CodingAgentMessage,
     will_retry: bool,
+};
+
+pub const AutoRetryStartSessionEvent = struct {
+    attempt: usize,
+    max_attempts: usize,
+    delay_ms: u64,
+    error_message: []const u8,
+};
+
+pub const AutoRetryEndSessionEvent = struct {
+    success: bool,
+    attempt: usize,
+    final_error: ?[]const u8 = null,
 };
 
 pub const TurnStartSessionEvent = struct {
@@ -57,6 +71,8 @@ pub const ToolExecutionEndSessionEvent = struct {
 pub const SessionEvent = union(enum) {
     agent_start: void,
     agent_end: AgentEndSessionEvent,
+    auto_retry_start: AutoRetryStartSessionEvent,
+    auto_retry_end: AutoRetryEndSessionEvent,
     turn_start: TurnStartSessionEvent,
     turn_end: TurnEndSessionEvent,
     message_start: MessageSessionEvent,
@@ -132,6 +148,14 @@ pub const SessionEventBridge = struct {
             .messages = agent_messages,
             .will_retry = will_retry,
         } });
+    }
+
+    pub fn handleAutoRetryStart(self: *SessionEventBridge, event: AutoRetryStartSessionEvent) void {
+        self.emitPublic(.{ .auto_retry_start = event });
+    }
+
+    pub fn handleAutoRetryEnd(self: *SessionEventBridge, event: AutoRetryEndSessionEvent) void {
+        self.emitPublic(.{ .auto_retry_end = event });
     }
 
     pub fn handleTurnStart(
@@ -275,6 +299,237 @@ pub const SessionEventBridge = struct {
         }
     }
 };
+
+pub const AutoRetryController = struct {
+    settings: settings_manager.RetrySettings = .{},
+    context_window: ?u64 = null,
+    retry_attempt: usize = 0,
+    retrying: bool = false,
+
+    pub fn init(settings: settings_manager.RetrySettings, context_window: ?u64) AutoRetryController {
+        return .{
+            .settings = settings,
+            .context_window = context_window,
+        };
+    }
+
+    pub fn isRetrying(self: *const AutoRetryController) bool {
+        return self.retrying;
+    }
+
+    pub fn willRetryAfterAgentEnd(
+        self: *const AutoRetryController,
+        agent_messages: []const messages.CodingAgentMessage,
+    ) bool {
+        if (!self.settings.enabled or self.retry_attempt >= self.settings.max_retries) return false;
+        var index = agent_messages.len;
+        while (index > 0) {
+            index -= 1;
+            switch (agent_messages[index]) {
+                .assistant => |assistant| return isRetryableError(assistant, self.context_window),
+                else => {},
+            }
+        }
+        return false;
+    }
+
+    pub fn prepareRetry(
+        self: *AutoRetryController,
+        bridge: *SessionEventBridge,
+        message: ai.AssistantMessage,
+    ) ?AutoRetryStartSessionEvent {
+        if (!self.settings.enabled) return null;
+        if (!isRetryableError(message, self.context_window)) return null;
+
+        self.retry_attempt += 1;
+        if (self.retry_attempt > self.settings.max_retries) {
+            self.retry_attempt -= 1;
+            return null;
+        }
+
+        const event = AutoRetryStartSessionEvent{
+            .attempt = self.retry_attempt,
+            .max_attempts = self.settings.max_retries,
+            .delay_ms = retryDelayMs(self.settings.base_delay_ms, self.retry_attempt),
+            .error_message = message.error_message orelse "Unknown error",
+        };
+        self.retrying = true;
+        bridge.handleAutoRetryStart(event);
+        return event;
+    }
+
+    pub fn completeRetrySuccess(
+        self: *AutoRetryController,
+        bridge: *SessionEventBridge,
+    ) ?AutoRetryEndSessionEvent {
+        if (self.retry_attempt == 0) return null;
+        const event = AutoRetryEndSessionEvent{
+            .success = true,
+            .attempt = self.retry_attempt,
+        };
+        self.retry_attempt = 0;
+        self.retrying = false;
+        bridge.handleAutoRetryEnd(event);
+        return event;
+    }
+
+    pub fn completeRetryFailure(
+        self: *AutoRetryController,
+        bridge: *SessionEventBridge,
+        final_error: ?[]const u8,
+    ) ?AutoRetryEndSessionEvent {
+        if (self.retry_attempt == 0) return null;
+        const event = AutoRetryEndSessionEvent{
+            .success = false,
+            .attempt = self.retry_attempt,
+            .final_error = final_error,
+        };
+        self.retry_attempt = 0;
+        self.retrying = false;
+        bridge.handleAutoRetryEnd(event);
+        return event;
+    }
+
+    pub fn abortRetry(self: *AutoRetryController, bridge: *SessionEventBridge) ?AutoRetryEndSessionEvent {
+        if (!self.retrying and self.retry_attempt == 0) return null;
+        return self.completeRetryFailure(bridge, "Retry cancelled");
+    }
+};
+
+pub fn isRetryableError(message: ai.AssistantMessage, context_window: ?u64) bool {
+    if (message.stop_reason != .@"error") return false;
+    const error_message = message.error_message orelse return false;
+    if (ai.overflow.isContextOverflow(message, context_window)) return false;
+    if (isNonRetryableProviderLimitError(error_message)) return false;
+    return isRetryableErrorText(error_message);
+}
+
+pub fn isNonRetryableProviderLimitError(error_message: []const u8) bool {
+    const non_retryable = [_][]const u8{
+        "GoUsageLimitError",
+        "FreeUsageLimitError",
+        "Monthly usage limit reached",
+        "available balance",
+        "insufficient_quota",
+        "out of budget",
+        "quota exceeded",
+        "billing",
+    };
+    return containsAnyAsciiIgnoreCase(error_message, &non_retryable);
+}
+
+pub fn retryDelayMs(base_delay_ms: u64, attempt: usize) u64 {
+    if (attempt == 0) return base_delay_ms;
+    var delay = base_delay_ms;
+    var remaining = attempt - 1;
+    while (remaining > 0) : (remaining -= 1) {
+        delay = std.math.mul(u64, delay, 2) catch return std.math.maxInt(u64);
+    }
+    return delay;
+}
+
+fn isRetryableErrorText(error_message: []const u8) bool {
+    const direct_phrases = [_][]const u8{
+        "overloaded",
+        "overloaded_error",
+        "provider returned error",
+        "provider_returned_error",
+        "rate limit",
+        "rate_limit",
+        "too many requests",
+        "429",
+        "500",
+        "502",
+        "503",
+        "504",
+        "service unavailable",
+        "service_unavailable",
+        "server error",
+        "server_error",
+        "internal error",
+        "internal_error",
+        "network error",
+        "network_error",
+        "connection error",
+        "connection_error",
+        "connection refused",
+        "connection_refused",
+        "connection lost",
+        "connection_lost",
+        "websocket closed",
+        "websocket error",
+        "other side closed",
+        "fetch failed",
+        "upstream connect",
+        "reset before headers",
+        "socket hang up",
+        "ended without",
+        "stream ended before message_stop",
+        "http2 request did not get a response",
+        "timed out",
+        "timeout",
+        "terminated",
+        "retry delay",
+    };
+    if (containsAnyAsciiIgnoreCase(error_message, &direct_phrases)) return true;
+
+    const token_groups = [_][]const []const u8{
+        &.{ "provider", "returned", "error" },
+        &.{ "rate", "limit" },
+        &.{ "service", "unavailable" },
+        &.{ "server", "error" },
+        &.{ "internal", "error" },
+        &.{ "network", "error" },
+        &.{ "connection", "error" },
+        &.{ "connection", "refused" },
+        &.{ "connection", "lost" },
+        &.{ "websocket", "closed" },
+        &.{ "websocket", "error" },
+        &.{ "upstream", "connect" },
+        &.{ "retry", "delay" },
+    };
+    for (token_groups) |tokens| {
+        if (containsTokenSequenceAsciiIgnoreCase(error_message, tokens)) return true;
+    }
+    return false;
+}
+
+fn containsAnyAsciiIgnoreCase(haystack: []const u8, needles: []const []const u8) bool {
+    for (needles) |needle| {
+        if (containsAsciiIgnoreCase(haystack, needle)) return true;
+    }
+    return false;
+}
+
+fn containsAsciiIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    return indexOfAsciiIgnoreCase(haystack, needle, 0) != null;
+}
+
+fn containsTokenSequenceAsciiIgnoreCase(haystack: []const u8, tokens: []const []const u8) bool {
+    var start: usize = 0;
+    for (tokens) |token| {
+        const found = indexOfAsciiIgnoreCase(haystack, token, start) orelse return false;
+        start = found + token.len;
+    }
+    return true;
+}
+
+fn indexOfAsciiIgnoreCase(haystack: []const u8, needle: []const u8, start_index: usize) ?usize {
+    if (needle.len == 0) return start_index;
+    if (start_index >= haystack.len or needle.len > haystack.len - start_index) return null;
+    var index = start_index;
+    while (index <= haystack.len - needle.len) : (index += 1) {
+        var matches = true;
+        for (needle, 0..) |byte, offset| {
+            if (std.ascii.toLower(haystack[index + offset]) != std.ascii.toLower(byte)) {
+                matches = false;
+                break;
+            }
+        }
+        if (matches) return index;
+    }
+    return null;
+}
 
 fn persistMessageEnd(
     io: std.Io,
@@ -585,6 +840,130 @@ test "AgentSession bridge emits lifecycle events extension-first and advances tu
     try std.testing.expectEqual(@as(usize, 1), bridge.turn_index);
 }
 
+test "AgentSession retry controller emits retry start and success end events" {
+    const allocator = std.testing.allocator;
+    var bridge = SessionEventBridge.init(allocator);
+    defer bridge.deinit();
+
+    var observations: std.ArrayList(RetryObservation) = .empty;
+    defer observations.deinit(allocator);
+    var observer = RetryObserver{ .allocator = allocator, .observations = &observations };
+    try bridge.subscribe(.{ .ptr = &observer, .call_fn = RetryObserver.publicListener });
+
+    var controller = AutoRetryController.init(.{
+        .enabled = true,
+        .max_retries = 3,
+        .base_delay_ms = 1,
+    }, null);
+
+    const overloaded = assistantError("overloaded_error");
+    const agent_messages = [_]messages.CodingAgentMessage{.{ .assistant = overloaded }};
+    try std.testing.expect(controller.willRetryAfterAgentEnd(&agent_messages));
+
+    const first_start = controller.prepareRetry(&bridge, overloaded).?;
+    try std.testing.expectEqual(@as(usize, 1), first_start.attempt);
+    try std.testing.expectEqual(@as(u64, 1), first_start.delay_ms);
+    try std.testing.expect(controller.isRetrying());
+
+    const second_start = controller.prepareRetry(&bridge, overloaded).?;
+    try std.testing.expectEqual(@as(usize, 2), second_start.attempt);
+    try std.testing.expectEqual(@as(u64, 2), second_start.delay_ms);
+
+    const success = controller.completeRetrySuccess(&bridge).?;
+    try std.testing.expect(success.success);
+    try std.testing.expectEqual(@as(usize, 2), success.attempt);
+    try std.testing.expect(!controller.isRetrying());
+    try std.testing.expectEqual(@as(usize, 0), controller.retry_attempt);
+
+    const expected = [_]RetryObservation{
+        .{ .event = .start, .attempt = 1, .max_attempts = 3, .delay_ms = 1 },
+        .{ .event = .start, .attempt = 2, .max_attempts = 3, .delay_ms = 2 },
+        .{ .event = .end, .attempt = 2, .success = true },
+    };
+    try std.testing.expectEqualSlices(RetryObservation, &expected, observations.items);
+}
+
+test "AgentSession retry controller exhausts max retries and emits failure end" {
+    const allocator = std.testing.allocator;
+    var bridge = SessionEventBridge.init(allocator);
+    defer bridge.deinit();
+
+    var observations: std.ArrayList(RetryObservation) = .empty;
+    defer observations.deinit(allocator);
+    var observer = RetryObserver{ .allocator = allocator, .observations = &observations };
+    try bridge.subscribe(.{ .ptr = &observer, .call_fn = RetryObserver.publicListener });
+
+    var controller = AutoRetryController.init(.{
+        .enabled = true,
+        .max_retries = 2,
+        .base_delay_ms = 10,
+    }, null);
+    const overloaded = assistantError("Provider finish_reason: network_error");
+
+    try std.testing.expect(controller.prepareRetry(&bridge, overloaded) != null);
+    try std.testing.expect(controller.prepareRetry(&bridge, overloaded) != null);
+    try std.testing.expect(controller.prepareRetry(&bridge, overloaded) == null);
+
+    const agent_messages = [_]messages.CodingAgentMessage{.{ .assistant = overloaded }};
+    try std.testing.expect(!controller.willRetryAfterAgentEnd(&agent_messages));
+
+    const failure = controller.completeRetryFailure(&bridge, null).?;
+    try std.testing.expect(!failure.success);
+    try std.testing.expectEqual(@as(usize, 2), failure.attempt);
+    try std.testing.expect(!controller.isRetrying());
+
+    const expected = [_]RetryObservation{
+        .{ .event = .start, .attempt = 1, .max_attempts = 2, .delay_ms = 10 },
+        .{ .event = .start, .attempt = 2, .max_attempts = 2, .delay_ms = 20 },
+        .{ .event = .end, .attempt = 2, .success = false },
+    };
+    try std.testing.expectEqualSlices(RetryObservation, &expected, observations.items);
+}
+
+test "AgentSession retry controller skips disabled non-retryable and overflow errors" {
+    const allocator = std.testing.allocator;
+    var bridge = SessionEventBridge.init(allocator);
+    defer bridge.deinit();
+
+    var disabled = AutoRetryController.init(.{ .enabled = false }, null);
+    try std.testing.expect(disabled.prepareRetry(&bridge, assistantError("overloaded_error")) == null);
+
+    var enabled = AutoRetryController.init(.{ .enabled = true, .max_retries = 3, .base_delay_ms = 1 }, 32_768);
+    try std.testing.expect(enabled.prepareRetry(&bridge, assistantError("invalid_api_key")) == null);
+    try std.testing.expect(enabled.prepareRetry(&bridge, assistantError("insufficient_quota")) == null);
+    try std.testing.expect(enabled.prepareRetry(&bridge, assistantError("context_length_exceeded")) == null);
+    try std.testing.expect(isRetryableError(assistantError("Service unavailable: retry later"), 200_000));
+    try std.testing.expect(!isRetryableError(assistantError("Billing quota exceeded"), 200_000));
+}
+
+test "AgentSession retry controller cancels retry sleep as failure event" {
+    const allocator = std.testing.allocator;
+    var bridge = SessionEventBridge.init(allocator);
+    defer bridge.deinit();
+
+    var observations: std.ArrayList(RetryObservation) = .empty;
+    defer observations.deinit(allocator);
+    var observer = RetryObserver{ .allocator = allocator, .observations = &observations };
+    try bridge.subscribe(.{ .ptr = &observer, .call_fn = RetryObserver.publicListener });
+
+    var controller = AutoRetryController.init(.{
+        .enabled = true,
+        .max_retries = 3,
+        .base_delay_ms = 100,
+    }, null);
+    try std.testing.expect(controller.prepareRetry(&bridge, assistantError("connection lost")) != null);
+    const cancelled = controller.abortRetry(&bridge).?;
+    try std.testing.expect(!cancelled.success);
+    try std.testing.expectEqualStrings("Retry cancelled", cancelled.final_error.?);
+    try std.testing.expect(!controller.isRetrying());
+
+    const expected = [_]RetryObservation{
+        .{ .event = .start, .attempt = 1, .max_attempts = 3, .delay_ms = 100 },
+        .{ .event = .end, .attempt = 1, .success = false, .final_error = .cancelled },
+    };
+    try std.testing.expectEqualSlices(RetryObservation, &expected, observations.items);
+}
+
 const MessageEndReplacementState = struct {
     allocator: std.mem.Allocator,
     calls: usize = 0,
@@ -770,6 +1149,64 @@ const LifecycleOrderState = struct {
         });
     }
 };
+
+const ObservedRetryEvent = enum {
+    start,
+    end,
+};
+
+const ObservedRetryFinalError = enum {
+    none,
+    cancelled,
+    other,
+};
+
+const RetryObservation = struct {
+    event: ObservedRetryEvent,
+    attempt: usize,
+    max_attempts: usize = 0,
+    delay_ms: u64 = 0,
+    success: ?bool = null,
+    final_error: ObservedRetryFinalError = .none,
+};
+
+const RetryObserver = struct {
+    allocator: std.mem.Allocator,
+    observations: *std.ArrayList(RetryObservation),
+
+    fn publicListener(ptr: ?*anyopaque, event: SessionEvent) void {
+        const observer: *@This() = @ptrCast(@alignCast(ptr.?));
+        switch (event) {
+            .auto_retry_start => |payload| observer.observations.append(observer.allocator, .{
+                .event = .start,
+                .attempt = payload.attempt,
+                .max_attempts = payload.max_attempts,
+                .delay_ms = payload.delay_ms,
+            }) catch @panic("out of memory"),
+            .auto_retry_end => |payload| observer.observations.append(observer.allocator, .{
+                .event = .end,
+                .attempt = payload.attempt,
+                .success = payload.success,
+                .final_error = if (payload.final_error) |final_error|
+                    if (std.mem.eql(u8, final_error, "Retry cancelled")) .cancelled else .other
+                else
+                    .none,
+            }) catch @panic("out of memory"),
+            else => {},
+        }
+    }
+};
+
+fn assistantError(error_message: []const u8) ai.AssistantMessage {
+    return .{
+        .content = &.{},
+        .api = ai.types.api.openai_responses,
+        .provider = "openai",
+        .model = "gpt-test",
+        .stop_reason = .@"error",
+        .error_message = error_message,
+    };
+}
 
 const TestHarness = struct {
     allocator: std.mem.Allocator,
