@@ -465,7 +465,7 @@ packages/coding-agent/src/core/tools/edit-diff.ts	bulb_coding_agent	source	pendi
 packages/coding-agent/src/core/tools/edit.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/core/tools/file-mutation-queue.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/core/tools/find.ts	bulb_coding_agent	source	implemented	src/bulb_coding_agent/tools/find.zig	Native find execution, pluggable glob operations, hidden file discovery, simple hierarchical .gitignore filtering, globstar/path-pattern matching, limit/byte truncation details, call/result rendering, flag-like pattern safety, malformed glob rejection, and upstream find/path-glob tests ported without Node or fd runtime requirements
-packages/coding-agent/src/core/tools/grep.ts	bulb_coding_agent	source	pending		
+packages/coding-agent/src/core/tools/grep.ts	bulb_coding_agent	source	in_progress	src/bulb_coding_agent/tools/grep.zig	Native grep execution, pluggable filesystem operations, hidden-file and gitignore-aware directory walking, glob filters, literal and basic regex matching, context lines, match/byte/line truncation details, call/result rendering, and upstream tools.test grep coverage ported; full ripgrep regex-dialect parity remains
 packages/coding-agent/src/core/tools/index.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/core/tools/ls.ts	bulb_coding_agent	source	implemented	src/bulb_coding_agent/tools/ls.zig	Native ls execution, pluggable filesystem operations, dotfile/directory listing, case-insensitive sorting, entry/byte truncation details, path call rendering, collapsed result rendering, and upstream tools.test ls coverage ported
 packages/coding-agent/src/core/tools/output-accumulator.ts	bulb_coding_agent	source	pending		
@@ -713,7 +713,7 @@ packages/coding-agent/test/theme-detection.test.ts	bulb_coding_agent	test	pendin
 packages/coding-agent/test/theme-export.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/theme-picker.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/tool-execution-component.test.ts	bulb_coding_agent	test	pending		
-packages/coding-agent/test/tools.test.ts	bulb_coding_agent	test	in_progress	src/bulb_coding_agent/tools/find.zig	Built-in ls and find sections ported with native Zig tests; read/write/edit/bash/grep sections remain pending with their tool implementations
+packages/coding-agent/test/tools.test.ts	bulb_coding_agent	test	in_progress	src/bulb_coding_agent/tools/grep.zig	Built-in ls, find, and grep sections ported with native Zig tests; read/write/edit/bash sections remain pending with their tool implementations
 packages/coding-agent/test/tree-selector.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/trigger-compact-extension.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/truncate-to-width.test.ts	bulb_coding_agent	test	pending		
