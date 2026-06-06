@@ -461,8 +461,8 @@ packages/coding-agent/src/core/system-prompt.ts	bulb_coding_agent	source	impleme
 packages/coding-agent/src/core/telemetry.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/core/timings.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/core/tools/bash.ts	bulb_coding_agent	source	pending		
-packages/coding-agent/src/core/tools/edit-diff.ts	bulb_coding_agent	source	pending		
-packages/coding-agent/src/core/tools/edit.ts	bulb_coding_agent	source	pending		
+packages/coding-agent/src/core/tools/edit-diff.ts	bulb_coding_agent	source	in_progress	src/bulb_coding_agent/tools/edit_diff.zig	LF normalization, BOM stripping, CRLF restoration, exact and fuzzy text matching, duplicate/not-found/empty/overlap/no-change diagnostics, multi-edit original-content application, display diffs, unified patches, preview diagnostics, and upstream edit diff tests ported; full NFKC normalization and byte-for-byte npm diff output remain
+packages/coding-agent/src/core/tools/edit.ts	bulb_coding_agent	source	in_progress	src/bulb_coding_agent/tools/edit.zig	Native edit execution, legacy single-edit argument support, pluggable read/write/access operations, shared mutation-queue locking, abort checks held through in-flight writes, Pi-compatible success/details payloads, access diagnostics, multi-edit/no-partial semantics, CRLF/BOM preservation, and basic call/result rendering ported; async TUI preview component and schema/tool-wrapper integration remain
 packages/coding-agent/src/core/tools/file-mutation-queue.ts	bulb_coding_agent	source	implemented	src/bulb_coding_agent/tools/file_mutation_queue.zig	Native per-file mutation queue with realpath keying for symlink aliases, independent locks for different files, ref-counted cleanup, and upstream serialization/parallelism coverage ported
 packages/coding-agent/src/core/tools/find.ts	bulb_coding_agent	source	implemented	src/bulb_coding_agent/tools/find.zig	Native find execution, pluggable glob operations, hidden file discovery, simple hierarchical .gitignore filtering, globstar/path-pattern matching, limit/byte truncation details, call/result rendering, flag-like pattern safety, malformed glob rejection, and upstream find/path-glob tests ported without Node or fd runtime requirements
 packages/coding-agent/src/core/tools/grep.ts	bulb_coding_agent	source	in_progress	src/bulb_coding_agent/tools/grep.zig	Native grep execution, pluggable filesystem operations, hidden-file and gitignore-aware directory walking, glob filters, literal and basic regex matching, context lines, match/byte/line truncation details, call/result rendering, and upstream tools.test grep coverage ported; full ripgrep regex-dialect parity remains
@@ -591,7 +591,7 @@ packages/coding-agent/test/export-html-xss.test.ts	bulb_coding_agent	test	pendin
 packages/coding-agent/test/extensions-discovery.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/extensions-input-event.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/extensions-runner.test.ts	bulb_coding_agent	test	pending		
-packages/coding-agent/test/file-mutation-queue.test.ts	bulb_coding_agent	test	in_progress	src/bulb_coding_agent/tools/file_mutation_queue.zig	Queue serialization, different-file parallelism, symlink aliasing, and aborted-write queue retention ported; edit/write shared queue cases remain pending until edit tool parity lands
+packages/coding-agent/test/file-mutation-queue.test.ts	bulb_coding_agent	test	implemented	src/bulb_coding_agent/tools/edit.zig	Queue serialization, different-file parallelism, symlink aliasing, edit/write shared queue ordering, and aborted write/edit queue retention regressions ported
 packages/coding-agent/test/fixtures/assistant-message-with-thinking-code.json	bulb_coding_agent	fixture	pending		
 packages/coding-agent/test/fixtures/before-compaction.jsonl	bulb_coding_agent	fixture	pending		
 packages/coding-agent/test/fixtures/empty-agent/.gitkeep	bulb_coding_agent	fixture	pending		
@@ -713,7 +713,7 @@ packages/coding-agent/test/theme-detection.test.ts	bulb_coding_agent	test	pendin
 packages/coding-agent/test/theme-export.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/theme-picker.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/tool-execution-component.test.ts	bulb_coding_agent	test	pending		
-packages/coding-agent/test/tools.test.ts	bulb_coding_agent	test	in_progress	src/bulb_coding_agent/tools/write.zig	Built-in ls, find, grep, read, and write sections ported with native Zig tests; edit/bash sections remain pending with their tool implementations
+packages/coding-agent/test/tools.test.ts	bulb_coding_agent	test	in_progress	src/bulb_coding_agent/tools/edit.zig	Built-in ls, find, grep, read, write, and edit sections ported with native Zig tests; bash section remains pending with its tool implementation
 packages/coding-agent/test/tree-selector.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/trigger-compact-extension.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/truncate-to-width.test.ts	bulb_coding_agent	test	pending		
