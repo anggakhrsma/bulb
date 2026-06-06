@@ -1,4 +1,6 @@
+pub const loader = @import("loader.zig");
 pub const types = @import("types.zig");
+pub const wrapper = @import("wrapper.zig");
 
 pub const AgentEndEvent = types.AgentEndEvent;
 pub const AgentStartEvent = types.AgentStartEvent;
@@ -47,6 +49,7 @@ pub const InputEventResult = types.InputEventResult;
 pub const InputSource = types.InputSource;
 pub const KeybindingsManager = types.KeybindingsManager;
 pub const LoadExtensionsResult = types.LoadExtensionsResult;
+pub const LoadedNativeExtension = loader.LoadedNativeExtension;
 pub const LsToolCallEvent = types.LsToolCallEvent;
 pub const MessageRenderer = types.MessageRenderer;
 pub const MessageRenderOptions = types.MessageRenderOptions;
@@ -95,7 +98,10 @@ pub const WidgetPlacement = types.WidgetPlacement;
 pub const WorkingIndicatorOptions = types.WorkingIndicatorOptions;
 pub const WriteToolCallEvent = types.WriteToolCallEvent;
 pub const all_event_names = types.all_event_names;
+pub const createExtensionRuntime = loader.createExtensionRuntime;
 pub const defineTool = types.defineTool;
+pub const loadExtensionFromFactoryAlloc = loader.loadExtensionFromFactoryAlloc;
+pub const loadExtensionsAlloc = loader.loadExtensionsAlloc;
 pub const isBashToolResult = types.isBashToolResult;
 pub const isEditToolResult = types.isEditToolResult;
 pub const isFindToolResult = types.isFindToolResult;
@@ -104,7 +110,11 @@ pub const isLsToolResult = types.isLsToolResult;
 pub const isReadToolResult = types.isReadToolResult;
 pub const isToolCallEventType = types.isToolCallEventType;
 pub const isWriteToolResult = types.isWriteToolResult;
+pub const wrapRegisteredTool = wrapper.wrapRegisteredTool;
+pub const wrapRegisteredToolsAlloc = wrapper.wrapRegisteredToolsAlloc;
 
 test {
+    _ = @import("loader.zig");
     _ = @import("types.zig");
+    _ = @import("wrapper.zig");
 }

@@ -1332,9 +1332,9 @@ pub const ProviderModelConfig = struct {
 
 pub const ExtensionFactory = struct {
     ptr: ?*anyopaque = null,
-    init_fn: *const fn (?*anyopaque, *ExtensionAPI) anyerror!void,
+    init_fn: *const fn (?*anyopaque, *const ExtensionAPI) anyerror!void,
 
-    pub fn init(self: ExtensionFactory, api: *ExtensionAPI) !void {
+    pub fn init(self: ExtensionFactory, api: *const ExtensionAPI) !void {
         return self.init_fn(self.ptr, api);
     }
 };

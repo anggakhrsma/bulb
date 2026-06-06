@@ -17,6 +17,7 @@ pub const auth_storage = @import("auth_storage.zig");
 pub const ansi = @import("ansi.zig");
 pub const bash_executor = @import("bash_executor.zig");
 pub const cli_args = @import("cli_args.zig");
+pub const event_bus = @import("event_bus.zig");
 pub const frontmatter = @import("frontmatter.zig");
 pub const git = @import("git.zig");
 pub const initial_message = @import("initial_message.zig");
@@ -74,6 +75,14 @@ pub const createTool = tools.tool_registry.createTool;
 pub const createCodingToolsAlloc = tools.tool_registry.createCodingToolsAlloc;
 pub const createReadOnlyToolsAlloc = tools.tool_registry.createReadOnlyToolsAlloc;
 pub const createAllTools = tools.tool_registry.createAllTools;
+pub const EventBus = event_bus.EventBus;
+pub const EventBusController = event_bus.EventBusController;
+pub const createEventBus = event_bus.EventBusController.init;
+pub const createExtensionRuntime = extensions.createExtensionRuntime;
+pub const loadExtensionFromFactoryAlloc = extensions.loadExtensionFromFactoryAlloc;
+pub const loadExtensionsAlloc = extensions.loadExtensionsAlloc;
+pub const wrapRegisteredTool = extensions.wrapRegisteredTool;
+pub const wrapRegisteredToolsAlloc = extensions.wrapRegisteredToolsAlloc;
 
 pub fn createReadToolDefinition(cwd: []const u8, options: tools.read.ReadToolOptions) ToolDefinition {
     var all_options: ToolsOptions = .{};
@@ -161,6 +170,7 @@ test {
     _ = @import("ansi.zig");
     _ = @import("bash_executor.zig");
     _ = @import("cli_args.zig");
+    _ = @import("event_bus.zig");
     _ = @import("frontmatter.zig");
     _ = @import("git.zig");
     _ = @import("initial_message.zig");
