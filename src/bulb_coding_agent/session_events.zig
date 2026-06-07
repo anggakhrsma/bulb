@@ -29,6 +29,11 @@ pub const AutoRetryEndSessionEvent = struct {
     final_error: ?[]const u8 = null,
 };
 
+pub const QueueUpdateSessionEvent = struct {
+    steering: []const []const u8,
+    follow_up: []const []const u8,
+};
+
 pub const TurnStartSessionEvent = struct {
     turn_index: usize,
     timestamp_ms: i64,
@@ -74,6 +79,7 @@ pub const SessionEvent = union(enum) {
     agent_end: AgentEndSessionEvent,
     auto_retry_start: AutoRetryStartSessionEvent,
     auto_retry_end: AutoRetryEndSessionEvent,
+    queue_update: QueueUpdateSessionEvent,
     turn_start: TurnStartSessionEvent,
     turn_end: TurnEndSessionEvent,
     message_start: MessageSessionEvent,
@@ -193,6 +199,17 @@ pub const SessionEventBridge = struct {
 
     pub fn handleAutoRetryEnd(self: *SessionEventBridge, event: AutoRetryEndSessionEvent) void {
         self.emitPublic(.{ .auto_retry_end = event });
+    }
+
+    pub fn handleQueueUpdate(
+        self: *SessionEventBridge,
+        steering: []const []const u8,
+        follow_up: []const []const u8,
+    ) void {
+        self.emitPublic(.{ .queue_update = .{
+            .steering = steering,
+            .follow_up = follow_up,
+        } });
     }
 
     pub fn handleTurnStart(
@@ -457,6 +474,22 @@ pub const AutoRetryController = struct {
     }
 };
 
+pub const QueueMode = enum {
+    one_at_a_time,
+    all,
+};
+
+pub const CustomMessageDelivery = enum {
+    steer,
+    follow_up,
+    next_turn,
+};
+
+const QueuedSessionMessage = struct {
+    text: []const u8,
+    message: messages.CodingAgentMessage,
+};
+
 pub const AgentSessionReplay = struct {
     allocator: std.mem.Allocator,
     bridge: *SessionEventBridge,
@@ -469,7 +502,13 @@ pub const AgentSessionReplay = struct {
     messages: std.ArrayList(messages.CodingAgentMessage) = .empty,
     owned_texts: std.ArrayList([]u8) = .empty,
     owned_content: std.ArrayList([]ai.UserContent) = .empty,
+    owned_details: std.ArrayList([]u8) = .empty,
+    steering_messages: std.ArrayList(QueuedSessionMessage) = .empty,
+    follow_up_messages: std.ArrayList(QueuedSessionMessage) = .empty,
+    next_turn_messages: std.ArrayList(QueuedSessionMessage) = .empty,
     retry_sleeps: std.ArrayList(u64) = .empty,
+    steering_mode: QueueMode = .one_at_a_time,
+    follow_up_mode: QueueMode = .one_at_a_time,
     is_streaming: bool = false,
 
     pub fn init(
@@ -495,6 +534,11 @@ pub const AgentSessionReplay = struct {
         self.owned_texts.deinit(self.allocator);
         for (self.owned_content.items) |content| self.allocator.free(content);
         self.owned_content.deinit(self.allocator);
+        for (self.owned_details.items) |details| self.allocator.free(details);
+        self.owned_details.deinit(self.allocator);
+        self.steering_messages.deinit(self.allocator);
+        self.follow_up_messages.deinit(self.allocator);
+        self.next_turn_messages.deinit(self.allocator);
         self.retry_sleeps.deinit(self.allocator);
         self.messages.deinit(self.allocator);
         self.* = undefined;
@@ -509,12 +553,62 @@ pub const AgentSessionReplay = struct {
         return self.responses.len - self.next_response;
     }
 
+    pub fn pendingMessageCount(self: *const AgentSessionReplay) usize {
+        return self.steering_messages.items.len + self.follow_up_messages.items.len;
+    }
+
     pub fn isRetrying(self: *const AgentSessionReplay) bool {
         return self.retry.isRetrying();
     }
 
+    pub fn setSteeringMode(self: *AgentSessionReplay, mode: QueueMode) void {
+        self.steering_mode = mode;
+    }
+
+    pub fn setFollowUpMode(self: *AgentSessionReplay, mode: QueueMode) void {
+        self.follow_up_mode = mode;
+    }
+
     pub fn abortRetry(self: *AgentSessionReplay) ?AutoRetryEndSessionEvent {
         return self.retry.abortRetry(self.bridge);
+    }
+
+    pub fn steer(self: *AgentSessionReplay, text: []const u8, timestamp_ms: i64) !void {
+        try self.queueTextMessage(&self.steering_messages, text, timestamp_ms);
+    }
+
+    pub fn followUp(self: *AgentSessionReplay, text: []const u8, timestamp_ms: i64) !void {
+        try self.queueTextMessage(&self.follow_up_messages, text, timestamp_ms);
+    }
+
+    pub fn sendCustomTextMessage(
+        self: *AgentSessionReplay,
+        custom_type: []const u8,
+        text: []const u8,
+        display: bool,
+        details_json: ?[]const u8,
+        timestamp_ms: i64,
+        delivery: CustomMessageDelivery,
+    ) !void {
+        const message = try self.customTextMessage(custom_type, text, display, details_json, timestamp_ms);
+        const queued = QueuedSessionMessage{ .text = customMessageText(message), .message = message };
+        switch (delivery) {
+            .steer => {
+                try self.steering_messages.append(self.allocator, queued);
+                try self.emitQueueUpdate();
+            },
+            .follow_up => {
+                try self.follow_up_messages.append(self.allocator, queued);
+                try self.emitQueueUpdate();
+            },
+            .next_turn => try self.next_turn_messages.append(self.allocator, queued),
+        }
+    }
+
+    pub fn clearQueue(self: *AgentSessionReplay) !void {
+        self.steering_messages.clearRetainingCapacity();
+        self.follow_up_messages.clearRetainingCapacity();
+        try self.emitQueueUpdate();
     }
 
     pub fn prompt(self: *AgentSessionReplay, io: std.Io, text: []const u8, timestamp_ms: i64) !void {
@@ -528,13 +622,21 @@ pub const AgentSessionReplay = struct {
 
     fn runPromptBody(self: *AgentSessionReplay, io: std.Io, text: []const u8, timestamp_ms: i64) !void {
         var emit_prompt = true;
+        var drain_follow_up = false;
         while (true) {
             try self.bridge.handleTurnStart(self.runner, timestamp_ms);
 
             if (emit_prompt) {
                 const user_message = try self.textUserMessage(text, timestamp_ms);
                 try self.emitAndStoreMessage(io, user_message);
+                try self.emitQueuedMessages(io, &self.next_turn_messages, .all, false);
                 emit_prompt = false;
+            } else if (self.steering_messages.items.len > 0) {
+                try self.emitQueuedMessages(io, &self.steering_messages, self.steering_mode, true);
+                drain_follow_up = false;
+            } else if (drain_follow_up and self.follow_up_messages.items.len > 0) {
+                try self.emitQueuedMessages(io, &self.follow_up_messages, self.follow_up_mode, true);
+                drain_follow_up = false;
             }
 
             var assistant_message = try self.nextAssistantResponse();
@@ -566,8 +668,19 @@ pub const AgentSessionReplay = struct {
             if (turn_tool_results.items.len > 0 and assistant_message.stop_reason == .tool_use) {
                 continue;
             }
+            if (self.steering_messages.items.len > 0) {
+                continue;
+            }
+            if (self.follow_up_messages.items.len > 0) {
+                drain_follow_up = true;
+                continue;
+            }
 
             try self.bridge.handleAgentEnd(self.runner, self.messages.items, false);
+            if (self.steering_messages.items.len > 0 or self.follow_up_messages.items.len > 0) {
+                drain_follow_up = true;
+                continue;
+            }
             return;
         }
     }
@@ -627,6 +740,87 @@ pub const AgentSessionReplay = struct {
         try self.bridge.handleMessageStart(self.runner, mutable);
         try self.bridge.handleMessageEnd(io, self.runner, self.sessions, &mutable);
         try self.messages.append(self.allocator, mutable);
+    }
+
+    fn queueTextMessage(
+        self: *AgentSessionReplay,
+        queue: *std.ArrayList(QueuedSessionMessage),
+        text: []const u8,
+        timestamp_ms: i64,
+    ) !void {
+        const message = try self.textUserMessage(text, timestamp_ms);
+        try queue.append(self.allocator, .{
+            .text = userMessageText(message).?,
+            .message = message,
+        });
+        try self.emitQueueUpdate();
+    }
+
+    fn customTextMessage(
+        self: *AgentSessionReplay,
+        custom_type: []const u8,
+        text: []const u8,
+        display: bool,
+        details_json: ?[]const u8,
+        timestamp_ms: i64,
+    ) !messages.CodingAgentMessage {
+        const owned_custom_type = try self.allocator.dupe(u8, custom_type);
+        var custom_type_registered = false;
+        errdefer if (!custom_type_registered) self.allocator.free(owned_custom_type);
+        try self.owned_texts.append(self.allocator, owned_custom_type);
+        custom_type_registered = true;
+
+        const owned_text = try self.allocator.dupe(u8, text);
+        var text_registered = false;
+        errdefer if (!text_registered) self.allocator.free(owned_text);
+        try self.owned_texts.append(self.allocator, owned_text);
+        text_registered = true;
+
+        const owned_details = if (details_json) |details| try self.allocator.dupe(u8, details) else null;
+        var details_registered = false;
+        errdefer if (!details_registered) if (owned_details) |details| self.allocator.free(details);
+        if (owned_details) |details| {
+            try self.owned_details.append(self.allocator, details);
+            details_registered = true;
+        } else {
+            details_registered = true;
+        }
+
+        return .{ .custom = .{
+            .custom_type = owned_custom_type,
+            .content = .{ .text = owned_text },
+            .display = display,
+            .details_json = owned_details,
+            .timestamp_ms = timestamp_ms,
+        } };
+    }
+
+    fn emitQueuedMessages(
+        self: *AgentSessionReplay,
+        io: std.Io,
+        queue: *std.ArrayList(QueuedSessionMessage),
+        mode: QueueMode,
+        emit_update: bool,
+    ) !void {
+        const count = switch (mode) {
+            .one_at_a_time => @min(queue.items.len, 1),
+            .all => queue.items.len,
+        };
+
+        var remaining = count;
+        while (remaining > 0) : (remaining -= 1) {
+            const queued = queue.orderedRemove(0);
+            if (emit_update) try self.emitQueueUpdate();
+            try self.emitAndStoreMessage(io, queued.message);
+        }
+    }
+
+    fn emitQueueUpdate(self: *AgentSessionReplay) !void {
+        const steering = try queuedTextsAlloc(self.allocator, self.steering_messages.items);
+        defer self.allocator.free(steering);
+        const follow_up = try queuedTextsAlloc(self.allocator, self.follow_up_messages.items);
+        defer self.allocator.free(follow_up);
+        self.bridge.handleQueueUpdate(steering, follow_up);
     }
 
     fn emitAssistantStreamUpdates(self: *AgentSessionReplay, assistant_message: ai.AssistantMessage) !void {
@@ -964,6 +1158,38 @@ fn customContentJsonAlloc(
     }
 
     return output.toOwnedSlice();
+}
+
+fn queuedTextsAlloc(
+    allocator: std.mem.Allocator,
+    queue: []const QueuedSessionMessage,
+) ![][]const u8 {
+    const texts = try allocator.alloc([]const u8, queue.len);
+    for (queue, 0..) |queued, index| texts[index] = queued.text;
+    return texts;
+}
+
+fn userMessageText(message: messages.CodingAgentMessage) ?[]const u8 {
+    if (message != .user) return null;
+    return firstUserContentText(message.user.content);
+}
+
+fn customMessageText(message: messages.CodingAgentMessage) []const u8 {
+    if (message != .custom) return "";
+    return switch (message.custom.content) {
+        .text => |text| text,
+        .parts => |parts| firstUserContentText(parts) orelse "",
+    };
+}
+
+fn firstUserContentText(content: []const ai.UserContent) ?[]const u8 {
+    for (content) |part| {
+        switch (part) {
+            .text => |text| return text.text,
+            else => {},
+        }
+    }
+    return null;
 }
 
 fn toolExecutionResultJsonAlloc(allocator: std.mem.Allocator, text: []const u8) !std.json.Value {
@@ -1566,6 +1792,182 @@ test "AgentSession replay emits rich streaming update boundaries" {
     try std.testing.expectEqual(@as(usize, 1), echo_state.runs.items.len);
 }
 
+test "AgentSession replay removes queued steer before queued message_start" {
+    const allocator = std.testing.allocator;
+    var harness = try TestHarness.init(allocator);
+    defer harness.deinit();
+
+    var runner = extensions.ExtensionRunner.init(
+        allocator,
+        &.{},
+        harness.runtime,
+        "/tmp",
+        harness.sessions,
+        harness.registry,
+    );
+    defer runner.deinit();
+
+    var bridge = SessionEventBridge.init(allocator);
+    defer bridge.deinit();
+    var echo_state = EchoToolState{ .allocator = allocator };
+    defer echo_state.deinit();
+    const echo_tool = echoTool(&echo_state);
+    const replay_tools = [_]tools.tool_registry.AgentTool{echo_tool};
+    var replay = AgentSessionReplay.init(
+        allocator,
+        &bridge,
+        &runner,
+        harness.sessions,
+        AutoRetryController.init(.{ .enabled = false }, null),
+        &replay_tools,
+    );
+    defer replay.deinit();
+
+    var counts_at_start: std.ArrayList(usize) = .empty;
+    defer counts_at_start.deinit(allocator);
+    var queue_counts: std.ArrayList(usize) = .empty;
+    defer queue_counts.deinit(allocator);
+    var state = QueueDuringToolState{
+        .replay = &replay,
+        .delivery = .steer,
+        .queued_text = "queued",
+        .counts_at_message_start = &counts_at_start,
+        .queue_counts = &queue_counts,
+    };
+    try bridge.subscribe(.{ .ptr = &state, .call_fn = QueueDuringToolState.publicListener });
+
+    const tool_content = [_]ai.AssistantContent{.{ .tool_call = .{
+        .id = "call-1",
+        .name = "echo",
+        .arguments_json = "{\"text\":\"hello\"}",
+    } }};
+    const final_content = [_]ai.AssistantContent{.{ .text = .{ .text = "done" } }};
+    const responses = [_]ai.AssistantMessage{
+        assistantMessage(&tool_content, .tool_use),
+        assistantMessage(&final_content, .stop),
+    };
+    replay.setResponses(&responses);
+
+    try replay.prompt(std.testing.io, "start", 123);
+
+    try std.testing.expectEqualSlices(usize, &[_]usize{ 1, 0 }, queue_counts.items);
+    try std.testing.expectEqualSlices(usize, &[_]usize{0}, counts_at_start.items);
+    try std.testing.expectEqual(@as(usize, 0), replay.pendingMessageCount());
+    try expectReplayUserTexts(&replay, &[_][]const u8{ "start", "queued" });
+    try std.testing.expectEqual(@as(usize, 1), echo_state.runs.items.len);
+}
+
+test "AgentSession replay delays follow-up until tool continuation finishes" {
+    const allocator = std.testing.allocator;
+    var harness = try TestHarness.init(allocator);
+    defer harness.deinit();
+
+    var runner = extensions.ExtensionRunner.init(
+        allocator,
+        &.{},
+        harness.runtime,
+        "/tmp",
+        harness.sessions,
+        harness.registry,
+    );
+    defer runner.deinit();
+
+    var bridge = SessionEventBridge.init(allocator);
+    defer bridge.deinit();
+    var echo_state = EchoToolState{ .allocator = allocator };
+    defer echo_state.deinit();
+    const echo_tool = echoTool(&echo_state);
+    const replay_tools = [_]tools.tool_registry.AgentTool{echo_tool};
+    var replay = AgentSessionReplay.init(
+        allocator,
+        &bridge,
+        &runner,
+        harness.sessions,
+        AutoRetryController.init(.{ .enabled = false }, null),
+        &replay_tools,
+    );
+    defer replay.deinit();
+
+    var counts_at_start: std.ArrayList(usize) = .empty;
+    defer counts_at_start.deinit(allocator);
+    var queue_counts: std.ArrayList(usize) = .empty;
+    defer queue_counts.deinit(allocator);
+    var state = QueueDuringToolState{
+        .replay = &replay,
+        .delivery = .follow_up,
+        .queued_text = "after current run",
+        .counts_at_message_start = &counts_at_start,
+        .queue_counts = &queue_counts,
+    };
+    try bridge.subscribe(.{ .ptr = &state, .call_fn = QueueDuringToolState.publicListener });
+
+    const tool_content = [_]ai.AssistantContent{.{ .tool_call = .{
+        .id = "call-1",
+        .name = "echo",
+        .arguments_json = "{\"text\":\"hello\"}",
+    } }};
+    const original_content = [_]ai.AssistantContent{.{ .text = .{ .text = "original turn complete" } }};
+    const follow_up_content = [_]ai.AssistantContent{.{ .text = .{ .text = "handled follow-up" } }};
+    const responses = [_]ai.AssistantMessage{
+        assistantMessage(&tool_content, .tool_use),
+        assistantMessage(&original_content, .stop),
+        assistantMessage(&follow_up_content, .stop),
+    };
+    replay.setResponses(&responses);
+
+    try replay.prompt(std.testing.io, "start", 123);
+
+    try std.testing.expectEqualSlices(usize, &[_]usize{ 1, 0 }, queue_counts.items);
+    try std.testing.expectEqualSlices(usize, &[_]usize{0}, counts_at_start.items);
+    try expectReplayUserTexts(&replay, &[_][]const u8{ "start", "after current run" });
+    try expectReplayAssistantTexts(&replay, &[_][]const u8{ "", "original turn complete", "handled follow-up" });
+}
+
+test "AgentSession replay injects next-turn custom messages without queue update" {
+    const allocator = std.testing.allocator;
+    var harness = try TestHarness.init(allocator);
+    defer harness.deinit();
+
+    var runner = extensions.ExtensionRunner.init(
+        allocator,
+        &.{},
+        harness.runtime,
+        "/tmp",
+        harness.sessions,
+        harness.registry,
+    );
+    defer runner.deinit();
+
+    var bridge = SessionEventBridge.init(allocator);
+    defer bridge.deinit();
+    var queue_updates: std.ArrayList(usize) = .empty;
+    defer queue_updates.deinit(allocator);
+    var observer = QueueUpdateCounter{ .allocator = allocator, .counts = &queue_updates };
+    try bridge.subscribe(.{ .ptr = &observer, .call_fn = QueueUpdateCounter.publicListener });
+
+    const final_content = [_]ai.AssistantContent{.{ .text = .{ .text = "done" } }};
+    const responses = [_]ai.AssistantMessage{assistantMessage(&final_content, .stop)};
+    var replay = AgentSessionReplay.init(
+        allocator,
+        &bridge,
+        &runner,
+        harness.sessions,
+        AutoRetryController.init(.{ .enabled = false }, null),
+        &.{},
+    );
+    defer replay.deinit();
+    try replay.sendCustomTextMessage("next-turn", "carry this", true, "{\"value\":1}", 122, .next_turn);
+    replay.setResponses(&responses);
+
+    try replay.prompt(std.testing.io, "normal prompt", 123);
+
+    try std.testing.expectEqual(@as(usize, 0), queue_updates.items.len);
+    try expectReplayRoles(&replay, &[_]ObservedRole{ .user, .custom, .assistant });
+    try std.testing.expectEqualStrings("next-turn", replay.messages.items[1].custom.custom_type);
+    try std.testing.expectEqualStrings("carry this", customMessageText(replay.messages.items[1]));
+    try std.testing.expectEqualStrings("{\"value\":1}", replay.messages.items[1].custom.details_json.?);
+}
+
 test "AgentSession replay waits for retry recovery tool loop before returning" {
     const allocator = std.testing.allocator;
     var harness = try TestHarness.init(allocator);
@@ -1931,6 +2333,67 @@ const RetryObserver = struct {
     }
 };
 
+const QueueDuringToolState = struct {
+    replay: *AgentSessionReplay,
+    delivery: CustomMessageDelivery,
+    queued_text: []const u8,
+    sent: bool = false,
+    counts_at_message_start: *std.ArrayList(usize),
+    queue_counts: *std.ArrayList(usize),
+
+    fn publicListener(ptr: ?*anyopaque, event: SessionEvent) void {
+        const state: *@This() = @ptrCast(@alignCast(ptr.?));
+        switch (event) {
+            .tool_execution_start => {
+                if (state.sent) return;
+                state.sent = true;
+                switch (state.delivery) {
+                    .steer => state.replay.steer(state.queued_text, 124) catch @panic("out of memory"),
+                    .follow_up => state.replay.followUp(state.queued_text, 124) catch @panic("out of memory"),
+                    .next_turn => state.replay.sendCustomTextMessage(
+                        "queue-test",
+                        state.queued_text,
+                        true,
+                        null,
+                        124,
+                        .next_turn,
+                    ) catch @panic("out of memory"),
+                }
+            },
+            .message_start => |payload| {
+                const text = userMessageText(payload.message) orelse return;
+                if (std.mem.eql(u8, text, state.queued_text)) {
+                    state.counts_at_message_start.append(
+                        state.replay.allocator,
+                        state.replay.pendingMessageCount(),
+                    ) catch @panic("out of memory");
+                }
+            },
+            .queue_update => |payload| state.queue_counts.append(
+                state.replay.allocator,
+                payload.steering.len + payload.follow_up.len,
+            ) catch @panic("out of memory"),
+            else => {},
+        }
+    }
+};
+
+const QueueUpdateCounter = struct {
+    allocator: std.mem.Allocator,
+    counts: *std.ArrayList(usize),
+
+    fn publicListener(ptr: ?*anyopaque, event: SessionEvent) void {
+        const counter: *@This() = @ptrCast(@alignCast(ptr.?));
+        switch (event) {
+            .queue_update => |payload| counter.counts.append(
+                counter.allocator,
+                payload.steering.len + payload.follow_up.len,
+            ) catch @panic("out of memory"),
+            else => {},
+        }
+    }
+};
+
 const ReplayEventObservation = enum {
     agent_start,
     agent_end,
@@ -1988,6 +2451,7 @@ const ReplayEventRecorder = struct {
                 if (std.mem.eql(u8, payload.tool_name, "echo")) recorder.append(.tool_execution_end_echo) catch @panic("out of memory");
             },
             .tool_execution_update => {},
+            .queue_update => {},
         }
     }
 
@@ -2053,6 +2517,45 @@ fn messageObservation(boundary: MessageBoundary, message: messages.CodingAgentMe
         .tool_result => if (boundary == .start) .message_start_tool_result else .message_end_tool_result,
         else => null,
     };
+}
+
+fn expectReplayUserTexts(replay: *const AgentSessionReplay, expected: []const []const u8) !void {
+    var index: usize = 0;
+    for (replay.messages.items) |message| {
+        if (message != .user) continue;
+        if (index >= expected.len) return error.UnexpectedUserMessage;
+        try std.testing.expectEqualStrings(expected[index], userMessageText(message).?);
+        index += 1;
+    }
+    try std.testing.expectEqual(expected.len, index);
+}
+
+fn expectReplayAssistantTexts(replay: *const AgentSessionReplay, expected: []const []const u8) !void {
+    var index: usize = 0;
+    for (replay.messages.items) |message| {
+        if (message != .assistant) continue;
+        if (index >= expected.len) return error.UnexpectedAssistantMessage;
+        try std.testing.expectEqualStrings(expected[index], assistantMessageText(message.assistant));
+        index += 1;
+    }
+    try std.testing.expectEqual(expected.len, index);
+}
+
+fn expectReplayRoles(replay: *const AgentSessionReplay, expected: []const ObservedRole) !void {
+    try std.testing.expectEqual(expected.len, replay.messages.items.len);
+    for (expected, 0..) |role, index| {
+        try std.testing.expectEqual(role, observedRole(replay.messages.items[index]));
+    }
+}
+
+fn assistantMessageText(message: ai.AssistantMessage) []const u8 {
+    for (message.content) |content| {
+        switch (content) {
+            .text => |text| return text.text,
+            else => {},
+        }
+    }
+    return "";
 }
 
 const EchoToolState = struct {
