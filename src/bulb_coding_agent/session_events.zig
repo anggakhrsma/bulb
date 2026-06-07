@@ -574,10 +574,12 @@ pub const AgentSessionReplay = struct {
     }
 
     pub fn steer(self: *AgentSessionReplay, text: []const u8, timestamp_ms: i64) !void {
+        try self.throwIfQueuedExtensionCommand(text);
         try self.queueTextMessage(&self.steering_messages, text, timestamp_ms);
     }
 
     pub fn followUp(self: *AgentSessionReplay, text: []const u8, timestamp_ms: i64) !void {
+        try self.throwIfQueuedExtensionCommand(text);
         try self.queueTextMessage(&self.follow_up_messages, text, timestamp_ms);
     }
 
@@ -754,6 +756,13 @@ pub const AgentSessionReplay = struct {
             .message = message,
         });
         try self.emitQueueUpdate();
+    }
+
+    fn throwIfQueuedExtensionCommand(self: *AgentSessionReplay, text: []const u8) !void {
+        const command_name = queuedSlashCommandName(text) orelse return;
+        const resolved = try self.runner.getCommandAlloc(self.allocator, command_name) orelse return;
+        self.allocator.free(resolved.invocation_name);
+        return error.ExtensionCommandCannotBeQueued;
     }
 
     fn customTextMessage(
@@ -1167,6 +1176,25 @@ fn queuedTextsAlloc(
     const texts = try allocator.alloc([]const u8, queue.len);
     for (queue, 0..) |queued, index| texts[index] = queued.text;
     return texts;
+}
+
+fn queuedSlashCommandName(text: []const u8) ?[]const u8 {
+    if (text.len < 2 or text[0] != '/') return null;
+    const rest = text[1..];
+    const end = std.mem.indexOfScalar(u8, rest, ' ') orelse rest.len;
+    if (end == 0) return null;
+    return rest[0..end];
+}
+
+pub fn queuedExtensionCommandErrorMessageAlloc(
+    allocator: std.mem.Allocator,
+    command_name: []const u8,
+) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "Extension command \"/{s}\" cannot be queued. Use prompt() or execute the command when not streaming.",
+        .{command_name},
+    );
 }
 
 fn userMessageText(message: messages.CodingAgentMessage) ?[]const u8 {
@@ -1968,6 +1996,307 @@ test "AgentSession replay injects next-turn custom messages without queue update
     try std.testing.expectEqualStrings("{\"value\":1}", replay.messages.items[1].custom.details_json.?);
 }
 
+test "AgentSession replay delivers multiple steering messages in order in one-at-a-time mode" {
+    const allocator = std.testing.allocator;
+    var harness = try TestHarness.init(allocator);
+    defer harness.deinit();
+
+    var runner = extensions.ExtensionRunner.init(
+        allocator,
+        &.{},
+        harness.runtime,
+        "/tmp",
+        harness.sessions,
+        harness.registry,
+    );
+    defer runner.deinit();
+
+    var bridge = SessionEventBridge.init(allocator);
+    defer bridge.deinit();
+    var echo_state = EchoToolState{ .allocator = allocator };
+    defer echo_state.deinit();
+    const echo_tool = echoTool(&echo_state);
+    const replay_tools = [_]tools.tool_registry.AgentTool{echo_tool};
+    var replay = AgentSessionReplay.init(
+        allocator,
+        &bridge,
+        &runner,
+        harness.sessions,
+        AutoRetryController.init(.{ .enabled = false }, null),
+        &replay_tools,
+    );
+    defer replay.deinit();
+
+    var counts_at_start: std.ArrayList(usize) = .empty;
+    defer counts_at_start.deinit(allocator);
+    var queue_counts: std.ArrayList(usize) = .empty;
+    defer queue_counts.deinit(allocator);
+    var state = QueueDuringToolState{
+        .replay = &replay,
+        .delivery = .steer,
+        .queued_text = "steer 1",
+        .extra_queued_text = "steer 2",
+        .counts_at_message_start = &counts_at_start,
+        .queue_counts = &queue_counts,
+    };
+    try bridge.subscribe(.{ .ptr = &state, .call_fn = QueueDuringToolState.publicListener });
+
+    const tool_content = [_]ai.AssistantContent{.{ .tool_call = .{
+        .id = "call-1",
+        .name = "echo",
+        .arguments_json = "{\"text\":\"hello\"}",
+    } }};
+    const first_content = [_]ai.AssistantContent{.{ .text = .{ .text = "handled steer 1" } }};
+    const second_content = [_]ai.AssistantContent{.{ .text = .{ .text = "handled steer 2" } }};
+    const responses = [_]ai.AssistantMessage{
+        assistantMessage(&tool_content, .tool_use),
+        assistantMessage(&first_content, .stop),
+        assistantMessage(&second_content, .stop),
+    };
+    replay.setResponses(&responses);
+
+    try replay.prompt(std.testing.io, "start", 123);
+
+    try std.testing.expectEqualSlices(usize, &[_]usize{ 1, 2, 1, 0 }, queue_counts.items);
+    try std.testing.expectEqualSlices(usize, &[_]usize{ 1, 0 }, counts_at_start.items);
+    try expectReplayUserTexts(&replay, &[_][]const u8{ "start", "steer 1", "steer 2" });
+    try expectReplayAssistantTexts(&replay, &[_][]const u8{ "", "handled steer 1", "handled steer 2" });
+}
+
+test "AgentSession replay delivers all steering messages in one batch in all mode" {
+    const allocator = std.testing.allocator;
+    var harness = try TestHarness.init(allocator);
+    defer harness.deinit();
+
+    var runner = extensions.ExtensionRunner.init(
+        allocator,
+        &.{},
+        harness.runtime,
+        "/tmp",
+        harness.sessions,
+        harness.registry,
+    );
+    defer runner.deinit();
+
+    var bridge = SessionEventBridge.init(allocator);
+    defer bridge.deinit();
+    var echo_state = EchoToolState{ .allocator = allocator };
+    defer echo_state.deinit();
+    const echo_tool = echoTool(&echo_state);
+    const replay_tools = [_]tools.tool_registry.AgentTool{echo_tool};
+    var replay = AgentSessionReplay.init(
+        allocator,
+        &bridge,
+        &runner,
+        harness.sessions,
+        AutoRetryController.init(.{ .enabled = false }, null),
+        &replay_tools,
+    );
+    defer replay.deinit();
+    replay.setSteeringMode(.all);
+
+    var counts_at_start: std.ArrayList(usize) = .empty;
+    defer counts_at_start.deinit(allocator);
+    var queue_counts: std.ArrayList(usize) = .empty;
+    defer queue_counts.deinit(allocator);
+    var state = QueueDuringToolState{
+        .replay = &replay,
+        .delivery = .steer,
+        .queued_text = "steer 1",
+        .extra_queued_text = "steer 2",
+        .counts_at_message_start = &counts_at_start,
+        .queue_counts = &queue_counts,
+    };
+    try bridge.subscribe(.{ .ptr = &state, .call_fn = QueueDuringToolState.publicListener });
+
+    const tool_content = [_]ai.AssistantContent{.{ .tool_call = .{
+        .id = "call-1",
+        .name = "echo",
+        .arguments_json = "{\"text\":\"hello\"}",
+    } }};
+    const final_content = [_]ai.AssistantContent{.{ .text = .{ .text = "batched steer response" } }};
+    const responses = [_]ai.AssistantMessage{
+        assistantMessage(&tool_content, .tool_use),
+        assistantMessage(&final_content, .stop),
+    };
+    replay.setResponses(&responses);
+
+    try replay.prompt(std.testing.io, "start", 123);
+
+    try std.testing.expectEqualSlices(usize, &[_]usize{ 1, 2, 1, 0 }, queue_counts.items);
+    try std.testing.expectEqualSlices(usize, &[_]usize{ 1, 0 }, counts_at_start.items);
+    try expectReplayUserTexts(&replay, &[_][]const u8{ "start", "steer 1", "steer 2" });
+    try expectReplayAssistantTexts(&replay, &[_][]const u8{ "", "batched steer response" });
+}
+
+test "AgentSession replay delivers all follow-up messages in one batch in all mode" {
+    const allocator = std.testing.allocator;
+    var harness = try TestHarness.init(allocator);
+    defer harness.deinit();
+
+    var runner = extensions.ExtensionRunner.init(
+        allocator,
+        &.{},
+        harness.runtime,
+        "/tmp",
+        harness.sessions,
+        harness.registry,
+    );
+    defer runner.deinit();
+
+    var bridge = SessionEventBridge.init(allocator);
+    defer bridge.deinit();
+    var echo_state = EchoToolState{ .allocator = allocator };
+    defer echo_state.deinit();
+    const echo_tool = echoTool(&echo_state);
+    const replay_tools = [_]tools.tool_registry.AgentTool{echo_tool};
+    var replay = AgentSessionReplay.init(
+        allocator,
+        &bridge,
+        &runner,
+        harness.sessions,
+        AutoRetryController.init(.{ .enabled = false }, null),
+        &replay_tools,
+    );
+    defer replay.deinit();
+    replay.setFollowUpMode(.all);
+
+    var counts_at_start: std.ArrayList(usize) = .empty;
+    defer counts_at_start.deinit(allocator);
+    var queue_counts: std.ArrayList(usize) = .empty;
+    defer queue_counts.deinit(allocator);
+    var state = QueueDuringToolState{
+        .replay = &replay,
+        .delivery = .follow_up,
+        .queued_text = "follow-up 1",
+        .extra_queued_text = "follow-up 2",
+        .counts_at_message_start = &counts_at_start,
+        .queue_counts = &queue_counts,
+    };
+    try bridge.subscribe(.{ .ptr = &state, .call_fn = QueueDuringToolState.publicListener });
+
+    const tool_content = [_]ai.AssistantContent{.{ .tool_call = .{
+        .id = "call-1",
+        .name = "echo",
+        .arguments_json = "{\"text\":\"hello\"}",
+    } }};
+    const original_content = [_]ai.AssistantContent{.{ .text = .{ .text = "original turn complete" } }};
+    const final_content = [_]ai.AssistantContent{.{ .text = .{ .text = "batched follow-up response" } }};
+    const responses = [_]ai.AssistantMessage{
+        assistantMessage(&tool_content, .tool_use),
+        assistantMessage(&original_content, .stop),
+        assistantMessage(&final_content, .stop),
+    };
+    replay.setResponses(&responses);
+
+    try replay.prompt(std.testing.io, "start", 123);
+
+    try std.testing.expectEqualSlices(usize, &[_]usize{ 1, 2, 1, 0 }, queue_counts.items);
+    try std.testing.expectEqualSlices(usize, &[_]usize{ 1, 0 }, counts_at_start.items);
+    try expectReplayUserTexts(&replay, &[_][]const u8{ "start", "follow-up 1", "follow-up 2" });
+    try expectReplayAssistantTexts(&replay, &[_][]const u8{ "", "original turn complete", "batched follow-up response" });
+}
+
+test "AgentSession replay rejects queued registered extension commands from public steer and follow-up" {
+    const allocator = std.testing.allocator;
+    var harness = try TestHarness.init(allocator);
+    defer harness.deinit();
+
+    const command_source = source_info.createSyntheticSourceInfo("/tmp/command.zig", .{ .source = "test" });
+    const commands = [_]extensions.RegisteredCommand{.{
+        .name = "testcmd",
+        .source_info = command_source,
+        .description = "Test command",
+        .handler = .{ .handler_fn = QueueCommandCallbacks.command },
+    }};
+    const registered_extensions = [_]extensions.Extension{testCommandExtension("/tmp/commands.zig", &commands)};
+    var runner = extensions.ExtensionRunner.init(
+        allocator,
+        &registered_extensions,
+        harness.runtime,
+        "/tmp",
+        harness.sessions,
+        harness.registry,
+    );
+    defer runner.deinit();
+
+    var bridge = SessionEventBridge.init(allocator);
+    defer bridge.deinit();
+    var replay = AgentSessionReplay.init(
+        allocator,
+        &bridge,
+        &runner,
+        harness.sessions,
+        AutoRetryController.init(.{ .enabled = false }, null),
+        &.{},
+    );
+    defer replay.deinit();
+
+    try std.testing.expectError(error.ExtensionCommandCannotBeQueued, replay.steer("/testcmd queued", 123));
+    try std.testing.expectError(error.ExtensionCommandCannotBeQueued, replay.followUp("/testcmd queued", 123));
+    try std.testing.expectEqual(@as(usize, 0), replay.pendingMessageCount());
+    try replay.steer("/unknown queued", 123);
+    try std.testing.expectEqual(@as(usize, 1), replay.pendingMessageCount());
+
+    const message = try queuedExtensionCommandErrorMessageAlloc(allocator, "testcmd");
+    defer allocator.free(message);
+    try std.testing.expectEqualStrings(
+        "Extension command \"/testcmd\" cannot be queued. Use prompt() or execute the command when not streaming.",
+        message,
+    );
+}
+
+test "AgentSession replay delivers follow-ups queued during agent_end" {
+    const allocator = std.testing.allocator;
+    var harness = try TestHarness.init(allocator);
+    defer harness.deinit();
+
+    var bridge = SessionEventBridge.init(allocator);
+    defer bridge.deinit();
+    var follow_up_state = AgentEndFollowUpState{ .queued_text = "conflict report" };
+    const handlers = [_]extensions.ExtensionHandler{.{
+        .event_name = .agent_end,
+        .ptr = &follow_up_state,
+        .handler_fn = AgentEndFollowUpState.handler,
+    }};
+    const registered_extensions = [_]extensions.Extension{testExtension("/tmp/agent-end-follow-up.zig", &handlers)};
+    var runner = extensions.ExtensionRunner.init(
+        allocator,
+        &registered_extensions,
+        harness.runtime,
+        "/tmp",
+        harness.sessions,
+        harness.registry,
+    );
+    defer runner.deinit();
+
+    var replay = AgentSessionReplay.init(
+        allocator,
+        &bridge,
+        &runner,
+        harness.sessions,
+        AutoRetryController.init(.{ .enabled = false }, null),
+        &.{},
+    );
+    defer replay.deinit();
+    follow_up_state.replay = &replay;
+
+    const reply_content = [_]ai.AssistantContent{.{ .text = .{ .text = "reply" } }};
+    const follow_up_content = [_]ai.AssistantContent{.{ .text = .{ .text = "follow-up reply" } }};
+    const responses = [_]ai.AssistantMessage{
+        assistantMessage(&reply_content, .stop),
+        assistantMessage(&follow_up_content, .stop),
+    };
+    replay.setResponses(&responses);
+
+    try replay.prompt(std.testing.io, "hello", 123);
+
+    try expectReplayUserTexts(&replay, &[_][]const u8{ "hello", "conflict report" });
+    try expectReplayAssistantTexts(&replay, &[_][]const u8{ "reply", "follow-up reply" });
+    try std.testing.expectEqual(@as(usize, 1), follow_up_state.calls);
+    try std.testing.expectEqual(@as(usize, 0), replay.pendingMessageCount());
+}
+
 test "AgentSession replay waits for retry recovery tool loop before returning" {
     const allocator = std.testing.allocator;
     var harness = try TestHarness.init(allocator);
@@ -2337,6 +2666,7 @@ const QueueDuringToolState = struct {
     replay: *AgentSessionReplay,
     delivery: CustomMessageDelivery,
     queued_text: []const u8,
+    extra_queued_text: ?[]const u8 = null,
     sent: bool = false,
     counts_at_message_start: *std.ArrayList(usize),
     queue_counts: *std.ArrayList(usize),
@@ -2347,22 +2677,14 @@ const QueueDuringToolState = struct {
             .tool_execution_start => {
                 if (state.sent) return;
                 state.sent = true;
-                switch (state.delivery) {
-                    .steer => state.replay.steer(state.queued_text, 124) catch @panic("out of memory"),
-                    .follow_up => state.replay.followUp(state.queued_text, 124) catch @panic("out of memory"),
-                    .next_turn => state.replay.sendCustomTextMessage(
-                        "queue-test",
-                        state.queued_text,
-                        true,
-                        null,
-                        124,
-                        .next_turn,
-                    ) catch @panic("out of memory"),
-                }
+                state.queueText(state.queued_text);
+                if (state.extra_queued_text) |extra_text| state.queueText(extra_text);
             },
             .message_start => |payload| {
                 const text = userMessageText(payload.message) orelse return;
-                if (std.mem.eql(u8, text, state.queued_text)) {
+                if (std.mem.eql(u8, text, state.queued_text) or
+                    (state.extra_queued_text != null and std.mem.eql(u8, text, state.extra_queued_text.?)))
+                {
                     state.counts_at_message_start.append(
                         state.replay.allocator,
                         state.replay.pendingMessageCount(),
@@ -2375,6 +2697,45 @@ const QueueDuringToolState = struct {
             ) catch @panic("out of memory"),
             else => {},
         }
+    }
+
+    fn queueText(self: *@This(), text: []const u8) void {
+        switch (self.delivery) {
+            .steer => self.replay.steer(text, 124) catch @panic("out of memory"),
+            .follow_up => self.replay.followUp(text, 124) catch @panic("out of memory"),
+            .next_turn => self.replay.sendCustomTextMessage(
+                "queue-test",
+                text,
+                true,
+                null,
+                124,
+                .next_turn,
+            ) catch @panic("out of memory"),
+        }
+    }
+};
+
+const AgentEndFollowUpState = struct {
+    replay: ?*AgentSessionReplay = null,
+    queued_text: []const u8,
+    calls: usize = 0,
+
+    fn handler(ptr: ?*anyopaque, event_value: extensions.ExtensionEvent, ctx: *extensions.ExtensionContext) !?std.json.Value {
+        _ = event_value;
+        _ = ctx;
+        const state: *@This() = @ptrCast(@alignCast(ptr.?));
+        if (state.calls > 0) return null;
+        state.calls += 1;
+        try state.replay.?.followUp(state.queued_text, 124);
+        return null;
+    }
+};
+
+const QueueCommandCallbacks = struct {
+    fn command(ptr: ?*anyopaque, args: []const u8, ctx: *extensions.ExtensionCommandContext) !void {
+        _ = ptr;
+        _ = args;
+        _ = ctx;
     }
 };
 
@@ -2719,6 +3080,15 @@ fn testExtension(path: []const u8, handlers: []const extensions.ExtensionHandler
         .resolved_path = path,
         .source_info = source_info.createSyntheticSourceInfo(path, .{ .source = "test" }),
         .handlers = handlers,
+    };
+}
+
+fn testCommandExtension(path: []const u8, commands: []const extensions.RegisteredCommand) extensions.Extension {
+    return .{
+        .path = path,
+        .resolved_path = path,
+        .source_info = source_info.createSyntheticSourceInfo(path, .{ .source = "test" }),
+        .commands = commands,
     };
 }
 

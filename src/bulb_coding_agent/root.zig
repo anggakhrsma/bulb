@@ -69,6 +69,7 @@ pub const SessionSubscription = session_events.SessionSubscription;
 pub const QueueUpdateSessionEvent = session_events.QueueUpdateSessionEvent;
 pub const QueueMode = session_events.QueueMode;
 pub const CustomMessageDelivery = session_events.CustomMessageDelivery;
+pub const queuedExtensionCommandErrorMessageAlloc = session_events.queuedExtensionCommandErrorMessageAlloc;
 pub const MessageEndListener = session_events.MessageEndListener;
 pub const AutoRetryController = session_events.AutoRetryController;
 pub const AgentSessionReplay = session_events.AgentSessionReplay;
