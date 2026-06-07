@@ -2,6 +2,7 @@ const std = @import("std");
 
 const ai = @import("bulb_ai");
 const auth_storage = @import("auth_storage.zig");
+const compaction_mod = @import("compaction.zig");
 const config_value = @import("resolve_config_value.zig");
 const extensions = @import("extensions/root.zig");
 const messages = @import("messages.zig");
@@ -684,13 +685,116 @@ pub const AgentSessionReplay = struct {
             return error.MissingTokensBefore;
         };
 
-        const retained_summary = try self.retainText(compaction.summary);
-        const retained_first_kept_entry_id = try self.retainText(first_kept_entry_id);
-        const retained_details_json = if (compaction.details_json) |details| try self.retainDetails(details) else null;
+        return try self.persistCompactionResult(
+            io,
+            .{
+                .summary = compaction.summary,
+                .first_kept_entry_id = first_kept_entry_id,
+                .tokens_before = tokens_before,
+                .details_json = compaction.details_json,
+            },
+            true,
+            reason,
+            will_retry,
+        );
+    }
+
+    pub fn compactWithGeneratedSummary(
+        self: *AgentSessionReplay,
+        io: std.Io,
+        preparation: *const compaction_mod.CompactionPreparation,
+        model: ai.Model,
+        request_options: compaction_mod.SummaryRequestOptions,
+        executor: compaction_mod.SummaryExecutor,
+        reason: CompactionReason,
+        will_retry: bool,
+    ) !CompactionSessionResult {
+        self.bridge.handleCompactionStart(reason);
+        errdefer |err| self.bridge.handleCompactionEnd(.{
+            .reason = reason,
+            .result = null,
+            .aborted = err == error.CompactionCancelled,
+            .will_retry = if (err == error.CompactionCancelled) false else will_retry,
+            .error_message = compactionErrorMessage(err),
+        });
+
+        const signal = request_options.signal orelse &never_aborted_signal;
+        const branch_entries = try self.sessions.getBranchAlloc(self.allocator, null);
+        defer self.allocator.free(branch_entries);
+
+        if (self.runner.hasHandlers(.session_before_compact)) {
+            var maybe_emit_result = try self.runner.emitSessionBeforeCompactAlloc(.{
+                .preparation = extensionPreparationFromCompaction(preparation),
+                .branch_entries = branch_entries,
+                .custom_instructions = request_options.custom_instructions,
+                .signal = signal,
+            });
+            defer if (maybe_emit_result) |*emit_result| emit_result.deinit();
+
+            const cancelled_by_extension = if (maybe_emit_result) |*emit_result| emit_result.result.cancel else false;
+            if (signal.isAborted() or cancelled_by_extension) return error.CompactionCancelled;
+
+            if (maybe_emit_result) |*emit_result| {
+                if (emit_result.result.compaction) |extension_compaction| {
+                    const first_kept_entry_id = extension_compaction.first_kept_entry_id orelse preparation.first_kept_entry_id;
+                    const tokens_before = extension_compaction.tokens_before orelse preparation.tokens_before;
+                    return try self.persistCompactionResult(
+                        io,
+                        .{
+                            .summary = extension_compaction.summary,
+                            .first_kept_entry_id = first_kept_entry_id,
+                            .tokens_before = tokens_before,
+                            .details_json = extension_compaction.details_json,
+                        },
+                        true,
+                        reason,
+                        will_retry,
+                    );
+                }
+            }
+        } else if (signal.isAborted()) {
+            return error.CompactionCancelled;
+        }
+
+        var generated = try compaction_mod.compactAlloc(
+            self.allocator,
+            preparation,
+            model,
+            request_options,
+            executor,
+        );
+        defer generated.deinit();
+
+        if (signal.isAborted()) return error.CompactionCancelled;
+        return try self.persistCompactionResult(
+            io,
+            .{
+                .summary = generated.summary,
+                .first_kept_entry_id = generated.first_kept_entry_id,
+                .tokens_before = generated.tokens_before,
+                .details_json = generated.details_json,
+            },
+            false,
+            reason,
+            will_retry,
+        );
+    }
+
+    fn persistCompactionResult(
+        self: *AgentSessionReplay,
+        io: std.Io,
+        result: CompactionSessionResult,
+        from_extension: bool,
+        reason: CompactionReason,
+        will_retry: bool,
+    ) !CompactionSessionResult {
+        const retained_summary = try self.retainText(result.summary);
+        const retained_first_kept_entry_id = try self.retainText(result.first_kept_entry_id);
+        const retained_details_json = if (result.details_json) |details| try self.retainDetails(details) else null;
         const event_result = CompactionSessionResult{
             .summary = retained_summary,
             .first_kept_entry_id = retained_first_kept_entry_id,
-            .tokens_before = tokens_before,
+            .tokens_before = result.tokens_before,
             .details_json = retained_details_json,
         };
 
@@ -700,13 +804,13 @@ pub const AgentSessionReplay = struct {
             event_result.first_kept_entry_id,
             event_result.tokens_before,
             event_result.details_json,
-            true,
+            from_extension,
         );
         const compaction_entry = self.sessions.getEntry(entry_id) orelse return error.MissingCompactionEntry;
 
         _ = try self.runner.emit(.{ .session = .{ .compact = .{
             .compaction_entry = compaction_entry,
-            .from_extension = true,
+            .from_extension = from_extension,
         } } });
 
         self.bridge.handleCompactionEnd(.{
@@ -1163,6 +1267,29 @@ pub const AgentSessionReplay = struct {
         };
     }
 };
+
+const never_aborted_signal: ai.AbortSignal = .{};
+
+fn extensionPreparationFromCompaction(preparation: *const compaction_mod.CompactionPreparation) extensions.CompactionPreparation {
+    return .{
+        .first_kept_entry_id = preparation.first_kept_entry_id,
+        .messages_to_summarize = preparation.messages_to_summarize,
+        .turn_prefix_messages = preparation.turn_prefix_messages,
+        .is_split_turn = preparation.is_split_turn,
+        .tokens_before = preparation.tokens_before,
+        .previous_summary = preparation.previous_summary,
+        .tokens = preparation.tokens_before,
+    };
+}
+
+fn compactionErrorMessage(err: anyerror) []const u8 {
+    return switch (err) {
+        error.CompactionCancelled => "Compaction cancelled",
+        error.SummarizationFailed => "Compaction failed: SummarizationFailed",
+        error.TurnPrefixSummarizationFailed => "Compaction failed: TurnPrefixSummarizationFailed",
+        else => "Compaction failed",
+    };
+}
 
 pub fn isRetryableError(message: ai.AssistantMessage, context_window: ?u64) bool {
     if (message.stop_reason != .@"error") return false;
@@ -2726,6 +2853,184 @@ test "AgentSession replay compact uses extension-provided summary and emits save
     try std.testing.expectEqualSlices(CompactionEventObservation, &expected_events, public_events.items);
 }
 
+test "AgentSession replay compact falls back to generated summary and emits saved compact event" {
+    const allocator = std.testing.allocator;
+    var harness = try TestHarness.init(allocator);
+    defer harness.deinit();
+
+    var runner = extensions.ExtensionRunner.init(
+        allocator,
+        &.{},
+        harness.runtime,
+        "/tmp",
+        harness.sessions,
+        harness.registry,
+    );
+    defer runner.deinit();
+
+    var bridge = SessionEventBridge.init(allocator);
+    defer bridge.deinit();
+    var public_events: std.ArrayList(CompactionEventObservation) = .empty;
+    defer public_events.deinit(allocator);
+    var observer = CompactionEventObserver{ .allocator = allocator, .events = &public_events };
+    try bridge.subscribe(.{ .ptr = &observer, .call_fn = CompactionEventObserver.publicListener });
+
+    const assistant_content = [_]ai.AssistantContent{.{ .text = .{ .text = "reply" } }};
+    const responses = [_]ai.AssistantMessage{assistantMessage(&assistant_content, .stop)};
+    var replay = AgentSessionReplay.init(
+        allocator,
+        &bridge,
+        &runner,
+        harness.sessions,
+        AutoRetryController.init(.{ .enabled = false }, null),
+        &.{},
+    );
+    defer replay.deinit();
+    replay.setResponses(&responses);
+    try replay.prompt(std.testing.io, "message to compact", 123);
+
+    const entries_before = harness.sessions.getEntries();
+    try std.testing.expectEqual(@as(usize, 2), entries_before.len);
+    const first_kept_entry_id = entries_before[0].id.?;
+    var signal: ai.AbortSignal = .{};
+    var preparation = compaction_mod.CompactionPreparation{
+        .arena = std.heap.ArenaAllocator.init(allocator),
+        .first_kept_entry_id = first_kept_entry_id,
+        .messages_to_summarize = replay.messages.items,
+        .turn_prefix_messages = &.{},
+        .is_split_turn = false,
+        .tokens_before = 333,
+        .settings = .{ .reserve_tokens = 1024, .keep_recent_tokens = 1 },
+    };
+    defer preparation.deinit();
+    var summary_state = GeneratedSummaryState{ .summary = "summary from generated executor" };
+
+    const result = try replay.compactWithGeneratedSummary(
+        std.testing.io,
+        &preparation,
+        sessionCompactionModel(),
+        .{
+            .api_key = "test-key",
+            .signal = &signal,
+            .custom_instructions = "keep the generated summary crisp",
+        },
+        summary_state.executor(),
+        .manual,
+        false,
+    );
+
+    try std.testing.expectEqualStrings("summary from generated executor", result.summary);
+    try std.testing.expectEqual(@as(usize, 1), summary_state.calls);
+    try std.testing.expectEqual(@as(?u64, 819), summary_state.seen_max_tokens);
+    try std.testing.expectEqualStrings("test-key", summary_state.seen_api_key.?);
+
+    const entries_after = harness.sessions.getEntries();
+    try std.testing.expectEqual(@as(usize, 3), entries_after.len);
+    const compaction_entry = entries_after[2];
+    try expectEntryType(compaction_entry, "compaction");
+    try expectEntryJsonStringField(allocator, compaction_entry, "summary", "summary from generated executor");
+    try expectEntryJsonStringField(allocator, compaction_entry, "firstKeptEntryId", first_kept_entry_id);
+    try expectEntryJsonU64Field(allocator, compaction_entry, "tokensBefore", 333);
+    try expectEntryJsonBoolField(allocator, compaction_entry, "fromHook", false);
+
+    var context = try harness.sessions.buildSessionContextAlloc(allocator);
+    defer context.deinit();
+    try std.testing.expect(context.messages.len >= 1);
+    try std.testing.expectEqual(ObservedRole.compaction_summary, observedRole(context.messages[0]));
+    try std.testing.expectEqualStrings("summary from generated executor", context.messages[0].compaction_summary.summary);
+
+    const expected_events = [_]CompactionEventObservation{
+        .{ .event = .start, .reason = .manual },
+        .{ .event = .end, .reason = .manual, .aborted = false, .will_retry = false, .summary = .other },
+    };
+    try std.testing.expectEqualSlices(CompactionEventObservation, &expected_events, public_events.items);
+}
+
+test "AgentSession replay generated compact lets extension-provided summary win" {
+    const allocator = std.testing.allocator;
+    var harness = try TestHarness.init(allocator);
+    defer harness.deinit();
+
+    var handler_arena = std.heap.ArenaAllocator.init(allocator);
+    defer handler_arena.deinit();
+    var extension_state = CompactExtensionState{
+        .allocator = handler_arena.allocator(),
+        .summary = "summary from extension",
+    };
+    const handlers = [_]extensions.ExtensionHandler{
+        .{
+            .ptr = &extension_state,
+            .event_name = .session_before_compact,
+            .handler_fn = CompactExtensionState.handler,
+        },
+        .{
+            .ptr = &extension_state,
+            .event_name = .session_compact,
+            .handler_fn = CompactExtensionState.handler,
+        },
+    };
+    const registered_extensions = [_]extensions.Extension{testExtension("/tmp/session-compact-generated-override.zig", &handlers)};
+    var runner = extensions.ExtensionRunner.init(
+        allocator,
+        &registered_extensions,
+        harness.runtime,
+        "/tmp",
+        harness.sessions,
+        harness.registry,
+    );
+    defer runner.deinit();
+
+    var bridge = SessionEventBridge.init(allocator);
+    defer bridge.deinit();
+
+    const assistant_content = [_]ai.AssistantContent{.{ .text = .{ .text = "reply" } }};
+    const responses = [_]ai.AssistantMessage{assistantMessage(&assistant_content, .stop)};
+    var replay = AgentSessionReplay.init(
+        allocator,
+        &bridge,
+        &runner,
+        harness.sessions,
+        AutoRetryController.init(.{ .enabled = false }, null),
+        &.{},
+    );
+    defer replay.deinit();
+    replay.setResponses(&responses);
+    try replay.prompt(std.testing.io, "message to compact", 123);
+
+    const entries_before = harness.sessions.getEntries();
+    const first_kept_entry_id = entries_before[0].id.?;
+    var signal: ai.AbortSignal = .{};
+    var preparation = compaction_mod.CompactionPreparation{
+        .arena = std.heap.ArenaAllocator.init(allocator),
+        .first_kept_entry_id = first_kept_entry_id,
+        .messages_to_summarize = replay.messages.items,
+        .turn_prefix_messages = &.{},
+        .is_split_turn = false,
+        .tokens_before = 444,
+        .settings = .{ .reserve_tokens = 1024, .keep_recent_tokens = 1 },
+    };
+    defer preparation.deinit();
+    var summary_state = GeneratedSummaryState{ .summary = "unused generated summary" };
+
+    const result = try replay.compactWithGeneratedSummary(
+        std.testing.io,
+        &preparation,
+        sessionCompactionModel(),
+        .{ .api_key = "test-key", .signal = &signal },
+        summary_state.executor(),
+        .manual,
+        false,
+    );
+
+    try std.testing.expectEqualStrings("summary from extension", result.summary);
+    try std.testing.expectEqual(@as(usize, 0), summary_state.calls);
+    try std.testing.expectEqual(@as(usize, 1), extension_state.before_calls);
+    try std.testing.expectEqual(@as(usize, 1), extension_state.compact_calls);
+    try std.testing.expectEqual(true, extension_state.seen_from_extension.?);
+    const compaction_entry = harness.sessions.getEntries()[2];
+    try expectEntryJsonBoolField(allocator, compaction_entry, "fromHook", true);
+}
+
 test "AgentSession replay compact cancellation stops session_compact and persistence" {
     const allocator = std.testing.allocator;
     var harness = try TestHarness.init(allocator);
@@ -3251,6 +3556,39 @@ const AgentEndFollowUpState = struct {
     }
 };
 
+const GeneratedSummaryState = struct {
+    summary: []const u8,
+    calls: usize = 0,
+    seen_max_tokens: ?u64 = null,
+    seen_api_key: ?[]const u8 = null,
+    content: [1]ai.AssistantContent = undefined,
+
+    fn executor(self: *@This()) compaction_mod.SummaryExecutor {
+        return .{ .ptr = self, .complete_fn = complete };
+    }
+
+    fn complete(
+        ptr: ?*anyopaque,
+        model: ai.Model,
+        context: ai.Context,
+        options: ai.SimpleStreamOptions,
+    ) !ai.AssistantMessage {
+        _ = context;
+        const state: *@This() = @ptrCast(@alignCast(ptr.?));
+        state.calls += 1;
+        state.seen_max_tokens = options.base.max_tokens;
+        state.seen_api_key = options.base.api_key;
+        state.content[0] = .{ .text = .{ .text = state.summary } };
+        return .{
+            .content = state.content[0..],
+            .api = model.api,
+            .provider = model.provider,
+            .model = model.id,
+            .stop_reason = .stop,
+        };
+    }
+};
+
 const CompactExtensionState = struct {
     allocator: std.mem.Allocator,
     summary: []const u8,
@@ -3659,6 +3997,18 @@ fn assistantMessage(content: []const ai.AssistantContent, stop_reason: ai.StopRe
         .provider = "openai",
         .model = "gpt-test",
         .stop_reason = stop_reason,
+    };
+}
+
+fn sessionCompactionModel() ai.Model {
+    return .{
+        .id = "gpt-test",
+        .name = "GPT Test",
+        .api = ai.types.api.openai_responses,
+        .provider = "openai",
+        .base_url = "https://example.invalid",
+        .context_window = 200_000,
+        .max_tokens = 8192,
     };
 }
 
