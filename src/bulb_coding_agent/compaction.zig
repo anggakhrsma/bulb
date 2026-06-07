@@ -7,6 +7,106 @@ const FileEntry = session_manager.FileEntry;
 const CodingAgentMessage = messages_mod.CodingAgentMessage;
 
 const estimated_image_chars: u64 = 4800;
+const tool_result_summary_max_chars: usize = 2000;
+
+pub const summarization_system_prompt =
+    \\You are a context summarization assistant. Your task is to read a conversation between a user and an AI coding assistant, then produce a structured summary following the exact format specified.
+    \\
+    \\Do NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary.
+;
+
+pub const summarization_prompt =
+    \\The messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work.
+    \\
+    \\Use this EXACT format:
+    \\
+    \\## Goal
+    \\[What is the user trying to accomplish? Can be multiple items if the session covers different tasks.]
+    \\
+    \\## Constraints & Preferences
+    \\- [Any constraints, preferences, or requirements mentioned by user]
+    \\- [Or "(none)" if none were mentioned]
+    \\
+    \\## Progress
+    \\### Done
+    \\- [x] [Completed tasks/changes]
+    \\
+    \\### In Progress
+    \\- [ ] [Current work]
+    \\
+    \\### Blocked
+    \\- [Issues preventing progress, if any]
+    \\
+    \\## Key Decisions
+    \\- **[Decision]**: [Brief rationale]
+    \\
+    \\## Next Steps
+    \\1. [Ordered list of what should happen next]
+    \\
+    \\## Critical Context
+    \\- [Any data, examples, or references needed to continue]
+    \\- [Or "(none)" if not applicable]
+    \\
+    \\Keep each section concise. Preserve exact file paths, function names, and error messages.
+;
+
+pub const update_summarization_prompt =
+    \\The messages above are NEW conversation messages to incorporate into the existing summary provided in <previous-summary> tags.
+    \\
+    \\Update the existing structured summary with new information. RULES:
+    \\- PRESERVE all existing information from the previous summary
+    \\- ADD new progress, decisions, and context from the new messages
+    \\- UPDATE the Progress section: move items from "In Progress" to "Done" when completed
+    \\- UPDATE "Next Steps" based on what was accomplished
+    \\- PRESERVE exact file paths, function names, and error messages
+    \\- If something is no longer relevant, you may remove it
+    \\
+    \\Use this EXACT format:
+    \\
+    \\## Goal
+    \\[Preserve existing goals, add new ones if the task expanded]
+    \\
+    \\## Constraints & Preferences
+    \\- [Preserve existing, add new ones discovered]
+    \\
+    \\## Progress
+    \\### Done
+    \\- [x] [Include previously done items AND newly completed items]
+    \\
+    \\### In Progress
+    \\- [ ] [Current work - update based on progress]
+    \\
+    \\### Blocked
+    \\- [Current blockers - remove if resolved]
+    \\
+    \\## Key Decisions
+    \\- **[Decision]**: [Brief rationale] (preserve all previous, add new)
+    \\
+    \\## Next Steps
+    \\1. [Update based on current state]
+    \\
+    \\## Critical Context
+    \\- [Preserve important context, add new if needed]
+    \\
+    \\Keep each section concise. Preserve exact file paths, function names, and error messages.
+;
+
+pub const turn_prefix_summarization_prompt =
+    \\This is the PREFIX of a turn that was too large to keep. The SUFFIX (recent work) is retained.
+    \\
+    \\Summarize the prefix to provide context for the retained suffix:
+    \\
+    \\## Original Request
+    \\[What did the user ask for in this turn?]
+    \\
+    \\## Early Progress
+    \\- [Key decisions and work done in the prefix]
+    \\
+    \\## Context for Suffix
+    \\- [Information needed to understand the retained recent work]
+    \\
+    \\Be concise. Focus on what's needed to understand the kept suffix.
+;
 
 pub const CompactionSettings = struct {
     enabled: bool = true,
@@ -38,6 +138,26 @@ pub const FileOperations = struct {
 pub const FileOperationLists = struct {
     read_files: []const []const u8 = &.{},
     modified_files: []const []const u8 = &.{},
+};
+
+pub const SummaryRequestOptions = struct {
+    api_key: ?[]const u8 = null,
+    headers: []const ai.Header = &.{},
+    signal: ?*ai.AbortSignal = null,
+    custom_instructions: ?[]const u8 = null,
+    previous_summary: ?[]const u8 = null,
+    thinking_level: ?ai.ThinkingLevel = null,
+};
+
+pub const SummaryRequest = struct {
+    arena: std.heap.ArenaAllocator,
+    context: ai.Context,
+    options: ai.SimpleStreamOptions,
+
+    pub fn deinit(self: *SummaryRequest) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
 };
 
 pub const CompactionPreparation = struct {
@@ -386,6 +506,203 @@ pub fn computeFileListsAlloc(allocator: std.mem.Allocator, file_ops: FileOperati
     };
 }
 
+pub fn formatFileOperationsAlloc(
+    allocator: std.mem.Allocator,
+    read_files: []const []const u8,
+    modified_files: []const []const u8,
+) ![]u8 {
+    if (read_files.len == 0 and modified_files.len == 0) return allocator.dupe(u8, "");
+
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(allocator);
+    try output.appendSlice(allocator, "\n\n");
+
+    var wrote_section = false;
+    if (read_files.len > 0) {
+        try appendFileOperationSection(allocator, &output, "read-files", read_files);
+        wrote_section = true;
+    }
+    if (modified_files.len > 0) {
+        if (wrote_section) try output.appendSlice(allocator, "\n\n");
+        try appendFileOperationSection(allocator, &output, "modified-files", modified_files);
+    }
+
+    return output.toOwnedSlice(allocator);
+}
+
+pub fn serializeConversationAlloc(allocator: std.mem.Allocator, messages: []const ai.Message) ![]u8 {
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(allocator);
+
+    for (messages) |message| {
+        switch (message) {
+            .user => |msg| {
+                var content: std.ArrayList(u8) = .empty;
+                defer content.deinit(allocator);
+                try appendUserContentText(allocator, &content, msg.content);
+                if (content.items.len > 0) try appendSerializedPart(allocator, &output, "[User]: ", content.items);
+            },
+            .assistant => |msg| {
+                var text_parts: std.ArrayList(u8) = .empty;
+                defer text_parts.deinit(allocator);
+                var thinking_parts: std.ArrayList(u8) = .empty;
+                defer thinking_parts.deinit(allocator);
+                var tool_calls: std.ArrayList(u8) = .empty;
+                defer tool_calls.deinit(allocator);
+
+                var text_count: usize = 0;
+                var thinking_count: usize = 0;
+                var tool_count: usize = 0;
+                for (msg.content) |block| {
+                    switch (block) {
+                        .text => |text| {
+                            if (text_count > 0) try text_parts.append(allocator, '\n');
+                            try text_parts.appendSlice(allocator, text.text);
+                            text_count += 1;
+                        },
+                        .thinking => |thinking| {
+                            if (thinking_count > 0) try thinking_parts.append(allocator, '\n');
+                            try thinking_parts.appendSlice(allocator, thinking.thinking);
+                            thinking_count += 1;
+                        },
+                        .tool_call => |tool_call| {
+                            if (tool_count > 0) try tool_calls.appendSlice(allocator, "; ");
+                            try tool_calls.appendSlice(allocator, tool_call.name);
+                            try tool_calls.append(allocator, '(');
+                            try appendToolCallArguments(allocator, &tool_calls, tool_call.arguments_json);
+                            try tool_calls.append(allocator, ')');
+                            tool_count += 1;
+                        },
+                    }
+                }
+
+                if (thinking_count > 0) try appendSerializedPart(allocator, &output, "[Assistant thinking]: ", thinking_parts.items);
+                if (text_count > 0) try appendSerializedPart(allocator, &output, "[Assistant]: ", text_parts.items);
+                if (tool_count > 0) try appendSerializedPart(allocator, &output, "[Assistant tool calls]: ", tool_calls.items);
+            },
+            .tool_result => |msg| {
+                var content: std.ArrayList(u8) = .empty;
+                defer content.deinit(allocator);
+                try appendUserContentText(allocator, &content, msg.content);
+                if (content.items.len > 0) {
+                    var truncated: std.ArrayList(u8) = .empty;
+                    defer truncated.deinit(allocator);
+                    try appendTruncatedForSummary(allocator, &truncated, content.items, tool_result_summary_max_chars);
+                    try appendSerializedPart(allocator, &output, "[Tool result]: ", truncated.items);
+                }
+            },
+        }
+    }
+
+    return output.toOwnedSlice(allocator);
+}
+
+pub fn historySummaryMaxTokens(model: ai.Model, reserve_tokens: u64) u64 {
+    return clampSummaryMaxTokens(model, scaledTokens(reserve_tokens, 8, 10));
+}
+
+pub fn turnPrefixSummaryMaxTokens(model: ai.Model, reserve_tokens: u64) u64 {
+    return clampSummaryMaxTokens(model, scaledTokens(reserve_tokens, 1, 2));
+}
+
+pub fn createSummarizationOptions(
+    model: ai.Model,
+    max_tokens: u64,
+    api_key: ?[]const u8,
+    headers: []const ai.Header,
+    signal: ?*ai.AbortSignal,
+    thinking_level: ?ai.ThinkingLevel,
+) ai.SimpleStreamOptions {
+    var options = ai.SimpleStreamOptions{ .base = .{
+        .max_tokens = max_tokens,
+        .api_key = api_key,
+        .headers = headers,
+        .signal = signal,
+    } };
+    if (model.reasoning) {
+        if (thinking_level) |level| {
+            if (level != .off) options.reasoning = level;
+        }
+    }
+    return options;
+}
+
+pub fn buildSummaryRequestAlloc(
+    allocator: std.mem.Allocator,
+    current_messages: []const CodingAgentMessage,
+    model: ai.Model,
+    reserve_tokens: u64,
+    request_options: SummaryRequestOptions,
+) !SummaryRequest {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    const llm_messages = try messages_mod.convertToLlmAlloc(arena_allocator, current_messages);
+    const conversation_text = try serializeConversationAlloc(arena_allocator, llm_messages.messages);
+
+    var base_prompt: []const u8 = if (request_options.previous_summary != null)
+        update_summarization_prompt
+    else
+        summarization_prompt;
+    if (request_options.custom_instructions) |custom| {
+        base_prompt = try std.fmt.allocPrint(
+            arena_allocator,
+            "{s}\n\nAdditional focus: {s}",
+            .{ base_prompt, custom },
+        );
+    }
+
+    const prompt_text = if (request_options.previous_summary) |previous|
+        try std.fmt.allocPrint(
+            arena_allocator,
+            "<conversation>\n{s}\n</conversation>\n\n<previous-summary>\n{s}\n</previous-summary>\n\n{s}",
+            .{ conversation_text, previous, base_prompt },
+        )
+    else
+        try std.fmt.allocPrint(
+            arena_allocator,
+            "<conversation>\n{s}\n</conversation>\n\n{s}",
+            .{ conversation_text, base_prompt },
+        );
+
+    return try buildSummaryRequestFromPromptAlloc(
+        &arena,
+        prompt_text,
+        model,
+        historySummaryMaxTokens(model, reserve_tokens),
+        request_options,
+    );
+}
+
+pub fn buildTurnPrefixSummaryRequestAlloc(
+    allocator: std.mem.Allocator,
+    current_messages: []const CodingAgentMessage,
+    model: ai.Model,
+    reserve_tokens: u64,
+    request_options: SummaryRequestOptions,
+) !SummaryRequest {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    const llm_messages = try messages_mod.convertToLlmAlloc(arena_allocator, current_messages);
+    const conversation_text = try serializeConversationAlloc(arena_allocator, llm_messages.messages);
+    const prompt_text = try std.fmt.allocPrint(
+        arena_allocator,
+        "<conversation>\n{s}\n</conversation>\n\n{s}",
+        .{ conversation_text, turn_prefix_summarization_prompt },
+    );
+
+    return try buildSummaryRequestFromPromptAlloc(
+        &arena,
+        prompt_text,
+        model,
+        turnPrefixSummaryMaxTokens(model, reserve_tokens),
+        request_options,
+    );
+}
+
 fn getAssistantUsage(message: CodingAgentMessage) ?ai.Usage {
     if (message != .assistant) return null;
     const assistant = message.assistant;
@@ -595,6 +912,129 @@ fn mapKeysAlloc(allocator: std.mem.Allocator, map: *std.StringHashMap(void)) ![]
     return keys.toOwnedSlice(allocator);
 }
 
+fn appendFileOperationSection(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(u8),
+    tag_name: []const u8,
+    files: []const []const u8,
+) !void {
+    try output.append(allocator, '<');
+    try output.appendSlice(allocator, tag_name);
+    try output.appendSlice(allocator, ">\n");
+    for (files, 0..) |file, index| {
+        if (index > 0) try output.append(allocator, '\n');
+        try output.appendSlice(allocator, file);
+    }
+    try output.appendSlice(allocator, "\n</");
+    try output.appendSlice(allocator, tag_name);
+    try output.append(allocator, '>');
+}
+
+fn appendSerializedPart(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(u8),
+    label: []const u8,
+    content: []const u8,
+) !void {
+    if (output.items.len > 0) try output.appendSlice(allocator, "\n\n");
+    try output.appendSlice(allocator, label);
+    try output.appendSlice(allocator, content);
+}
+
+fn appendToolCallArguments(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(u8),
+    arguments_json: []const u8,
+) !void {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, arguments_json, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => {
+            try output.appendSlice(allocator, arguments_json);
+            return;
+        },
+    };
+    defer parsed.deinit();
+
+    if (parsed.value != .object) {
+        try output.appendSlice(allocator, arguments_json);
+        return;
+    }
+
+    var wrote_arg = false;
+    var iterator = parsed.value.object.iterator();
+    while (iterator.next()) |entry| {
+        if (wrote_arg) try output.appendSlice(allocator, ", ");
+        try output.appendSlice(allocator, entry.key_ptr.*);
+        try output.append(allocator, '=');
+        const value_json = try std.json.Stringify.valueAlloc(allocator, entry.value_ptr.*, .{});
+        defer allocator.free(value_json);
+        try output.appendSlice(allocator, value_json);
+        wrote_arg = true;
+    }
+}
+
+fn appendTruncatedForSummary(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(u8),
+    text: []const u8,
+    max_chars: usize,
+) !void {
+    if (text.len <= max_chars) {
+        try output.appendSlice(allocator, text);
+        return;
+    }
+    try output.appendSlice(allocator, text[0..max_chars]);
+    const marker = try std.fmt.allocPrint(
+        allocator,
+        "\n\n[... {d} more characters truncated]",
+        .{text.len - max_chars},
+    );
+    defer allocator.free(marker);
+    try output.appendSlice(allocator, marker);
+}
+
+fn scaledTokens(value: u64, numerator: u64, denominator: u64) u64 {
+    return (value *| numerator) / denominator;
+}
+
+fn clampSummaryMaxTokens(model: ai.Model, requested: u64) u64 {
+    if (model.max_tokens == 0) return requested;
+    return @min(requested, model.max_tokens);
+}
+
+fn buildSummaryRequestFromPromptAlloc(
+    arena: *std.heap.ArenaAllocator,
+    prompt_text: []const u8,
+    model: ai.Model,
+    max_tokens: u64,
+    request_options: SummaryRequestOptions,
+) !SummaryRequest {
+    const arena_allocator = arena.allocator();
+    const content = try arena_allocator.alloc(ai.UserContent, 1);
+    content[0] = .{ .text = .{ .text = prompt_text } };
+    const messages = try arena_allocator.alloc(ai.Message, 1);
+    messages[0] = .{ .user = .{
+        .content = content,
+        .timestamp_ms = 0,
+    } };
+
+    return .{
+        .arena = arena.*,
+        .context = .{
+            .system_prompt = summarization_system_prompt,
+            .messages = messages,
+        },
+        .options = createSummarizationOptions(
+            model,
+            max_tokens,
+            request_options.api_key,
+            request_options.headers,
+            request_options.signal,
+            request_options.thinking_level,
+        ),
+    };
+}
+
 fn sortStrings(values: [][]const u8) void {
     std.mem.sort([]const u8, values, {}, struct {
         fn lessThan(_: void, left: []const u8, right: []const u8) bool {
@@ -741,6 +1181,159 @@ fn containsString(values: []const []const u8, needle: []const u8) bool {
         if (std.mem.eql(u8, value, needle)) return true;
     }
     return false;
+}
+
+fn summaryTestModel(reasoning: bool, max_tokens: u64) ai.Model {
+    return .{
+        .id = if (reasoning) "reasoning-model" else "non-reasoning-model",
+        .name = if (reasoning) "Reasoning Model" else "Non-reasoning Model",
+        .api = ai.types.api.anthropic_messages,
+        .provider = "anthropic",
+        .base_url = "https://api.anthropic.com",
+        .reasoning = reasoning,
+        .input = &.{"text"},
+        .context_window = 200_000,
+        .max_tokens = max_tokens,
+    };
+}
+
+// Ported from packages/coding-agent/test/compaction-serialization.test.ts.
+test "serializeConversation truncates long tool results" {
+    const allocator = std.testing.allocator;
+    const long_content = try repeatAlloc(allocator, "x", 5000);
+    defer allocator.free(long_content);
+    const hidden_tail = try repeatAlloc(allocator, "x", 3000);
+    defer allocator.free(hidden_tail);
+
+    const content = [_]ai.UserContent{.{ .text = .{ .text = long_content } }};
+    const messages = [_]ai.Message{.{ .tool_result = .{
+        .tool_call_id = "tc1",
+        .tool_name = "read",
+        .content = &content,
+        .is_error = false,
+        .timestamp_ms = 1,
+    } }};
+
+    const result = try serializeConversationAlloc(allocator, &messages);
+    defer allocator.free(result);
+
+    try std.testing.expect(std.mem.indexOf(u8, result, "[Tool result]:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "[... 3000 more characters truncated]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, hidden_tail) == null);
+    try std.testing.expect(std.mem.indexOf(u8, result, long_content[0..2000]) != null);
+}
+
+// Ported from packages/coding-agent/test/compaction-serialization.test.ts.
+test "serializeConversation does not truncate short tool results" {
+    const allocator = std.testing.allocator;
+    const short_content = try repeatAlloc(allocator, "x", 1500);
+    defer allocator.free(short_content);
+    const expected = try std.fmt.allocPrint(allocator, "[Tool result]: {s}", .{short_content});
+    defer allocator.free(expected);
+
+    const content = [_]ai.UserContent{.{ .text = .{ .text = short_content } }};
+    const messages = [_]ai.Message{.{ .tool_result = .{
+        .tool_call_id = "tc1",
+        .tool_name = "read",
+        .content = &content,
+        .is_error = false,
+        .timestamp_ms = 1,
+    } }};
+
+    const result = try serializeConversationAlloc(allocator, &messages);
+    defer allocator.free(result);
+
+    try std.testing.expectEqualStrings(expected, result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "truncated") == null);
+}
+
+// Ported from packages/coding-agent/test/compaction-serialization.test.ts.
+test "serializeConversation does not truncate assistant or user messages" {
+    const allocator = std.testing.allocator;
+    const long_text = try repeatAlloc(allocator, "y", 5000);
+    defer allocator.free(long_text);
+
+    const user_content = [_]ai.UserContent{.{ .text = .{ .text = long_text } }};
+    const assistant_content = [_]ai.AssistantContent{.{ .text = .{ .text = long_text } }};
+    const messages = [_]ai.Message{
+        .{ .user = .{
+            .content = &user_content,
+            .timestamp_ms = 1,
+        } },
+        .{ .assistant = .{
+            .content = &assistant_content,
+            .api = ai.types.api.anthropic_messages,
+            .provider = "anthropic",
+            .model = "test",
+            .usage = mockUsage(0, 0, 0, 0),
+            .stop_reason = .stop,
+            .timestamp_ms = 2,
+        } },
+    };
+
+    const result = try serializeConversationAlloc(allocator, &messages);
+    defer allocator.free(result);
+
+    try std.testing.expect(std.mem.indexOf(u8, result, "truncated") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result, long_text) != null);
+}
+
+// Ported from packages/coding-agent/test/compaction-summary-reasoning.test.ts.
+test "compaction summary options use reasoning only for supported non-off thinking levels" {
+    const reasoning_model = summaryTestModel(true, 8192);
+    const non_reasoning_model = summaryTestModel(false, 8192);
+
+    const medium = createSummarizationOptions(reasoning_model, 1600, "test-key", &.{}, null, .medium);
+    try std.testing.expectEqual(ai.ThinkingLevel.medium, medium.reasoning.?);
+    try std.testing.expectEqualStrings("test-key", medium.base.api_key.?);
+
+    const off = createSummarizationOptions(reasoning_model, 1600, "test-key", &.{}, null, .off);
+    try std.testing.expect(off.reasoning == null);
+    try std.testing.expectEqualStrings("test-key", off.base.api_key.?);
+
+    const unsupported = createSummarizationOptions(non_reasoning_model, 1600, "test-key", &.{}, null, .medium);
+    try std.testing.expect(unsupported.reasoning == null);
+    try std.testing.expectEqualStrings("test-key", unsupported.base.api_key.?);
+}
+
+// Ported from packages/coding-agent/test/compaction-summary-reasoning.test.ts.
+test "compaction summary maxTokens are clamped to model output cap" {
+    const model = summaryTestModel(false, 128_000);
+
+    try std.testing.expectEqual(@as(u64, 128_000), historySummaryMaxTokens(model, 500_000));
+    try std.testing.expectEqual(@as(u64, 128_000), turnPrefixSummaryMaxTokens(model, 500_000));
+}
+
+test "compaction summary request wraps conversation previous summary and focus" {
+    const allocator = std.testing.allocator;
+    const content = [_]ai.UserContent{.{ .text = .{ .text = "Summarize this." } }};
+    const messages = [_]CodingAgentMessage{.{ .user = .{
+        .content = &content,
+        .timestamp_ms = 1,
+    } }};
+
+    var request = try buildSummaryRequestAlloc(
+        allocator,
+        &messages,
+        summaryTestModel(true, 8192),
+        2000,
+        .{
+            .api_key = "test-key",
+            .custom_instructions = "focus on file paths",
+            .previous_summary = "Existing summary",
+            .thinking_level = .medium,
+        },
+    );
+    defer request.deinit();
+
+    try std.testing.expectEqualStrings(summarization_system_prompt, request.context.system_prompt.?);
+    try std.testing.expectEqual(@as(u64, 1600), request.options.base.max_tokens.?);
+    try std.testing.expectEqual(ai.ThinkingLevel.medium, request.options.reasoning.?);
+    const prompt = request.context.messages[0].user.content[0].text.text;
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "<conversation>\n[User]: Summarize this.\n</conversation>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "<previous-summary>\nExisting summary\n</previous-summary>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, update_summarization_prompt) != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Additional focus: focus on file paths") != null);
 }
 
 test "compaction calculates context tokens from usage" {
