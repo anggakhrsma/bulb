@@ -136,6 +136,16 @@ pub const MessageEndEmitResult = struct {
     }
 };
 
+pub const SessionBeforeTreeEmitResult = struct {
+    arena: std.heap.ArenaAllocator,
+    result: types.SessionBeforeTreeResult,
+
+    pub fn deinit(self: *SessionBeforeTreeEmitResult) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
 pub const ToolResultEmitResult = struct {
     allocator: std.mem.Allocator,
     content: ?OwnedUserContentList = null,
@@ -502,6 +512,14 @@ pub const ExtensionRunner = struct {
     ) !?types.SessionBeforeForkResult {
         const value = (try self.emit(.{ .session = .{ .before_fork = event } })) orelse return null;
         return parseSessionBeforeForkResult(value);
+    }
+
+    pub fn emitSessionBeforeTreeAlloc(
+        self: *ExtensionRunner,
+        event: types.SessionBeforeTreeEvent,
+    ) !?SessionBeforeTreeEmitResult {
+        const value = (try self.emit(.{ .session = .{ .before_tree = event } })) orelse return null;
+        return try parseSessionBeforeTreeResultAlloc(self.allocator, value);
     }
 
     pub fn emitContext(self: *ExtensionRunner, context_messages: []types.AgentMessage) ![]types.AgentMessage {
@@ -1145,6 +1163,13 @@ fn jsonString(value: std.json.Value, key: []const u8) ?[]const u8 {
     };
 }
 
+fn jsonStringAny(value: std.json.Value, keys: []const []const u8) ?[]const u8 {
+    for (keys) |key| {
+        if (jsonString(value, key)) |string| return string;
+    }
+    return null;
+}
+
 fn jsonBoolAny(value: std.json.Value, keys: []const []const u8) ?bool {
     for (keys) |key| {
         if (jsonBool(value, key)) |boolean| return boolean;
@@ -1163,6 +1188,62 @@ fn parseSessionBeforeForkResult(value: std.json.Value) types.SessionBeforeForkRe
         .cancel = jsonBool(value, "cancel") orelse false,
         .skip_conversation_restore = jsonBoolAny(value, &.{ "skipConversationRestore", "skip_conversation_restore" }) orelse false,
     };
+}
+
+fn parseSessionBeforeTreeResultAlloc(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+) !SessionBeforeTreeEmitResult {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const arena_allocator = arena.allocator();
+    const result = try parseSessionBeforeTreeResultValueAlloc(arena_allocator, value);
+    return .{
+        .arena = arena,
+        .result = result,
+    };
+}
+
+fn parseSessionBeforeTreeResultValueAlloc(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+) !types.SessionBeforeTreeResult {
+    if (value != .object) return .{};
+    var result = types.SessionBeforeTreeResult{
+        .cancel = jsonBool(value, "cancel") orelse false,
+        .custom_instructions = try dupeOptionalString(
+            allocator,
+            jsonStringAny(value, &.{ "customInstructions", "custom_instructions" }),
+        ),
+        .replace_instructions = jsonBoolAny(value, &.{ "replaceInstructions", "replace_instructions" }),
+        .label = try dupeOptionalString(allocator, jsonString(value, "label")),
+    };
+
+    if (value.object.get("summary")) |summary_value| {
+        result.summary = try parseSessionBeforeTreeSummaryAlloc(allocator, summary_value);
+    }
+
+    return result;
+}
+
+fn parseSessionBeforeTreeSummaryAlloc(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+) !?types.SessionBeforeTreeSummary {
+    if (value != .object) return null;
+    const summary = jsonString(value, "summary") orelse return null;
+    return .{
+        .summary = try allocator.dupe(u8, summary),
+        .details = if (value.object.get("details")) |details|
+            try cloneJsonValueAlloc(allocator, details)
+        else
+            null,
+    };
+}
+
+fn cloneJsonValueAlloc(allocator: std.mem.Allocator, value: std.json.Value) !std.json.Value {
+    const encoded = try jsonValueToStringAlloc(allocator, value);
+    return try std.json.parseFromSliceLeaky(std.json.Value, allocator, encoded, .{});
 }
 
 fn parseAgentMessageAlloc(allocator: std.mem.Allocator, value: std.json.Value) !MessageEndEmitResult {
@@ -2224,6 +2305,166 @@ test "extension runner session_before_fork returns latest result and parses Pi f
     try std.testing.expectEqualStrings("entry-1", first.seen_entry_id.?);
     try std.testing.expectEqual(types.ForkPosition.before, first.seen_position.?);
     try std.testing.expectEqual(@as(usize, 1), second.calls);
+}
+
+test "extension runner session_before_tree returns latest result and parses Pi field casing" {
+    const allocator = std.testing.allocator;
+    var harness = try RunnerHarness.init(allocator);
+    defer harness.deinit();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const State = struct {
+        allocator: std.mem.Allocator,
+        summary: []const u8,
+        custom_instructions: []const u8,
+        replace_instructions: bool,
+        label: []const u8,
+        calls: usize = 0,
+        seen_target_id: ?[]const u8 = null,
+        seen_user_wants_summary: bool = false,
+
+        fn handler(ptr: ?*anyopaque, event_value: types.ExtensionEvent, ctx: *types.ExtensionContext) !?std.json.Value {
+            _ = ctx;
+            const state: *@This() = @ptrCast(@alignCast(ptr.?));
+            state.calls += 1;
+            state.seen_target_id = event_value.session.before_tree.preparation.target_id;
+            state.seen_user_wants_summary = event_value.session.before_tree.preparation.user_wants_summary;
+
+            var object = std.json.Value{ .object = .empty };
+            var summary_object = std.json.Value{ .object = .empty };
+            try putJsonString(state.allocator, &summary_object, "summary", state.summary);
+            var details_object = std.json.Value{ .object = .empty };
+            try putJsonString(state.allocator, &details_object, "source", state.summary);
+            try putJsonValue(state.allocator, &summary_object, "details", details_object);
+            try putJsonValue(state.allocator, &object, "summary", summary_object);
+            try putJsonString(state.allocator, &object, "customInstructions", state.custom_instructions);
+            try putJsonBool(state.allocator, &object, "replaceInstructions", state.replace_instructions);
+            try putJsonString(state.allocator, &object, "label", state.label);
+            return object;
+        }
+    };
+
+    var first = State{
+        .allocator = arena.allocator(),
+        .summary = "first summary",
+        .custom_instructions = "first focus",
+        .replace_instructions = false,
+        .label = "first-label",
+    };
+    var second = State{
+        .allocator = arena.allocator(),
+        .summary = "second summary",
+        .custom_instructions = "second focus",
+        .replace_instructions = true,
+        .label = "second-label",
+    };
+    const first_handlers = [_]types.ExtensionHandler{.{
+        .ptr = &first,
+        .event_name = .session_before_tree,
+        .handler_fn = State.handler,
+    }};
+    const second_handlers = [_]types.ExtensionHandler{.{
+        .ptr = &second,
+        .event_name = .session_before_tree,
+        .handler_fn = State.handler,
+    }};
+    const extensions = [_]types.Extension{
+        testExtension("/tmp/tree-a.zig", &.{}, &.{}, &.{}, &.{}, &.{}, &first_handlers),
+        testExtension("/tmp/tree-b.zig", &.{}, &.{}, &.{}, &.{}, &.{}, &second_handlers),
+    };
+    var runner = ExtensionRunner.init(allocator, &extensions, harness.runtime, "/tmp", harness.sessions, harness.registry);
+    defer runner.deinit();
+    var signal: ai.AbortSignal = .{};
+
+    var result = (try runner.emitSessionBeforeTreeAlloc(.{
+        .preparation = .{
+            .target_id = "target-entry",
+            .old_leaf_id = "old-leaf",
+            .common_ancestor_id = "ancestor",
+            .entries_to_summarize = &.{},
+            .user_wants_summary = true,
+            .custom_instructions = "initial focus",
+            .replace_instructions = false,
+            .label = "initial-label",
+        },
+        .signal = &signal,
+    })).?;
+    defer result.deinit();
+
+    try std.testing.expect(!result.result.cancel);
+    try std.testing.expectEqualStrings("second summary", result.result.summary.?.summary);
+    const details = result.result.summary.?.details.?;
+    try std.testing.expectEqualStrings("second summary", details.object.get("source").?.string);
+    try std.testing.expectEqualStrings("second focus", result.result.custom_instructions.?);
+    try std.testing.expectEqual(true, result.result.replace_instructions.?);
+    try std.testing.expectEqualStrings("second-label", result.result.label.?);
+    try std.testing.expectEqual(@as(usize, 1), first.calls);
+    try std.testing.expectEqualStrings("target-entry", first.seen_target_id.?);
+    try std.testing.expect(first.seen_user_wants_summary);
+    try std.testing.expectEqual(@as(usize, 1), second.calls);
+}
+
+test "extension runner session_before_tree cancellation stops later handlers" {
+    const allocator = std.testing.allocator;
+    var harness = try RunnerHarness.init(allocator);
+    defer harness.deinit();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const State = struct {
+        allocator: std.mem.Allocator,
+        cancel: bool = false,
+        calls: usize = 0,
+
+        fn handler(ptr: ?*anyopaque, event_value: types.ExtensionEvent, ctx: *types.ExtensionContext) !?std.json.Value {
+            _ = event_value;
+            _ = ctx;
+            const state: *@This() = @ptrCast(@alignCast(ptr.?));
+            state.calls += 1;
+            var object = std.json.Value{ .object = .empty };
+            try putJsonBool(state.allocator, &object, "cancel", state.cancel);
+            return object;
+        }
+    };
+
+    var first = State{ .allocator = arena.allocator() };
+    var second = State{ .allocator = arena.allocator(), .cancel = true };
+    var third = State{ .allocator = arena.allocator() };
+    const first_handlers = [_]types.ExtensionHandler{.{
+        .ptr = &first,
+        .event_name = .session_before_tree,
+        .handler_fn = State.handler,
+    }};
+    const second_handlers = [_]types.ExtensionHandler{.{
+        .ptr = &second,
+        .event_name = .session_before_tree,
+        .handler_fn = State.handler,
+    }};
+    const third_handlers = [_]types.ExtensionHandler{.{
+        .ptr = &third,
+        .event_name = .session_before_tree,
+        .handler_fn = State.handler,
+    }};
+    const extensions = [_]types.Extension{
+        testExtension("/tmp/tree-cancel-a.zig", &.{}, &.{}, &.{}, &.{}, &.{}, &first_handlers),
+        testExtension("/tmp/tree-cancel-b.zig", &.{}, &.{}, &.{}, &.{}, &.{}, &second_handlers),
+        testExtension("/tmp/tree-cancel-c.zig", &.{}, &.{}, &.{}, &.{}, &.{}, &third_handlers),
+    };
+    var runner = ExtensionRunner.init(allocator, &extensions, harness.runtime, "/tmp", harness.sessions, harness.registry);
+    defer runner.deinit();
+    var signal: ai.AbortSignal = .{};
+
+    var result = (try runner.emitSessionBeforeTreeAlloc(.{
+        .preparation = .{ .target_id = "target-entry" },
+        .signal = &signal,
+    })).?;
+    defer result.deinit();
+
+    try std.testing.expect(result.result.cancel);
+    try std.testing.expectEqual(@as(usize, 1), first.calls);
+    try std.testing.expectEqual(@as(usize, 1), second.calls);
+    try std.testing.expectEqual(@as(usize, 0), third.calls);
 }
 
 test "extension runner chains before_agent_start system prompt updates" {
