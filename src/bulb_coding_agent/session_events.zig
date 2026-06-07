@@ -9,6 +9,7 @@ const model_registry = @import("model_registry.zig");
 const session_manager = @import("session_manager.zig");
 const settings_manager = @import("settings_manager.zig");
 const source_info = @import("source_info.zig");
+const tools = @import("tools/root.zig");
 
 pub const AgentEndSessionEvent = struct {
     messages: []messages.CodingAgentMessage,
@@ -358,6 +359,10 @@ pub const AutoRetryController = struct {
         return event;
     }
 
+    pub fn completeRetryDelay(self: *AutoRetryController) void {
+        self.retrying = false;
+    }
+
     pub fn completeRetrySuccess(
         self: *AutoRetryController,
         bridge: *SessionEventBridge,
@@ -393,6 +398,312 @@ pub const AutoRetryController = struct {
     pub fn abortRetry(self: *AutoRetryController, bridge: *SessionEventBridge) ?AutoRetryEndSessionEvent {
         if (!self.retrying and self.retry_attempt == 0) return null;
         return self.completeRetryFailure(bridge, "Retry cancelled");
+    }
+};
+
+pub const AgentSessionReplay = struct {
+    allocator: std.mem.Allocator,
+    bridge: *SessionEventBridge,
+    runner: *extensions.ExtensionRunner,
+    sessions: *session_manager.SessionManager,
+    retry: AutoRetryController,
+    agent_tools: []const tools.tool_registry.AgentTool = &.{},
+    responses: []const ai.AssistantMessage = &.{},
+    next_response: usize = 0,
+    messages: std.ArrayList(messages.CodingAgentMessage) = .empty,
+    owned_texts: std.ArrayList([]u8) = .empty,
+    owned_content: std.ArrayList([]ai.UserContent) = .empty,
+    retry_sleeps: std.ArrayList(u64) = .empty,
+    is_streaming: bool = false,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        bridge: *SessionEventBridge,
+        runner: *extensions.ExtensionRunner,
+        sessions: *session_manager.SessionManager,
+        retry: AutoRetryController,
+        agent_tools: []const tools.tool_registry.AgentTool,
+    ) AgentSessionReplay {
+        return .{
+            .allocator = allocator,
+            .bridge = bridge,
+            .runner = runner,
+            .sessions = sessions,
+            .retry = retry,
+            .agent_tools = agent_tools,
+        };
+    }
+
+    pub fn deinit(self: *AgentSessionReplay) void {
+        for (self.owned_texts.items) |text| self.allocator.free(text);
+        self.owned_texts.deinit(self.allocator);
+        for (self.owned_content.items) |content| self.allocator.free(content);
+        self.owned_content.deinit(self.allocator);
+        self.retry_sleeps.deinit(self.allocator);
+        self.messages.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    pub fn setResponses(self: *AgentSessionReplay, responses: []const ai.AssistantMessage) void {
+        self.responses = responses;
+        self.next_response = 0;
+    }
+
+    pub fn pendingResponseCount(self: *const AgentSessionReplay) usize {
+        return self.responses.len - self.next_response;
+    }
+
+    pub fn isRetrying(self: *const AgentSessionReplay) bool {
+        return self.retry.isRetrying();
+    }
+
+    pub fn abortRetry(self: *AgentSessionReplay) ?AutoRetryEndSessionEvent {
+        return self.retry.abortRetry(self.bridge);
+    }
+
+    pub fn prompt(self: *AgentSessionReplay, io: std.Io, text: []const u8, timestamp_ms: i64) !void {
+        if (self.is_streaming) return error.AgentAlreadyProcessing;
+        self.is_streaming = true;
+        defer self.is_streaming = false;
+
+        try self.bridge.handleAgentStart(self.runner);
+        try self.runPromptBody(io, text, timestamp_ms);
+    }
+
+    fn runPromptBody(self: *AgentSessionReplay, io: std.Io, text: []const u8, timestamp_ms: i64) !void {
+        var emit_prompt = true;
+        while (true) {
+            try self.bridge.handleTurnStart(self.runner, timestamp_ms);
+
+            if (emit_prompt) {
+                const user_message = try self.textUserMessage(text, timestamp_ms);
+                try self.emitAndStoreMessage(io, user_message);
+                emit_prompt = false;
+            }
+
+            var assistant_message = try self.nextAssistantResponse();
+            try self.bridge.handleMessageStart(self.runner, .{ .assistant = assistant_message });
+            try self.emitAssistantStreamUpdates(assistant_message);
+            var coding_assistant = messages.CodingAgentMessage{ .assistant = assistant_message };
+            try self.bridge.handleMessageEnd(io, self.runner, self.sessions, &coding_assistant);
+            assistant_message = coding_assistant.assistant;
+            try self.messages.append(self.allocator, coding_assistant);
+
+            if (assistant_message.stop_reason != .@"error" and self.retry.retry_attempt > 0) {
+                _ = self.retry.completeRetrySuccess(self.bridge);
+            }
+
+            if (assistant_message.stop_reason == .@"error" or assistant_message.stop_reason == .aborted) {
+                if (try self.finishTurnAndMaybeRetry(assistant_message)) {
+                    try self.bridge.handleAgentStart(self.runner);
+                    emit_prompt = false;
+                    continue;
+                }
+                return;
+            }
+
+            var turn_tool_results: std.ArrayList(ai.ToolResultMessage) = .empty;
+            defer turn_tool_results.deinit(self.allocator);
+            try self.executeToolCalls(io, assistant_message, &turn_tool_results, timestamp_ms);
+
+            try self.bridge.handleTurnEnd(self.runner, .{ .assistant = assistant_message }, turn_tool_results.items);
+            if (turn_tool_results.items.len > 0 and assistant_message.stop_reason == .tool_use) {
+                continue;
+            }
+
+            try self.bridge.handleAgentEnd(self.runner, self.messages.items, false);
+            return;
+        }
+    }
+
+    fn finishTurnAndMaybeRetry(self: *AgentSessionReplay, assistant_message: ai.AssistantMessage) !bool {
+        var no_tool_results: [0]ai.ToolResultMessage = .{};
+        const will_retry = self.retry.willRetryAfterAgentEnd(self.messages.items);
+        try self.bridge.handleTurnEnd(self.runner, .{ .assistant = assistant_message }, no_tool_results[0..]);
+        try self.bridge.handleAgentEnd(self.runner, self.messages.items, will_retry);
+
+        if (assistant_message.stop_reason == .aborted) return false;
+
+        if (self.retry.prepareRetry(self.bridge, assistant_message)) |event| {
+            try self.retry_sleeps.append(self.allocator, event.delay_ms);
+            self.retry.completeRetryDelay();
+            if (self.messages.items.len > 0) {
+                self.messages.items.len -= 1;
+            }
+            return true;
+        }
+
+        if (assistant_message.stop_reason == .@"error" and self.retry.retry_attempt > 0) {
+            _ = self.retry.completeRetryFailure(self.bridge, assistant_message.error_message);
+        }
+        return false;
+    }
+
+    fn nextAssistantResponse(self: *AgentSessionReplay) !ai.AssistantMessage {
+        if (self.next_response >= self.responses.len) return error.NoReplayResponse;
+        defer self.next_response += 1;
+        return self.responses[self.next_response];
+    }
+
+    fn textUserMessage(self: *AgentSessionReplay, text: []const u8, timestamp_ms: i64) !messages.CodingAgentMessage {
+        const owned_text = try self.allocator.dupe(u8, text);
+        var text_registered = false;
+        errdefer if (!text_registered) self.allocator.free(owned_text);
+
+        const content = try self.allocator.alloc(ai.UserContent, 1);
+        var content_registered = false;
+        errdefer if (!content_registered) self.allocator.free(content);
+
+        content[0] = .{ .text = .{ .text = owned_text } };
+        try self.owned_texts.append(self.allocator, owned_text);
+        text_registered = true;
+        try self.owned_content.append(self.allocator, content);
+        content_registered = true;
+
+        return .{ .user = .{
+            .content = content,
+            .timestamp_ms = timestamp_ms,
+        } };
+    }
+
+    fn emitAndStoreMessage(self: *AgentSessionReplay, io: std.Io, message: messages.CodingAgentMessage) !void {
+        var mutable = message;
+        try self.bridge.handleMessageStart(self.runner, mutable);
+        try self.bridge.handleMessageEnd(io, self.runner, self.sessions, &mutable);
+        try self.messages.append(self.allocator, mutable);
+    }
+
+    fn emitAssistantStreamUpdates(self: *AgentSessionReplay, assistant_message: ai.AssistantMessage) !void {
+        for (assistant_message.content, 0..) |content, index| {
+            switch (content) {
+                .thinking => |thinking| if (thinking.thinking.len > 0) {
+                    try self.bridge.handleMessageUpdate(self.runner, .{ .assistant = assistant_message }, .{
+                        .thinking_delta = .{
+                            .content_index = index,
+                            .delta = thinking.thinking,
+                        },
+                    });
+                },
+                .text => |text| if (text.text.len > 0) {
+                    try self.bridge.handleMessageUpdate(self.runner, .{ .assistant = assistant_message }, .{
+                        .text_delta = .{
+                            .content_index = index,
+                            .delta = text.text,
+                        },
+                    });
+                },
+                .tool_call => |tool_call| {
+                    try self.bridge.handleMessageUpdate(self.runner, .{ .assistant = assistant_message }, .{
+                        .toolcall_delta = .{
+                            .content_index = index,
+                            .delta = tool_call.arguments_json,
+                        },
+                    });
+                },
+            }
+        }
+    }
+
+    fn executeToolCalls(
+        self: *AgentSessionReplay,
+        io: std.Io,
+        assistant_message: ai.AssistantMessage,
+        turn_tool_results: *std.ArrayList(ai.ToolResultMessage),
+        timestamp_ms: i64,
+    ) !void {
+        for (assistant_message.content) |content| {
+            if (content != .tool_call) continue;
+            const tool_call = content.tool_call;
+
+            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena.deinit();
+            const arena_allocator = arena.allocator();
+
+            var parsed_args = try std.json.parseFromSlice(std.json.Value, arena_allocator, tool_call.arguments_json, .{});
+            defer parsed_args.deinit();
+
+            try self.bridge.handleToolExecutionStart(self.runner, .{
+                .tool_call_id = tool_call.id,
+                .tool_name = tool_call.name,
+                .args = parsed_args.value,
+            });
+
+            const execution = try self.executeToolAlloc(io, tool_call, parsed_args.value);
+            var owned_execution = execution;
+            defer owned_execution.deinit(self.allocator);
+
+            const result_text = try self.toolExecutionTextAlloc(owned_execution);
+            defer self.allocator.free(result_text);
+            const result_value = try toolExecutionResultJsonAlloc(arena_allocator, result_text);
+            const is_error = std.meta.activeTag(owned_execution) == .failure;
+            try self.bridge.handleToolExecutionEnd(self.runner, .{
+                .tool_call_id = tool_call.id,
+                .tool_name = tool_call.name,
+                .result = result_value,
+                .is_error = is_error,
+            });
+
+            const tool_result = try self.toolResultMessageFromText(tool_call, result_text, is_error, timestamp_ms);
+            try turn_tool_results.append(self.allocator, tool_result);
+            try self.emitAndStoreMessage(io, .{ .tool_result = tool_result });
+        }
+    }
+
+    fn executeToolAlloc(
+        self: *AgentSessionReplay,
+        io: std.Io,
+        tool_call: ai.ToolCall,
+        args: std.json.Value,
+    ) !tools.tool_registry.ToolExecution {
+        const tool = self.findTool(tool_call.name) orelse {
+            const message = try std.fmt.allocPrint(self.allocator, "Tool {s} not found", .{tool_call.name});
+            return .{ .failure = message };
+        };
+        return tool.executeValueAlloc(self.allocator, io, args, .{});
+    }
+
+    fn findTool(self: *const AgentSessionReplay, name: []const u8) ?*const tools.tool_registry.AgentTool {
+        for (self.agent_tools) |*tool| {
+            if (std.mem.eql(u8, tool.name, name)) return tool;
+        }
+        return null;
+    }
+
+    fn toolExecutionTextAlloc(self: *AgentSessionReplay, execution: tools.tool_registry.ToolExecution) ![]u8 {
+        return switch (execution) {
+            .success => |result| try tools.render_utils.getTextOutputAlloc(self.allocator, .{ .content = result.content }, true),
+            .failure => |message| try self.allocator.dupe(u8, message),
+        };
+    }
+
+    fn toolResultMessageFromText(
+        self: *AgentSessionReplay,
+        tool_call: ai.ToolCall,
+        text: []const u8,
+        is_error: bool,
+        timestamp_ms: i64,
+    ) !ai.ToolResultMessage {
+        const owned_text = try self.allocator.dupe(u8, text);
+        var text_registered = false;
+        errdefer if (!text_registered) self.allocator.free(owned_text);
+
+        const content = try self.allocator.alloc(ai.UserContent, 1);
+        var content_registered = false;
+        errdefer if (!content_registered) self.allocator.free(content);
+
+        content[0] = .{ .text = .{ .text = owned_text } };
+        try self.owned_texts.append(self.allocator, owned_text);
+        text_registered = true;
+        try self.owned_content.append(self.allocator, content);
+        content_registered = true;
+
+        return .{
+            .tool_call_id = tool_call.id,
+            .tool_name = tool_call.name,
+            .content = content,
+            .is_error = is_error,
+            .timestamp_ms = timestamp_ms,
+        };
     }
 };
 
@@ -570,6 +881,16 @@ fn customContentJsonAlloc(
     }
 
     return output.toOwnedSlice();
+}
+
+fn toolExecutionResultJsonAlloc(allocator: std.mem.Allocator, text: []const u8) !std.json.Value {
+    var result = std.json.Value{ .object = .empty };
+    try putJsonString(allocator, &result, "text", text);
+    return result;
+}
+
+fn putJsonString(allocator: std.mem.Allocator, object: *std.json.Value, key: []const u8, value: []const u8) !void {
+    try object.object.put(allocator, try allocator.dupe(u8, key), .{ .string = value });
 }
 
 fn writeUserContentArray(json: *std.json.Stringify, content: []const ai.UserContent) !void {
@@ -964,6 +1285,175 @@ test "AgentSession retry controller cancels retry sleep as failure event" {
     try std.testing.expectEqualSlices(RetryObservation, &expected, observations.items);
 }
 
+test "AgentSession replay emits upstream single prompt event order" {
+    const allocator = std.testing.allocator;
+    var harness = try TestHarness.init(allocator);
+    defer harness.deinit();
+
+    var runner = extensions.ExtensionRunner.init(
+        allocator,
+        &.{},
+        harness.runtime,
+        "/tmp",
+        harness.sessions,
+        harness.registry,
+    );
+    defer runner.deinit();
+
+    var bridge = SessionEventBridge.init(allocator);
+    defer bridge.deinit();
+    var observed_events: std.ArrayList(ReplayEventObservation) = .empty;
+    defer observed_events.deinit(allocator);
+    var will_retry_flags: std.ArrayList(bool) = .empty;
+    defer will_retry_flags.deinit(allocator);
+    var update_tags: std.ArrayList(std.meta.Tag(ai.StreamEvent)) = .empty;
+    defer update_tags.deinit(allocator);
+    var recorder = ReplayEventRecorder{
+        .allocator = allocator,
+        .events = &observed_events,
+        .will_retry_flags = &will_retry_flags,
+        .update_tags = &update_tags,
+    };
+    try bridge.subscribe(.{ .ptr = &recorder, .call_fn = ReplayEventRecorder.publicListener });
+
+    const assistant_content = [_]ai.AssistantContent{.{ .text = .{ .text = "hello" } }};
+    const responses = [_]ai.AssistantMessage{assistantMessage(&assistant_content, .stop)};
+    var replay = AgentSessionReplay.init(
+        allocator,
+        &bridge,
+        &runner,
+        harness.sessions,
+        AutoRetryController.init(.{ .enabled = false }, null),
+        &.{},
+    );
+    defer replay.deinit();
+    replay.setResponses(&responses);
+
+    try replay.prompt(std.testing.io, "hi", 123);
+
+    const expected = [_]ReplayEventObservation{
+        .agent_start,
+        .turn_start,
+        .message_start_user,
+        .message_end_user,
+        .message_start_assistant,
+        .message_update,
+        .message_end_assistant,
+        .turn_end,
+        .agent_end,
+    };
+    try std.testing.expectEqualSlices(ReplayEventObservation, &expected, observed_events.items);
+    try std.testing.expectEqualSlices(bool, &[_]bool{false}, will_retry_flags.items);
+    try std.testing.expectEqual(@as(usize, 2), replay.messages.items.len);
+    try std.testing.expectEqual(@as(usize, 0), replay.pendingResponseCount());
+}
+
+test "AgentSession replay waits for retry recovery tool loop before returning" {
+    const allocator = std.testing.allocator;
+    var harness = try TestHarness.init(allocator);
+    defer harness.deinit();
+
+    var runner = extensions.ExtensionRunner.init(
+        allocator,
+        &.{},
+        harness.runtime,
+        "/tmp",
+        harness.sessions,
+        harness.registry,
+    );
+    defer runner.deinit();
+
+    var bridge = SessionEventBridge.init(allocator);
+    defer bridge.deinit();
+    var observed_events: std.ArrayList(ReplayEventObservation) = .empty;
+    defer observed_events.deinit(allocator);
+    var will_retry_flags: std.ArrayList(bool) = .empty;
+    defer will_retry_flags.deinit(allocator);
+    var update_tags: std.ArrayList(std.meta.Tag(ai.StreamEvent)) = .empty;
+    defer update_tags.deinit(allocator);
+    var recorder = ReplayEventRecorder{
+        .allocator = allocator,
+        .events = &observed_events,
+        .will_retry_flags = &will_retry_flags,
+        .update_tags = &update_tags,
+    };
+    try bridge.subscribe(.{ .ptr = &recorder, .call_fn = ReplayEventRecorder.publicListener });
+
+    var echo_state = EchoToolState{ .allocator = allocator };
+    defer echo_state.deinit();
+    const echo_tool = echoTool(&echo_state);
+    const replay_tools = [_]tools.tool_registry.AgentTool{echo_tool};
+
+    const tool_content = [_]ai.AssistantContent{.{ .tool_call = .{
+        .id = "call-1",
+        .name = "echo",
+        .arguments_json = "{\"text\":\"hello\"}",
+    } }};
+    const final_content = [_]ai.AssistantContent{.{ .text = .{ .text = "final answer" } }};
+    const follow_up_content = [_]ai.AssistantContent{.{ .text = .{ .text = "follow-up answer" } }};
+    const responses = [_]ai.AssistantMessage{
+        assistantError("overloaded_error"),
+        assistantMessage(&tool_content, .tool_use),
+        assistantMessage(&final_content, .stop),
+        assistantMessage(&follow_up_content, .stop),
+    };
+    var replay = AgentSessionReplay.init(
+        allocator,
+        &bridge,
+        &runner,
+        harness.sessions,
+        AutoRetryController.init(.{ .enabled = true, .max_retries = 3, .base_delay_ms = 1 }, null),
+        &replay_tools,
+    );
+    defer replay.deinit();
+    replay.setResponses(&responses);
+
+    try replay.prompt(std.testing.io, "test", 123);
+    try replay.prompt(std.testing.io, "follow-up", 124);
+
+    const expected_prefix = [_]ReplayEventObservation{
+        .agent_start,
+        .turn_start,
+        .message_start_user,
+        .message_end_user,
+        .message_start_assistant,
+        .message_end_assistant,
+        .turn_end,
+        .agent_end,
+        .auto_retry_start,
+        .agent_start,
+        .turn_start,
+        .message_start_assistant,
+        .message_update,
+        .message_end_assistant,
+        .auto_retry_end,
+        .tool_execution_start_echo,
+        .tool_execution_end_echo,
+        .message_start_tool_result,
+        .message_end_tool_result,
+        .turn_end,
+        .turn_start,
+        .message_start_assistant,
+        .message_update,
+        .message_end_assistant,
+        .turn_end,
+        .agent_end,
+    };
+    try std.testing.expect(observed_events.items.len >= expected_prefix.len);
+    try std.testing.expectEqualSlices(
+        ReplayEventObservation,
+        &expected_prefix,
+        observed_events.items[0..expected_prefix.len],
+    );
+    try std.testing.expectEqualSlices(bool, &[_]bool{ true, false }, will_retry_flags.items[0..2]);
+    try std.testing.expectEqualSlices(u64, &[_]u64{1}, replay.retry_sleeps.items);
+    try std.testing.expectEqual(@as(usize, 1), echo_state.runs.items.len);
+    try std.testing.expectEqualStrings("hello", echo_state.runs.items[0]);
+    try std.testing.expect(!replay.is_streaming);
+    try std.testing.expect(!replay.isRetrying());
+    try std.testing.expectEqual(@as(usize, 0), replay.pendingResponseCount());
+}
+
 const MessageEndReplacementState = struct {
     allocator: std.mem.Allocator,
     calls: usize = 0,
@@ -1196,6 +1686,148 @@ const RetryObserver = struct {
         }
     }
 };
+
+const ReplayEventObservation = enum {
+    agent_start,
+    agent_end,
+    auto_retry_start,
+    auto_retry_end,
+    turn_start,
+    turn_end,
+    message_start_user,
+    message_end_user,
+    message_start_assistant,
+    message_update,
+    message_end_assistant,
+    message_start_tool_result,
+    message_end_tool_result,
+    tool_execution_start_echo,
+    tool_execution_end_echo,
+};
+
+const ReplayEventRecorder = struct {
+    allocator: std.mem.Allocator,
+    events: *std.ArrayList(ReplayEventObservation),
+    will_retry_flags: *std.ArrayList(bool),
+    update_tags: *std.ArrayList(std.meta.Tag(ai.StreamEvent)),
+
+    fn publicListener(ptr: ?*anyopaque, event: SessionEvent) void {
+        const recorder: *@This() = @ptrCast(@alignCast(ptr.?));
+        switch (event) {
+            .agent_start => recorder.append(.agent_start) catch @panic("out of memory"),
+            .agent_end => |payload| {
+                recorder.append(.agent_end) catch @panic("out of memory");
+                recorder.will_retry_flags.append(recorder.allocator, payload.will_retry) catch @panic("out of memory");
+            },
+            .auto_retry_start => recorder.append(.auto_retry_start) catch @panic("out of memory"),
+            .auto_retry_end => recorder.append(.auto_retry_end) catch @panic("out of memory"),
+            .turn_start => recorder.append(.turn_start) catch @panic("out of memory"),
+            .turn_end => recorder.append(.turn_end) catch @panic("out of memory"),
+            .message_start => |payload| recorder.append(messageObservation(.start, payload.message) orelse return) catch @panic("out of memory"),
+            .message_update => |payload| {
+                recorder.update_tags.append(recorder.allocator, std.meta.activeTag(payload.assistant_message_event)) catch @panic("out of memory");
+                recorder.append(.message_update) catch @panic("out of memory");
+            },
+            .message_end => |payload| recorder.append(messageObservation(.end, payload.message) orelse return) catch @panic("out of memory"),
+            .tool_execution_start => |payload| {
+                if (std.mem.eql(u8, payload.tool_name, "echo")) recorder.append(.tool_execution_start_echo) catch @panic("out of memory");
+            },
+            .tool_execution_end => |payload| {
+                if (std.mem.eql(u8, payload.tool_name, "echo")) recorder.append(.tool_execution_end_echo) catch @panic("out of memory");
+            },
+            .tool_execution_update => {},
+        }
+    }
+
+    fn append(self: *@This(), observation: ReplayEventObservation) !void {
+        if (observation == .message_update and self.events.items.len > 0) {
+            if (self.events.items[self.events.items.len - 1] == .message_update) return;
+        }
+        try self.events.append(self.allocator, observation);
+    }
+};
+
+const MessageBoundary = enum {
+    start,
+    end,
+};
+
+fn messageObservation(boundary: MessageBoundary, message: messages.CodingAgentMessage) ?ReplayEventObservation {
+    return switch (message) {
+        .user => if (boundary == .start) .message_start_user else .message_end_user,
+        .assistant => if (boundary == .start) .message_start_assistant else .message_end_assistant,
+        .tool_result => if (boundary == .start) .message_start_tool_result else .message_end_tool_result,
+        else => null,
+    };
+}
+
+const EchoToolState = struct {
+    allocator: std.mem.Allocator,
+    runs: std.ArrayList([]u8) = .empty,
+
+    fn deinit(self: *@This()) void {
+        for (self.runs.items) |run| self.allocator.free(run);
+        self.runs.deinit(self.allocator);
+    }
+
+    fn execute(
+        ptr: ?*anyopaque,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        cwd: []const u8,
+        params: std.json.Value,
+        execute_options: tools.tool_registry.ToolExecuteOptions,
+    ) !tools.tool_registry.ToolExecution {
+        _ = io;
+        _ = cwd;
+        _ = execute_options;
+        const state: *@This() = @ptrCast(@alignCast(ptr.?));
+        const text = jsonObjectString(params, "text") orelse "";
+
+        const recorded = try state.allocator.dupe(u8, text);
+        var recorded_registered = false;
+        errdefer if (!recorded_registered) state.allocator.free(recorded);
+        try state.runs.append(state.allocator, recorded);
+        recorded_registered = true;
+
+        const output = try std.fmt.allocPrint(allocator, "echo:{s}", .{text});
+        var output_registered = false;
+        errdefer if (!output_registered) allocator.free(output);
+
+        const blocks = try allocator.alloc(tools.render_utils.ToolContentBlock, 1);
+        errdefer allocator.free(blocks);
+        blocks[0] = tools.render_utils.textBlock(output);
+        output_registered = true;
+        return .{ .success = .{ .content = blocks } };
+    }
+};
+
+fn echoTool(state: *EchoToolState) tools.tool_registry.AgentTool {
+    return .{
+        .name = "echo",
+        .label = "Echo",
+        .description = "Echo text back",
+        .parameters_json = "{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\"}},\"required\":[\"text\"]}",
+        .ptr = state,
+        .custom_execute_fn = EchoToolState.execute,
+    };
+}
+
+fn jsonObjectString(value: std.json.Value, key: []const u8) ?[]const u8 {
+    if (value != .object) return null;
+    const field = value.object.get(key) orelse return null;
+    return if (field == .string) field.string else null;
+}
+
+fn assistantMessage(content: []const ai.AssistantContent, stop_reason: ai.StopReason) ai.AssistantMessage {
+    return .{
+        .content = content,
+        .api = ai.types.api.openai_responses,
+        .provider = "openai",
+        .model = "gpt-test",
+        .stop_reason = stop_reason,
+    };
+}
 
 fn assistantError(error_message: []const u8) ai.AssistantMessage {
     return .{

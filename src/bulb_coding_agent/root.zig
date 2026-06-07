@@ -67,6 +67,7 @@ pub const SessionEvent = session_events.SessionEvent;
 pub const SessionEventListener = session_events.SessionEventListener;
 pub const MessageEndListener = session_events.MessageEndListener;
 pub const AutoRetryController = session_events.AutoRetryController;
+pub const AgentSessionReplay = session_events.AgentSessionReplay;
 pub const ToolDefinition = extensions.ToolDefinition;
 pub const ToolExecutionMode = extensions.ToolExecutionMode;
 pub const ExtensionContext = extensions.ExtensionContext;
