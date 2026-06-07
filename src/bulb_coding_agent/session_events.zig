@@ -583,6 +583,25 @@ pub const AgentSessionReplay = struct {
         try self.queueTextMessage(&self.follow_up_messages, text, timestamp_ms);
     }
 
+    pub fn sendUserTextMessage(
+        self: *AgentSessionReplay,
+        io: std.Io,
+        text: []const u8,
+        timestamp_ms: i64,
+        delivery: CustomMessageDelivery,
+    ) !void {
+        if (!self.is_streaming) {
+            try self.promptRawUserText(io, text, timestamp_ms);
+            return;
+        }
+
+        switch (delivery) {
+            .steer => try self.queueTextMessage(&self.steering_messages, text, timestamp_ms),
+            .follow_up => try self.queueTextMessage(&self.follow_up_messages, text, timestamp_ms),
+            .next_turn => try self.queueTextMessage(&self.next_turn_messages, text, timestamp_ms),
+        }
+    }
+
     pub fn sendCustomTextMessage(
         self: *AgentSessionReplay,
         custom_type: []const u8,
@@ -614,12 +633,27 @@ pub const AgentSessionReplay = struct {
     }
 
     pub fn prompt(self: *AgentSessionReplay, io: std.Io, text: []const u8, timestamp_ms: i64) !void {
+        if (try self.tryExecuteExtensionCommand(text)) return;
+        try self.promptRawUserText(io, text, timestamp_ms);
+    }
+
+    fn promptRawUserText(self: *AgentSessionReplay, io: std.Io, text: []const u8, timestamp_ms: i64) !void {
         if (self.is_streaming) return error.AgentAlreadyProcessing;
         self.is_streaming = true;
         defer self.is_streaming = false;
 
         try self.bridge.handleAgentStart(self.runner);
         try self.runPromptBody(io, text, timestamp_ms);
+    }
+
+    fn tryExecuteExtensionCommand(self: *AgentSessionReplay, text: []const u8) !bool {
+        const invocation = slashCommandInvocation(text) orelse return false;
+        const resolved = try self.runner.getCommandAlloc(self.allocator, invocation.name) orelse return false;
+        defer self.allocator.free(resolved.invocation_name);
+
+        var ctx = try self.runner.createCommandContext();
+        try resolved.command.handler.call(invocation.args, &ctx);
+        return true;
     }
 
     fn runPromptBody(self: *AgentSessionReplay, io: std.Io, text: []const u8, timestamp_ms: i64) !void {
@@ -1178,12 +1212,25 @@ fn queuedTextsAlloc(
     return texts;
 }
 
-fn queuedSlashCommandName(text: []const u8) ?[]const u8 {
+const SlashCommandInvocation = struct {
+    name: []const u8,
+    args: []const u8,
+};
+
+fn slashCommandInvocation(text: []const u8) ?SlashCommandInvocation {
     if (text.len < 2 or text[0] != '/') return null;
     const rest = text[1..];
     const end = std.mem.indexOfScalar(u8, rest, ' ') orelse rest.len;
     if (end == 0) return null;
-    return rest[0..end];
+    return .{
+        .name = rest[0..end],
+        .args = if (end == rest.len) "" else rest[end + 1 ..],
+    };
+}
+
+fn queuedSlashCommandName(text: []const u8) ?[]const u8 {
+    const invocation = slashCommandInvocation(text) orelse return null;
+    return invocation.name;
 }
 
 pub fn queuedExtensionCommandErrorMessageAlloc(
@@ -2197,6 +2244,59 @@ test "AgentSession replay delivers all follow-up messages in one batch in all mo
     try expectReplayAssistantTexts(&replay, &[_][]const u8{ "", "original turn complete", "batched follow-up response" });
 }
 
+test "AgentSession replay dispatches extension commands immediately when prompted while idle" {
+    const allocator = std.testing.allocator;
+    var harness = try TestHarness.init(allocator);
+    defer harness.deinit();
+
+    var command_args: std.ArrayList([]u8) = .empty;
+    defer {
+        for (command_args.items) |args| allocator.free(args);
+        command_args.deinit(allocator);
+    }
+    var recorder = CommandRunRecorder{
+        .allocator = allocator,
+        .args = &command_args,
+    };
+
+    const command_source = source_info.createSyntheticSourceInfo("/tmp/command.zig", .{ .source = "test" });
+    const commands = [_]extensions.RegisteredCommand{.{
+        .name = "testcmd",
+        .source_info = command_source,
+        .description = "Test command",
+        .handler = .{ .ptr = &recorder, .handler_fn = CommandRunRecorder.command },
+    }};
+    const registered_extensions = [_]extensions.Extension{testCommandExtension("/tmp/commands.zig", &commands)};
+    var runner = extensions.ExtensionRunner.init(
+        allocator,
+        &registered_extensions,
+        harness.runtime,
+        "/tmp",
+        harness.sessions,
+        harness.registry,
+    );
+    defer runner.deinit();
+
+    var bridge = SessionEventBridge.init(allocator);
+    defer bridge.deinit();
+    var replay = AgentSessionReplay.init(
+        allocator,
+        &bridge,
+        &runner,
+        harness.sessions,
+        AutoRetryController.init(.{ .enabled = false }, null),
+        &.{},
+    );
+    defer replay.deinit();
+
+    try replay.prompt(std.testing.io, "/testcmd hello world", 123);
+
+    try std.testing.expectEqual(@as(usize, 1), command_args.items.len);
+    try std.testing.expectEqualStrings("hello world", command_args.items[0]);
+    try std.testing.expectEqual(@as(usize, 0), replay.pendingResponseCount());
+    try std.testing.expectEqual(@as(usize, 0), replay.messages.items.len);
+}
+
 test "AgentSession replay rejects queued registered extension commands from public steer and follow-up" {
     const allocator = std.testing.allocator;
     var harness = try TestHarness.init(allocator);
@@ -2244,6 +2344,79 @@ test "AgentSession replay rejects queued registered extension commands from publ
         "Extension command \"/testcmd\" cannot be queued. Use prompt() or execute the command when not streaming.",
         message,
     );
+}
+
+test "AgentSession replay treats extension-origin queued slash-command follow-ups as raw user text" {
+    const allocator = std.testing.allocator;
+    var harness = try TestHarness.init(allocator);
+    defer harness.deinit();
+
+    var command_args: std.ArrayList([]u8) = .empty;
+    defer {
+        for (command_args.items) |args| allocator.free(args);
+        command_args.deinit(allocator);
+    }
+    var recorder = CommandRunRecorder{
+        .allocator = allocator,
+        .args = &command_args,
+    };
+
+    const command_source = source_info.createSyntheticSourceInfo("/tmp/command.zig", .{ .source = "test" });
+    const commands = [_]extensions.RegisteredCommand{.{
+        .name = "testcmd",
+        .source_info = command_source,
+        .description = "Test command",
+        .handler = .{ .ptr = &recorder, .handler_fn = CommandRunRecorder.command },
+    }};
+    const registered_extensions = [_]extensions.Extension{testCommandExtension("/tmp/commands.zig", &commands)};
+    var runner = extensions.ExtensionRunner.init(
+        allocator,
+        &registered_extensions,
+        harness.runtime,
+        "/tmp",
+        harness.sessions,
+        harness.registry,
+    );
+    defer runner.deinit();
+
+    var bridge = SessionEventBridge.init(allocator);
+    defer bridge.deinit();
+    var echo_state = EchoToolState{ .allocator = allocator };
+    defer echo_state.deinit();
+    const echo_tool = echoTool(&echo_state);
+    const replay_tools = [_]tools.tool_registry.AgentTool{echo_tool};
+    var replay = AgentSessionReplay.init(
+        allocator,
+        &bridge,
+        &runner,
+        harness.sessions,
+        AutoRetryController.init(.{ .enabled = false }, null),
+        &replay_tools,
+    );
+    defer replay.deinit();
+
+    var follow_up_state = ExtensionOriginFollowUpState{ .replay = &replay };
+    try bridge.subscribe(.{ .ptr = &follow_up_state, .call_fn = ExtensionOriginFollowUpState.publicListener });
+
+    const tool_content = [_]ai.AssistantContent{.{ .tool_call = .{
+        .id = "tool-1",
+        .name = "echo",
+        .arguments_json = "{\"text\":\"hello\"}",
+    } }};
+    const original_content = [_]ai.AssistantContent{.{ .text = .{ .text = "first turn complete" } }};
+    const follow_up_content = [_]ai.AssistantContent{.{ .text = .{ .text = "queued follow-up handled by model" } }};
+    const responses = [_]ai.AssistantMessage{
+        assistantMessage(&tool_content, .tool_use),
+        assistantMessage(&original_content, .stop),
+        assistantMessage(&follow_up_content, .stop),
+    };
+    replay.setResponses(&responses);
+
+    try replay.prompt(std.testing.io, "start", 123);
+
+    try std.testing.expectEqual(@as(usize, 0), command_args.items.len);
+    try expectReplayUserTexts(&replay, &[_][]const u8{ "start", "/testcmd queued" });
+    try expectReplayAssistantTexts(&replay, &[_][]const u8{ "", "first turn complete", "queued follow-up handled by model" });
 }
 
 test "AgentSession replay delivers follow-ups queued during agent_end" {
@@ -2736,6 +2909,41 @@ const QueueCommandCallbacks = struct {
         _ = ptr;
         _ = args;
         _ = ctx;
+    }
+};
+
+const CommandRunRecorder = struct {
+    allocator: std.mem.Allocator,
+    args: *std.ArrayList([]u8),
+
+    fn command(ptr: ?*anyopaque, args: []const u8, ctx: *extensions.ExtensionCommandContext) !void {
+        _ = ctx;
+        const recorder: *@This() = @ptrCast(@alignCast(ptr.?));
+        const owned_args = try recorder.allocator.dupe(u8, args);
+        errdefer recorder.allocator.free(owned_args);
+        try recorder.args.append(recorder.allocator, owned_args);
+    }
+};
+
+const ExtensionOriginFollowUpState = struct {
+    replay: *AgentSessionReplay,
+    sent: bool = false,
+
+    fn publicListener(ptr: ?*anyopaque, event: SessionEvent) void {
+        const state: *@This() = @ptrCast(@alignCast(ptr.?));
+        switch (event) {
+            .tool_execution_start => {
+                if (state.sent) return;
+                state.sent = true;
+                state.replay.sendUserTextMessage(
+                    std.testing.io,
+                    "/testcmd queued",
+                    124,
+                    .follow_up,
+                ) catch @panic("out of memory");
+            },
+            else => {},
+        }
     }
 };
 
