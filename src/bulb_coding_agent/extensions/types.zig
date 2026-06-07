@@ -496,12 +496,19 @@ pub const CompactionErrorCallback = struct {
 };
 
 pub const CompactionPreparation = struct {
+    first_kept_entry_id: ?[]const u8 = null,
+    messages_to_summarize: []const AgentMessage = &.{},
+    turn_prefix_messages: []const AgentMessage = &.{},
+    is_split_turn: bool = false,
+    tokens_before: ?u64 = null,
+    previous_summary: ?[]const u8 = null,
     entries: []const SessionEntry = &.{},
     tokens: ?u64 = null,
 };
 
 pub const CompactionResult = struct {
     summary: []const u8,
+    first_kept_entry_id: ?[]const u8 = null,
     tokens_before: ?u64 = null,
     tokens_after: ?u64 = null,
     details_json: ?[]const u8 = null,

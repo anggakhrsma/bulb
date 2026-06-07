@@ -136,6 +136,16 @@ pub const MessageEndEmitResult = struct {
     }
 };
 
+pub const SessionBeforeCompactEmitResult = struct {
+    arena: std.heap.ArenaAllocator,
+    result: types.SessionBeforeCompactResult,
+
+    pub fn deinit(self: *SessionBeforeCompactEmitResult) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
 pub const SessionBeforeTreeEmitResult = struct {
     arena: std.heap.ArenaAllocator,
     result: types.SessionBeforeTreeResult,
@@ -512,6 +522,14 @@ pub const ExtensionRunner = struct {
     ) !?types.SessionBeforeForkResult {
         const value = (try self.emit(.{ .session = .{ .before_fork = event } })) orelse return null;
         return parseSessionBeforeForkResult(value);
+    }
+
+    pub fn emitSessionBeforeCompactAlloc(
+        self: *ExtensionRunner,
+        event: types.SessionBeforeCompactEvent,
+    ) !?SessionBeforeCompactEmitResult {
+        const value = (try self.emit(.{ .session = .{ .before_compact = event } })) orelse return null;
+        return try parseSessionBeforeCompactResultAlloc(self.allocator, value);
     }
 
     pub fn emitSessionBeforeTreeAlloc(
@@ -1177,6 +1195,18 @@ fn jsonBoolAny(value: std.json.Value, keys: []const []const u8) ?bool {
     return null;
 }
 
+fn jsonU64(value: std.json.Value, key: []const u8) ?u64 {
+    if (value != .object) return null;
+    return valueToU64(value.object.get(key));
+}
+
+fn jsonU64Any(value: std.json.Value, keys: []const []const u8) ?u64 {
+    for (keys) |key| {
+        if (jsonU64(value, key)) |number| return number;
+    }
+    return null;
+}
+
 fn parseSessionBeforeSwitchResult(value: std.json.Value) types.SessionBeforeSwitchResult {
     return .{
         .cancel = jsonBool(value, "cancel") orelse false,
@@ -1187,6 +1217,57 @@ fn parseSessionBeforeForkResult(value: std.json.Value) types.SessionBeforeForkRe
     return .{
         .cancel = jsonBool(value, "cancel") orelse false,
         .skip_conversation_restore = jsonBoolAny(value, &.{ "skipConversationRestore", "skip_conversation_restore" }) orelse false,
+    };
+}
+
+fn parseSessionBeforeCompactResultAlloc(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+) !SessionBeforeCompactEmitResult {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const arena_allocator = arena.allocator();
+    const result = try parseSessionBeforeCompactResultValueAlloc(arena_allocator, value);
+    return .{
+        .arena = arena,
+        .result = result,
+    };
+}
+
+fn parseSessionBeforeCompactResultValueAlloc(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+) !types.SessionBeforeCompactResult {
+    if (value != .object) return .{};
+    var result = types.SessionBeforeCompactResult{
+        .cancel = jsonBool(value, "cancel") orelse false,
+    };
+
+    if (value.object.get("compaction")) |compaction_value| {
+        result.compaction = try parseCompactionResultAlloc(allocator, compaction_value);
+    }
+
+    return result;
+}
+
+fn parseCompactionResultAlloc(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+) !?types.CompactionResult {
+    if (value != .object) return null;
+    const summary = jsonString(value, "summary") orelse return null;
+    return .{
+        .summary = try allocator.dupe(u8, summary),
+        .first_kept_entry_id = try dupeOptionalString(
+            allocator,
+            jsonStringAny(value, &.{ "firstKeptEntryId", "first_kept_entry_id" }),
+        ),
+        .tokens_before = jsonU64Any(value, &.{ "tokensBefore", "tokens_before" }),
+        .tokens_after = jsonU64Any(value, &.{ "tokensAfter", "tokens_after" }),
+        .details_json = if (value.object.get("details")) |details|
+            try jsonValueToStringAlloc(allocator, details)
+        else
+            null,
     };
 }
 
@@ -2305,6 +2386,175 @@ test "extension runner session_before_fork returns latest result and parses Pi f
     try std.testing.expectEqualStrings("entry-1", first.seen_entry_id.?);
     try std.testing.expectEqual(types.ForkPosition.before, first.seen_position.?);
     try std.testing.expectEqual(@as(usize, 1), second.calls);
+}
+
+test "extension runner session_before_compact returns latest result and parses Pi field casing" {
+    const allocator = std.testing.allocator;
+    var harness = try RunnerHarness.init(allocator);
+    defer harness.deinit();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const State = struct {
+        allocator: std.mem.Allocator,
+        summary: []const u8,
+        first_kept_entry_id: []const u8,
+        tokens_before: u64,
+        snake_case: bool = false,
+        calls: usize = 0,
+        seen_first_kept_entry_id: ?[]const u8 = null,
+        seen_tokens_before: ?u64 = null,
+        seen_custom_instructions: ?[]const u8 = null,
+
+        fn handler(ptr: ?*anyopaque, event_value: types.ExtensionEvent, ctx: *types.ExtensionContext) !?std.json.Value {
+            _ = ctx;
+            const state: *@This() = @ptrCast(@alignCast(ptr.?));
+            state.calls += 1;
+            state.seen_first_kept_entry_id = event_value.session.before_compact.preparation.first_kept_entry_id;
+            state.seen_tokens_before = event_value.session.before_compact.preparation.tokens_before;
+            state.seen_custom_instructions = event_value.session.before_compact.custom_instructions;
+
+            var object = std.json.Value{ .object = .empty };
+            var compaction = std.json.Value{ .object = .empty };
+            try putJsonString(state.allocator, &compaction, "summary", state.summary);
+            try putJsonString(
+                state.allocator,
+                &compaction,
+                if (state.snake_case) "first_kept_entry_id" else "firstKeptEntryId",
+                state.first_kept_entry_id,
+            );
+            try putJsonInt(
+                state.allocator,
+                &compaction,
+                if (state.snake_case) "tokens_before" else "tokensBefore",
+                @as(i64, @intCast(state.tokens_before)),
+            );
+            var details = std.json.Value{ .object = .empty };
+            try putJsonString(state.allocator, &details, "source", state.summary);
+            try putJsonValue(state.allocator, &compaction, "details", details);
+            try putJsonValue(state.allocator, &object, "compaction", compaction);
+            return object;
+        }
+    };
+
+    var first = State{
+        .allocator = arena.allocator(),
+        .summary = "first summary",
+        .first_kept_entry_id = "first-entry",
+        .tokens_before = 111,
+        .snake_case = true,
+    };
+    var second = State{
+        .allocator = arena.allocator(),
+        .summary = "second summary",
+        .first_kept_entry_id = "second-entry",
+        .tokens_before = 222,
+    };
+    const first_handlers = [_]types.ExtensionHandler{.{
+        .ptr = &first,
+        .event_name = .session_before_compact,
+        .handler_fn = State.handler,
+    }};
+    const second_handlers = [_]types.ExtensionHandler{.{
+        .ptr = &second,
+        .event_name = .session_before_compact,
+        .handler_fn = State.handler,
+    }};
+    const extensions = [_]types.Extension{
+        testExtension("/tmp/compact-a.zig", &.{}, &.{}, &.{}, &.{}, &.{}, &first_handlers),
+        testExtension("/tmp/compact-b.zig", &.{}, &.{}, &.{}, &.{}, &.{}, &second_handlers),
+    };
+    var runner = ExtensionRunner.init(allocator, &extensions, harness.runtime, "/tmp", harness.sessions, harness.registry);
+    defer runner.deinit();
+    var signal: ai.AbortSignal = .{};
+
+    var result = (try runner.emitSessionBeforeCompactAlloc(.{
+        .preparation = .{
+            .first_kept_entry_id = "prepared-entry",
+            .tokens_before = 999,
+        },
+        .branch_entries = &.{},
+        .custom_instructions = "compact this way",
+        .signal = &signal,
+    })).?;
+    defer result.deinit();
+
+    try std.testing.expect(!result.result.cancel);
+    const compaction = result.result.compaction.?;
+    try std.testing.expectEqualStrings("second summary", compaction.summary);
+    try std.testing.expectEqualStrings("second-entry", compaction.first_kept_entry_id.?);
+    try std.testing.expectEqual(@as(u64, 222), compaction.tokens_before.?);
+    var parsed_details = try std.json.parseFromSlice(std.json.Value, allocator, compaction.details_json.?, .{});
+    defer parsed_details.deinit();
+    try std.testing.expectEqualStrings("second summary", parsed_details.value.object.get("source").?.string);
+    try std.testing.expectEqual(@as(usize, 1), first.calls);
+    try std.testing.expectEqualStrings("prepared-entry", first.seen_first_kept_entry_id.?);
+    try std.testing.expectEqual(@as(u64, 999), first.seen_tokens_before.?);
+    try std.testing.expectEqualStrings("compact this way", first.seen_custom_instructions.?);
+    try std.testing.expectEqual(@as(usize, 1), second.calls);
+}
+
+test "extension runner session_before_compact cancellation stops later handlers" {
+    const allocator = std.testing.allocator;
+    var harness = try RunnerHarness.init(allocator);
+    defer harness.deinit();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const State = struct {
+        allocator: std.mem.Allocator,
+        cancel: bool = false,
+        calls: usize = 0,
+
+        fn handler(ptr: ?*anyopaque, event_value: types.ExtensionEvent, ctx: *types.ExtensionContext) !?std.json.Value {
+            _ = event_value;
+            _ = ctx;
+            const state: *@This() = @ptrCast(@alignCast(ptr.?));
+            state.calls += 1;
+            var object = std.json.Value{ .object = .empty };
+            try putJsonBool(state.allocator, &object, "cancel", state.cancel);
+            return object;
+        }
+    };
+
+    var first = State{ .allocator = arena.allocator() };
+    var second = State{ .allocator = arena.allocator(), .cancel = true };
+    var third = State{ .allocator = arena.allocator() };
+    const first_handlers = [_]types.ExtensionHandler{.{
+        .ptr = &first,
+        .event_name = .session_before_compact,
+        .handler_fn = State.handler,
+    }};
+    const second_handlers = [_]types.ExtensionHandler{.{
+        .ptr = &second,
+        .event_name = .session_before_compact,
+        .handler_fn = State.handler,
+    }};
+    const third_handlers = [_]types.ExtensionHandler{.{
+        .ptr = &third,
+        .event_name = .session_before_compact,
+        .handler_fn = State.handler,
+    }};
+    const extensions = [_]types.Extension{
+        testExtension("/tmp/compact-cancel-a.zig", &.{}, &.{}, &.{}, &.{}, &.{}, &first_handlers),
+        testExtension("/tmp/compact-cancel-b.zig", &.{}, &.{}, &.{}, &.{}, &.{}, &second_handlers),
+        testExtension("/tmp/compact-cancel-c.zig", &.{}, &.{}, &.{}, &.{}, &.{}, &third_handlers),
+    };
+    var runner = ExtensionRunner.init(allocator, &extensions, harness.runtime, "/tmp", harness.sessions, harness.registry);
+    defer runner.deinit();
+    var signal: ai.AbortSignal = .{};
+
+    var result = (try runner.emitSessionBeforeCompactAlloc(.{
+        .preparation = .{},
+        .branch_entries = &.{},
+        .signal = &signal,
+    })).?;
+    defer result.deinit();
+
+    try std.testing.expect(result.result.cancel);
+    try std.testing.expectEqual(@as(usize, 1), first.calls);
+    try std.testing.expectEqual(@as(usize, 1), second.calls);
+    try std.testing.expectEqual(@as(usize, 0), third.calls);
 }
 
 test "extension runner session_before_tree returns latest result and parses Pi field casing" {
