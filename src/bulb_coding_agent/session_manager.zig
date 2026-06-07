@@ -2017,7 +2017,7 @@ fn appendCompactionSummaryMessageAlloc(
     }
 }
 
-fn agentMessageFromMessageEntryAlloc(
+pub fn agentMessageFromMessageEntryAlloc(
     allocator: std.mem.Allocator,
     raw_json: []const u8,
 ) !?messages_mod.CodingAgentMessage {
@@ -2092,7 +2092,7 @@ fn agentMessageFromObjectAlloc(
     return null;
 }
 
-fn customMessageFromEntryAlloc(
+pub fn customMessageFromEntryAlloc(
     allocator: std.mem.Allocator,
     raw_json: []const u8,
 ) !?messages_mod.CustomMessage {
@@ -2114,7 +2114,7 @@ fn customMessageFromEntryAlloc(
     );
 }
 
-fn branchSummaryMessageFromEntryAlloc(
+pub fn branchSummaryMessageFromEntryAlloc(
     allocator: std.mem.Allocator,
     raw_json: []const u8,
 ) !?messages_mod.BranchSummaryMessage {
@@ -2131,7 +2131,7 @@ fn branchSummaryMessageFromEntryAlloc(
     );
 }
 
-fn compactionSummaryMessageFromEntryAlloc(
+pub fn compactionSummaryMessageFromEntryAlloc(
     allocator: std.mem.Allocator,
     raw_json: []const u8,
 ) !?messages_mod.CompactionSummaryMessage {
@@ -3080,7 +3080,7 @@ fn entryParentIdAlloc(allocator: std.mem.Allocator, raw_json: []const u8) !?[]co
     return optionalStringDup(allocator, parsed.value.object, "parentId");
 }
 
-fn entryStringFieldAlloc(allocator: std.mem.Allocator, raw_json: []const u8, field: []const u8) !?[]const u8 {
+pub fn entryStringFieldAlloc(allocator: std.mem.Allocator, raw_json: []const u8, field: []const u8) !?[]const u8 {
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw_json, .{}) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return null,
