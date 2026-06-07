@@ -488,6 +488,22 @@ pub const ExtensionRunner = struct {
         return result;
     }
 
+    pub fn emitSessionBeforeSwitch(
+        self: *ExtensionRunner,
+        event: types.SessionBeforeSwitchEvent,
+    ) !?types.SessionBeforeSwitchResult {
+        const value = (try self.emit(.{ .session = .{ .before_switch = event } })) orelse return null;
+        return parseSessionBeforeSwitchResult(value);
+    }
+
+    pub fn emitSessionBeforeFork(
+        self: *ExtensionRunner,
+        event: types.SessionBeforeForkEvent,
+    ) !?types.SessionBeforeForkResult {
+        const value = (try self.emit(.{ .session = .{ .before_fork = event } })) orelse return null;
+        return parseSessionBeforeForkResult(value);
+    }
+
     pub fn emitContext(self: *ExtensionRunner, context_messages: []types.AgentMessage) ![]types.AgentMessage {
         var ctx = try self.createContext();
 
@@ -1126,6 +1142,26 @@ fn jsonString(value: std.json.Value, key: []const u8) ?[]const u8 {
     return switch (field) {
         .string => |string| string,
         else => null,
+    };
+}
+
+fn jsonBoolAny(value: std.json.Value, keys: []const []const u8) ?bool {
+    for (keys) |key| {
+        if (jsonBool(value, key)) |boolean| return boolean;
+    }
+    return null;
+}
+
+fn parseSessionBeforeSwitchResult(value: std.json.Value) types.SessionBeforeSwitchResult {
+    return .{
+        .cancel = jsonBool(value, "cancel") orelse false,
+    };
+}
+
+fn parseSessionBeforeForkResult(value: std.json.Value) types.SessionBeforeForkResult {
+    return .{
+        .cancel = jsonBool(value, "cancel") orelse false,
+        .skip_conversation_restore = jsonBoolAny(value, &.{ "skipConversationRestore", "skip_conversation_restore" }) orelse false,
     };
 }
 
@@ -2070,6 +2106,124 @@ test "extension runner emits handler errors without aborting later handlers" {
     _ = try runner.emitContext(&.{});
     try std.testing.expectEqual(@as(usize, 1), state.errors);
     try std.testing.expectEqual(@as(usize, 1), state.calls);
+}
+
+test "extension runner session_before_switch returns cancellation and stops later handlers" {
+    const allocator = std.testing.allocator;
+    var harness = try RunnerHarness.init(allocator);
+    defer harness.deinit();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const State = struct {
+        allocator: std.mem.Allocator,
+        cancel: bool = false,
+        calls: usize = 0,
+        seen_reason: ?types.SessionReplacementReason = null,
+
+        fn handler(ptr: ?*anyopaque, event_value: types.ExtensionEvent, ctx: *types.ExtensionContext) !?std.json.Value {
+            _ = ctx;
+            const state: *@This() = @ptrCast(@alignCast(ptr.?));
+            state.calls += 1;
+            state.seen_reason = event_value.session.before_switch.reason;
+            var object = std.json.Value{ .object = .empty };
+            try putJsonBool(state.allocator, &object, "cancel", state.cancel);
+            return object;
+        }
+    };
+
+    var first = State{ .allocator = arena.allocator() };
+    var second = State{ .allocator = arena.allocator(), .cancel = true };
+    var third = State{ .allocator = arena.allocator() };
+    const first_handlers = [_]types.ExtensionHandler{.{
+        .ptr = &first,
+        .event_name = .session_before_switch,
+        .handler_fn = State.handler,
+    }};
+    const second_handlers = [_]types.ExtensionHandler{.{
+        .ptr = &second,
+        .event_name = .session_before_switch,
+        .handler_fn = State.handler,
+    }};
+    const third_handlers = [_]types.ExtensionHandler{.{
+        .ptr = &third,
+        .event_name = .session_before_switch,
+        .handler_fn = State.handler,
+    }};
+    const extensions = [_]types.Extension{
+        testExtension("/tmp/switch-a.zig", &.{}, &.{}, &.{}, &.{}, &.{}, &first_handlers),
+        testExtension("/tmp/switch-b.zig", &.{}, &.{}, &.{}, &.{}, &.{}, &second_handlers),
+        testExtension("/tmp/switch-c.zig", &.{}, &.{}, &.{}, &.{}, &.{}, &third_handlers),
+    };
+    var runner = ExtensionRunner.init(allocator, &extensions, harness.runtime, "/tmp", harness.sessions, harness.registry);
+    defer runner.deinit();
+
+    const result = (try runner.emitSessionBeforeSwitch(.{ .reason = .@"resume", .target_session_file = "/tmp/session.jsonl" })).?;
+    try std.testing.expect(result.cancel);
+    try std.testing.expectEqual(@as(usize, 1), first.calls);
+    try std.testing.expectEqual(types.SessionReplacementReason.@"resume", first.seen_reason.?);
+    try std.testing.expectEqual(@as(usize, 1), second.calls);
+    try std.testing.expectEqual(@as(usize, 0), third.calls);
+}
+
+test "extension runner session_before_fork returns latest result and parses Pi field casing" {
+    const allocator = std.testing.allocator;
+    var harness = try RunnerHarness.init(allocator);
+    defer harness.deinit();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const State = struct {
+        allocator: std.mem.Allocator,
+        skip: bool,
+        snake_case: bool = false,
+        calls: usize = 0,
+        seen_entry_id: ?[]const u8 = null,
+        seen_position: ?types.ForkPosition = null,
+
+        fn handler(ptr: ?*anyopaque, event_value: types.ExtensionEvent, ctx: *types.ExtensionContext) !?std.json.Value {
+            _ = ctx;
+            const state: *@This() = @ptrCast(@alignCast(ptr.?));
+            state.calls += 1;
+            state.seen_entry_id = event_value.session.before_fork.entry_id;
+            state.seen_position = event_value.session.before_fork.position;
+            var object = std.json.Value{ .object = .empty };
+            try putJsonBool(
+                state.allocator,
+                &object,
+                if (state.snake_case) "skip_conversation_restore" else "skipConversationRestore",
+                state.skip,
+            );
+            return object;
+        }
+    };
+
+    var first = State{ .allocator = arena.allocator(), .skip = false, .snake_case = true };
+    var second = State{ .allocator = arena.allocator(), .skip = true };
+    const first_handlers = [_]types.ExtensionHandler{.{
+        .ptr = &first,
+        .event_name = .session_before_fork,
+        .handler_fn = State.handler,
+    }};
+    const second_handlers = [_]types.ExtensionHandler{.{
+        .ptr = &second,
+        .event_name = .session_before_fork,
+        .handler_fn = State.handler,
+    }};
+    const extensions = [_]types.Extension{
+        testExtension("/tmp/fork-a.zig", &.{}, &.{}, &.{}, &.{}, &.{}, &first_handlers),
+        testExtension("/tmp/fork-b.zig", &.{}, &.{}, &.{}, &.{}, &.{}, &second_handlers),
+    };
+    var runner = ExtensionRunner.init(allocator, &extensions, harness.runtime, "/tmp", harness.sessions, harness.registry);
+    defer runner.deinit();
+
+    const result = (try runner.emitSessionBeforeFork(.{ .entry_id = "entry-1", .position = .before })).?;
+    try std.testing.expect(!result.cancel);
+    try std.testing.expect(result.skip_conversation_restore);
+    try std.testing.expectEqual(@as(usize, 1), first.calls);
+    try std.testing.expectEqualStrings("entry-1", first.seen_entry_id.?);
+    try std.testing.expectEqual(types.ForkPosition.before, first.seen_position.?);
+    try std.testing.expectEqual(@as(usize, 1), second.calls);
 }
 
 test "extension runner chains before_agent_start system prompt updates" {
