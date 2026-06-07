@@ -100,6 +100,7 @@ pub const TurnEndEvent = types.TurnEndEvent;
 pub const TurnStartEvent = types.TurnStartEvent;
 pub const UserBashEvent = types.UserBashEvent;
 pub const UserBashEventResult = types.UserBashEventResult;
+pub const UserBashHandler = types.UserBashHandler;
 pub const WidgetPlacement = types.WidgetPlacement;
 pub const WorkingIndicatorOptions = types.WorkingIndicatorOptions;
 pub const WriteToolCallEvent = types.WriteToolCallEvent;

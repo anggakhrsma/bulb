@@ -189,6 +189,7 @@ pub const ExtensionBuilder = struct {
     cwd: []const u8,
     extension_source_info: types.SourceInfo,
     handlers: std.ArrayList(types.ExtensionHandler) = .empty,
+    user_bash_handlers: std.ArrayList(types.UserBashHandler) = .empty,
     tools: std.ArrayList(types.RegisteredTool) = .empty,
     message_renderers: std.ArrayList(types.MessageRendererRegistration) = .empty,
     commands: std.ArrayList(types.RegisteredCommand) = .empty,
@@ -233,6 +234,7 @@ pub const ExtensionBuilder = struct {
         return .{
             .ptr = self,
             .on_fn = apiOn,
+            .on_user_bash_fn = apiOnUserBash,
             .register_tool_fn = apiRegisterTool,
             .register_command_fn = apiRegisterCommand,
             .register_shortcut_fn = apiRegisterShortcut,
@@ -266,6 +268,7 @@ pub const ExtensionBuilder = struct {
             .resolved_path = self.resolved_path,
             .source_info = self.extension_source_info,
             .handlers = try self.handlers.toOwnedSlice(allocator),
+            .user_bash_handlers = try self.user_bash_handlers.toOwnedSlice(allocator),
             .tools = try self.tools.toOwnedSlice(allocator),
             .message_renderers = try self.message_renderers.toOwnedSlice(allocator),
             .commands = try self.commands.toOwnedSlice(allocator),
@@ -392,6 +395,12 @@ fn apiOn(ptr: ?*anyopaque, event_name: types.ExtensionEventName, handler: types.
     var registered = handler;
     registered.event_name = event_name;
     try builder.handlers.append(builder.arena.allocator(), registered);
+}
+
+fn apiOnUserBash(ptr: ?*anyopaque, handler: types.UserBashHandler) !void {
+    const builder = builderFromPtr(ptr);
+    try builder.runtime.assertActive();
+    try builder.user_bash_handlers.append(builder.arena.allocator(), handler);
 }
 
 fn apiRegisterTool(ptr: ?*anyopaque, tool: types.ToolDefinition) !void {
@@ -722,6 +731,13 @@ test "extension builder registers handlers tools commands flags renderers and sh
             return null;
         }
 
+        fn userBashHandler(ptr: ?*anyopaque, event: types.UserBashEvent, ctx: *types.ExtensionContext) !?types.UserBashEventResult {
+            _ = ptr;
+            _ = event;
+            _ = ctx;
+            return null;
+        }
+
         fn command(ptr: ?*anyopaque, args: []const u8, ctx: *types.ExtensionCommandContext) !void {
             _ = ptr;
             _ = args;
@@ -752,6 +768,7 @@ test "extension builder registers handlers tools commands flags renderers and sh
         .session_start,
         .{ .event_name = .context, .handler_fn = Callbacks.eventHandler },
     );
+    try api_value.on_user_bash_fn.?(api_value.ptr, .{ .handler_fn = Callbacks.userBashHandler });
     try api_value.register_tool_fn.?(api_value.ptr, types.ToolDefinition{
         .name = "oracle",
         .label = "oracle",
@@ -778,6 +795,7 @@ test "extension builder registers handlers tools commands flags renderers and sh
     try std.testing.expectEqualStrings("<inline:test>", loaded.extension.path);
     try std.testing.expectEqualStrings("inline", loaded.extension.source_info.source);
     try std.testing.expectEqual(types.ExtensionEventName.session_start, loaded.extension.handlers[0].event_name);
+    try std.testing.expectEqual(@as(usize, 1), loaded.extension.user_bash_handlers.len);
     try std.testing.expectEqualStrings("oracle", loaded.extension.tools[0].definition.name);
     try std.testing.expectEqualStrings("ask oracle", loaded.extension.commands[0].description.?);
     try std.testing.expectEqualStrings("ctrl+o", loaded.extension.shortcuts[0].shortcut);

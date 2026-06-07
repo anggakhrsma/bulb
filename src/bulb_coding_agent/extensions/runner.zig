@@ -397,6 +397,7 @@ pub const ExtensionRunner = struct {
 
     pub fn hasHandlers(self: *const ExtensionRunner, event_name: types.ExtensionEventName) bool {
         for (self.extensions) |extension| {
+            if (event_name == .user_bash and extension.user_bash_handlers.len > 0) return true;
             for (extension.handlers) |handler| {
                 if (handler.event_name == event_name) return true;
             }
@@ -687,6 +688,22 @@ pub const ExtensionRunner = struct {
         }
 
         return result;
+    }
+
+    pub fn emitUserBash(self: *ExtensionRunner, event: types.UserBashEvent) !?types.UserBashEventResult {
+        var ctx = try self.createContext();
+
+        for (self.extensions) |extension| {
+            for (extension.user_bash_handlers) |handler| {
+                const handler_result = handler.call(event, &ctx) catch |err| {
+                    try self.emitHandlerErrorAlloc(extension.path, .user_bash, err);
+                    continue;
+                };
+                if (handler_result) |result| return result;
+            }
+        }
+
+        return null;
     }
 
     pub fn emitInputAlloc(
@@ -1834,6 +1851,15 @@ fn testExtension(
     };
 }
 
+fn testExtensionWithUserBash(path: []const u8, handlers: []const types.UserBashHandler) types.Extension {
+    return .{
+        .path = path,
+        .resolved_path = path,
+        .source_info = testSource(path),
+        .user_bash_handlers = handlers,
+    };
+}
+
 test "extension runner keeps first tool flag and renderer registrations" {
     const allocator = std.testing.allocator;
     var harness = try RunnerHarness.init(allocator);
@@ -2163,6 +2189,149 @@ test "extension runner chains tool_result content and isError patches" {
     try std.testing.expectEqualStrings("base", result.content.?.items[0].text.text);
     try std.testing.expectEqualStrings("ext1", result.content.?.items[1].text.text);
     try std.testing.expectEqual(true, result.is_error.?);
+}
+
+test "extension runner user_bash returns the first native handler result" {
+    const allocator = std.testing.allocator;
+    var harness = try RunnerHarness.init(allocator);
+    defer harness.deinit();
+
+    const State = struct {
+        allocator: std.mem.Allocator,
+        output: []const u8 = "",
+        calls: usize = 0,
+        seen_excluded: bool = false,
+        seen_command: ?[]u8 = null,
+        seen_cwd: ?[]u8 = null,
+
+        fn deinit(self: *@This()) void {
+            if (self.seen_command) |command| self.allocator.free(command);
+            if (self.seen_cwd) |cwd| self.allocator.free(cwd);
+        }
+
+        fn nullHandler(ptr: ?*anyopaque, event: types.UserBashEvent, ctx: *types.ExtensionContext) !?types.UserBashEventResult {
+            _ = ctx;
+            const state: *@This() = @ptrCast(@alignCast(ptr.?));
+            state.calls += 1;
+            state.seen_excluded = event.exclude_from_context;
+            state.seen_command = try state.allocator.dupe(u8, event.command);
+            state.seen_cwd = try state.allocator.dupe(u8, event.cwd);
+            return null;
+        }
+
+        fn resultHandler(ptr: ?*anyopaque, event: types.UserBashEvent, ctx: *types.ExtensionContext) !?types.UserBashEventResult {
+            _ = event;
+            _ = ctx;
+            const state: *@This() = @ptrCast(@alignCast(ptr.?));
+            state.calls += 1;
+            return .{ .result = .{
+                .output = try state.allocator.dupe(u8, state.output),
+                .exit_code = 0,
+                .cancelled = false,
+                .truncated = false,
+            } };
+        }
+
+        fn lateHandler(ptr: ?*anyopaque, event: types.UserBashEvent, ctx: *types.ExtensionContext) !?types.UserBashEventResult {
+            _ = event;
+            _ = ctx;
+            const state: *@This() = @ptrCast(@alignCast(ptr.?));
+            state.calls += 1;
+            return null;
+        }
+    };
+
+    var first = State{ .allocator = allocator };
+    defer first.deinit();
+    var second = State{ .allocator = allocator, .output = "handled by second\n" };
+    defer second.deinit();
+    var third = State{ .allocator = allocator };
+    defer third.deinit();
+    const first_handlers = [_]types.UserBashHandler{.{ .ptr = &first, .handler_fn = State.nullHandler }};
+    const second_handlers = [_]types.UserBashHandler{.{ .ptr = &second, .handler_fn = State.resultHandler }};
+    const third_handlers = [_]types.UserBashHandler{.{ .ptr = &third, .handler_fn = State.lateHandler }};
+    const extensions = [_]types.Extension{
+        testExtensionWithUserBash("/tmp/first.zig", &first_handlers),
+        testExtensionWithUserBash("/tmp/second.zig", &second_handlers),
+        testExtensionWithUserBash("/tmp/third.zig", &third_handlers),
+    };
+    var runner = ExtensionRunner.init(allocator, &extensions, harness.runtime, "/tmp", harness.sessions, harness.registry);
+    defer runner.deinit();
+
+    try std.testing.expect(runner.hasHandlers(.user_bash));
+    var result = (try runner.emitUserBash(.{
+        .command = "echo hi",
+        .exclude_from_context = true,
+        .cwd = "/work",
+    })).?;
+    defer if (result.result) |*bash_result| bash_result.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), first.calls);
+    try std.testing.expect(first.seen_excluded);
+    try std.testing.expectEqualStrings("echo hi", first.seen_command.?);
+    try std.testing.expectEqualStrings("/work", first.seen_cwd.?);
+    try std.testing.expectEqual(@as(usize, 1), second.calls);
+    try std.testing.expectEqual(@as(usize, 0), third.calls);
+    try std.testing.expectEqualStrings("handled by second\n", result.result.?.output);
+}
+
+test "extension runner user_bash reports handler errors and continues" {
+    const allocator = std.testing.allocator;
+    var harness = try RunnerHarness.init(allocator);
+    defer harness.deinit();
+
+    const State = struct {
+        allocator: std.mem.Allocator,
+        errors: usize = 0,
+
+        fn failing(ptr: ?*anyopaque, event: types.UserBashEvent, ctx: *types.ExtensionContext) !?types.UserBashEventResult {
+            _ = ptr;
+            _ = event;
+            _ = ctx;
+            return error.UserBashBoom;
+        }
+
+        fn valid(ptr: ?*anyopaque, event: types.UserBashEvent, ctx: *types.ExtensionContext) !?types.UserBashEventResult {
+            _ = event;
+            _ = ctx;
+            const state: *@This() = @ptrCast(@alignCast(ptr.?));
+            return .{ .result = .{
+                .output = try state.allocator.dupe(u8, "after error"),
+                .exit_code = 0,
+                .cancelled = false,
+                .truncated = false,
+            } };
+        }
+
+        fn onError(ptr: ?*anyopaque, err: types.ExtensionError) void {
+            const state: *@This() = @ptrCast(@alignCast(ptr.?));
+            if (std.mem.eql(u8, err.event, "user_bash") and
+                std.mem.eql(u8, err.@"error", "UserBashBoom"))
+            {
+                state.errors += 1;
+            }
+        }
+    };
+
+    var state = State{ .allocator = allocator };
+    const failing_handlers = [_]types.UserBashHandler{.{ .handler_fn = State.failing }};
+    const valid_handlers = [_]types.UserBashHandler{.{ .ptr = &state, .handler_fn = State.valid }};
+    const extensions = [_]types.Extension{
+        testExtensionWithUserBash("/tmp/failing.zig", &failing_handlers),
+        testExtensionWithUserBash("/tmp/valid.zig", &valid_handlers),
+    };
+    var runner = ExtensionRunner.init(allocator, &extensions, harness.runtime, "/tmp", harness.sessions, harness.registry);
+    defer runner.deinit();
+    try runner.onError(.{ .ptr = &state, .call_fn = State.onError });
+
+    var result = (try runner.emitUserBash(.{
+        .command = "pwd",
+        .cwd = "/tmp",
+    })).?;
+    defer if (result.result) |*bash_result| bash_result.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), state.errors);
+    try std.testing.expectEqualStrings("after error", result.result.?.output);
 }
 
 test "extension runner message_end returns null for no handlers undefined and missing message" {

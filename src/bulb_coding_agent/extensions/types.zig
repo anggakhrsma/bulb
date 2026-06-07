@@ -1244,6 +1244,15 @@ pub const ExtensionHandler = struct {
     }
 };
 
+pub const UserBashHandler = struct {
+    ptr: ?*anyopaque = null,
+    handler_fn: *const fn (?*anyopaque, UserBashEvent, *ExtensionContext) anyerror!?UserBashEventResult,
+
+    pub fn call(self: UserBashHandler, event: UserBashEvent, ctx: *ExtensionContext) !?UserBashEventResult {
+        return self.handler_fn(self.ptr, event, ctx);
+    }
+};
+
 pub const RegisterCommandOptions = struct {
     description: ?[]const u8 = null,
     get_argument_completions: ?ArgumentCompletions = null,
@@ -1278,6 +1287,7 @@ pub const RegisterFlagOptions = struct {
 pub const ExtensionAPI = struct {
     ptr: ?*anyopaque = null,
     on_fn: ?*const fn (?*anyopaque, ExtensionEventName, ExtensionHandler) anyerror!void = null,
+    on_user_bash_fn: ?*const fn (?*anyopaque, UserBashHandler) anyerror!void = null,
     register_tool_fn: ?*const fn (?*anyopaque, ToolDefinition) anyerror!void = null,
     register_command_fn: ?*const fn (?*anyopaque, []const u8, RegisterCommandOptions) anyerror!void = null,
     register_shortcut_fn: ?*const fn (?*anyopaque, KeyId, RegisterShortcutOptions) anyerror!void = null,
@@ -1645,6 +1655,7 @@ pub const Extension = struct {
     resolved_path: []const u8,
     source_info: SourceInfo,
     handlers: []const ExtensionHandler = &.{},
+    user_bash_handlers: []const UserBashHandler = &.{},
     tools: []const RegisteredTool = &.{},
     message_renderers: []const MessageRendererRegistration = &.{},
     commands: []const RegisteredCommand = &.{},
