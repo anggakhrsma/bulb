@@ -160,6 +160,32 @@ pub const SummaryRequest = struct {
     }
 };
 
+pub const SummaryCompleteFn = *const fn (
+    ?*anyopaque,
+    ai.Model,
+    ai.Context,
+    ai.SimpleStreamOptions,
+) anyerror!ai.AssistantMessage;
+
+pub const SummaryExecutor = struct {
+    ptr: ?*anyopaque = null,
+    complete_fn: SummaryCompleteFn,
+
+    pub fn complete(
+        self: SummaryExecutor,
+        model: ai.Model,
+        context: ai.Context,
+        options: ai.SimpleStreamOptions,
+    ) !ai.AssistantMessage {
+        return self.complete_fn(self.ptr, model, context, options);
+    }
+};
+
+pub const RegistrySummaryExecutorContext = struct {
+    registry: *const ai.api_registry.Registry,
+    env: ?*const std.process.Environ.Map = null,
+};
+
 pub const CompactionPreparation = struct {
     arena: std.heap.ArenaAllocator,
     first_kept_entry_id: []const u8,
@@ -172,6 +198,25 @@ pub const CompactionPreparation = struct {
     settings: CompactionSettings,
 
     pub fn deinit(self: *CompactionPreparation) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
+pub const CompactionDetails = struct {
+    read_files: []const []const u8 = &.{},
+    modified_files: []const []const u8 = &.{},
+};
+
+pub const CompactionResult = struct {
+    arena: std.heap.ArenaAllocator,
+    summary: []const u8,
+    first_kept_entry_id: []const u8,
+    tokens_before: u64,
+    details: CompactionDetails = .{},
+    details_json: []const u8,
+
+    pub fn deinit(self: *CompactionResult) void {
         self.arena.deinit();
         self.* = undefined;
     }
@@ -703,6 +748,151 @@ pub fn buildTurnPrefixSummaryRequestAlloc(
     );
 }
 
+pub fn registrySummaryExecutor(context: *RegistrySummaryExecutorContext) SummaryExecutor {
+    return .{ .ptr = context, .complete_fn = completeSummaryFromRegistry };
+}
+
+pub fn generateSummaryAlloc(
+    allocator: std.mem.Allocator,
+    current_messages: []const CodingAgentMessage,
+    model: ai.Model,
+    reserve_tokens: u64,
+    request_options: SummaryRequestOptions,
+    executor: SummaryExecutor,
+) ![]u8 {
+    var request = try buildSummaryRequestAlloc(
+        allocator,
+        current_messages,
+        model,
+        reserve_tokens,
+        request_options,
+    );
+    defer request.deinit();
+
+    const response = try executor.complete(model, request.context, request.options);
+    if (response.stop_reason == .@"error") return error.SummarizationFailed;
+    return assistantTextAlloc(allocator, response);
+}
+
+pub fn generateTurnPrefixSummaryAlloc(
+    allocator: std.mem.Allocator,
+    current_messages: []const CodingAgentMessage,
+    model: ai.Model,
+    reserve_tokens: u64,
+    request_options: SummaryRequestOptions,
+    executor: SummaryExecutor,
+) ![]u8 {
+    var request = try buildTurnPrefixSummaryRequestAlloc(
+        allocator,
+        current_messages,
+        model,
+        reserve_tokens,
+        request_options,
+    );
+    defer request.deinit();
+
+    const response = try executor.complete(model, request.context, request.options);
+    if (response.stop_reason == .@"error") return error.TurnPrefixSummarizationFailed;
+    return assistantTextAlloc(allocator, response);
+}
+
+pub fn compactAlloc(
+    allocator: std.mem.Allocator,
+    preparation: *const CompactionPreparation,
+    model: ai.Model,
+    request_options: SummaryRequestOptions,
+    executor: SummaryExecutor,
+) !CompactionResult {
+    var scratch_arena = std.heap.ArenaAllocator.init(allocator);
+    defer scratch_arena.deinit();
+    const scratch_allocator = scratch_arena.allocator();
+
+    var summary_base: []const u8 = undefined;
+    if (preparation.is_split_turn and preparation.turn_prefix_messages.len > 0) {
+        const history_result = if (preparation.messages_to_summarize.len > 0)
+            try generateSummaryAlloc(
+                scratch_allocator,
+                preparation.messages_to_summarize,
+                model,
+                preparation.settings.reserve_tokens,
+                .{
+                    .api_key = request_options.api_key,
+                    .headers = request_options.headers,
+                    .signal = request_options.signal,
+                    .custom_instructions = request_options.custom_instructions,
+                    .previous_summary = preparation.previous_summary,
+                    .thinking_level = request_options.thinking_level,
+                },
+                executor,
+            )
+        else
+            "No prior history.";
+
+        const turn_prefix_result = try generateTurnPrefixSummaryAlloc(
+            scratch_allocator,
+            preparation.turn_prefix_messages,
+            model,
+            preparation.settings.reserve_tokens,
+            .{
+                .api_key = request_options.api_key,
+                .headers = request_options.headers,
+                .signal = request_options.signal,
+                .thinking_level = request_options.thinking_level,
+            },
+            executor,
+        );
+        summary_base = try std.fmt.allocPrint(
+            scratch_allocator,
+            "{s}\n\n---\n\n**Turn Context (split turn):**\n\n{s}",
+            .{ history_result, turn_prefix_result },
+        );
+    } else {
+        summary_base = try generateSummaryAlloc(
+            scratch_allocator,
+            preparation.messages_to_summarize,
+            model,
+            preparation.settings.reserve_tokens,
+            .{
+                .api_key = request_options.api_key,
+                .headers = request_options.headers,
+                .signal = request_options.signal,
+                .custom_instructions = request_options.custom_instructions,
+                .previous_summary = preparation.previous_summary,
+                .thinking_level = request_options.thinking_level,
+            },
+            executor,
+        );
+    }
+
+    const file_lists = try computeFileListsAlloc(scratch_allocator, preparation.file_ops);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    const read_files = try cloneStringListAlloc(arena_allocator, file_lists.read_files);
+    const modified_files = try cloneStringListAlloc(arena_allocator, file_lists.modified_files);
+    const file_operations = try formatFileOperationsAlloc(arena_allocator, read_files, modified_files);
+    const summary = try std.fmt.allocPrint(
+        arena_allocator,
+        "{s}{s}",
+        .{ summary_base, file_operations },
+    );
+    const details_json = try compactionDetailsJsonAlloc(arena_allocator, read_files, modified_files);
+
+    return .{
+        .arena = arena,
+        .summary = summary,
+        .first_kept_entry_id = try arena_allocator.dupe(u8, preparation.first_kept_entry_id),
+        .tokens_before = preparation.tokens_before,
+        .details = .{
+            .read_files = read_files,
+            .modified_files = modified_files,
+        },
+        .details_json = details_json,
+    };
+}
+
 fn getAssistantUsage(message: CodingAgentMessage) ?ai.Usage {
     if (message != .assistant) return null;
     const assistant = message.assistant;
@@ -1035,6 +1225,64 @@ fn buildSummaryRequestFromPromptAlloc(
     };
 }
 
+fn completeSummaryFromRegistry(
+    ptr: ?*anyopaque,
+    model: ai.Model,
+    context: ai.Context,
+    options: ai.SimpleStreamOptions,
+) !ai.AssistantMessage {
+    const raw_ptr = ptr orelse return error.MissingSummaryExecutorContext;
+    const executor_context: *RegistrySummaryExecutorContext = @ptrCast(@alignCast(raw_ptr));
+    var result = try ai.stream.streamSimple(executor_context.registry.*, executor_context.env, model, context, options);
+    defer result.deinit();
+    return result.message;
+}
+
+fn assistantTextAlloc(allocator: std.mem.Allocator, response: ai.AssistantMessage) ![]u8 {
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(allocator);
+    var text_count: usize = 0;
+    for (response.content) |block| {
+        if (block != .text) continue;
+        if (text_count > 0) try output.append(allocator, '\n');
+        try output.appendSlice(allocator, block.text.text);
+        text_count += 1;
+    }
+    return output.toOwnedSlice(allocator);
+}
+
+fn cloneStringListAlloc(
+    allocator: std.mem.Allocator,
+    source: []const []const u8,
+) ![]const []const u8 {
+    const cloned = try allocator.alloc([]const u8, source.len);
+    for (source, 0..) |value, index| {
+        cloned[index] = try allocator.dupe(u8, value);
+    }
+    return cloned;
+}
+
+fn compactionDetailsJsonAlloc(
+    allocator: std.mem.Allocator,
+    read_files: []const []const u8,
+    modified_files: []const []const u8,
+) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    var json: std.json.Stringify = .{ .writer = &output.writer };
+    try json.beginObject();
+    try json.objectField("readFiles");
+    try json.beginArray();
+    for (read_files) |path| try json.write(path);
+    try json.endArray();
+    try json.objectField("modifiedFiles");
+    try json.beginArray();
+    for (modified_files) |path| try json.write(path);
+    try json.endArray();
+    try json.endObject();
+    return output.toOwnedSlice();
+}
+
 fn sortStrings(values: [][]const u8) void {
     std.mem.sort([]const u8, values, {}, struct {
         fn lessThan(_: void, left: []const u8, right: []const u8) bool {
@@ -1197,6 +1445,107 @@ fn summaryTestModel(reasoning: bool, max_tokens: u64) ai.Model {
     };
 }
 
+const SummaryExecutorCall = struct {
+    max_tokens: ?u64,
+    reasoning: ?ai.ThinkingLevel,
+    api_key: ?[]const u8,
+    prompt: []const u8,
+};
+
+const MockSummaryExecutor = struct {
+    allocator: std.mem.Allocator,
+    calls: std.ArrayList(SummaryExecutorCall) = .empty,
+    owned_content: std.ArrayList([]ai.AssistantContent) = .empty,
+    responses: []const []const u8 = &.{"## Goal\nTest summary"},
+    fail_on_call: ?usize = null,
+
+    fn init(allocator: std.mem.Allocator, responses: []const []const u8) MockSummaryExecutor {
+        return .{ .allocator = allocator, .responses = responses };
+    }
+
+    fn deinit(self: *MockSummaryExecutor) void {
+        for (self.calls.items) |call| {
+            self.allocator.free(call.prompt);
+            if (call.api_key) |api_key| self.allocator.free(api_key);
+        }
+        self.calls.deinit(self.allocator);
+        for (self.owned_content.items) |content| self.allocator.free(content);
+        self.owned_content.deinit(self.allocator);
+    }
+
+    fn executor(self: *MockSummaryExecutor) SummaryExecutor {
+        return .{ .ptr = self, .complete_fn = complete };
+    }
+
+    fn complete(
+        ptr: ?*anyopaque,
+        model: ai.Model,
+        context: ai.Context,
+        options: ai.SimpleStreamOptions,
+    ) !ai.AssistantMessage {
+        const self: *MockSummaryExecutor = @ptrCast(@alignCast(ptr.?));
+        const call_index = self.calls.items.len;
+        const prompt = firstPromptText(context);
+        const prompt_copy = try self.allocator.dupe(u8, prompt);
+        errdefer self.allocator.free(prompt_copy);
+        const api_key_copy = if (options.base.api_key) |api_key|
+            try self.allocator.dupe(u8, api_key)
+        else
+            null;
+        errdefer if (api_key_copy) |api_key| self.allocator.free(api_key);
+
+        try self.calls.append(self.allocator, .{
+            .max_tokens = options.base.max_tokens,
+            .reasoning = options.reasoning,
+            .api_key = api_key_copy,
+            .prompt = prompt_copy,
+        });
+
+        if (self.fail_on_call) |fail_index| {
+            if (call_index == fail_index) {
+                return .{
+                    .content = &.{},
+                    .api = model.api,
+                    .provider = model.provider,
+                    .model = model.id,
+                    .stop_reason = .@"error",
+                    .error_message = "mock summary failure",
+                };
+            }
+        }
+
+        const response_text = if (self.responses.len == 0)
+            ""
+        else if (call_index < self.responses.len)
+            self.responses[call_index]
+        else
+            self.responses[self.responses.len - 1];
+        const content = try self.allocator.alloc(ai.AssistantContent, 1);
+        errdefer self.allocator.free(content);
+        content[0] = .{ .text = .{ .text = response_text } };
+        try self.owned_content.append(self.allocator, content);
+        return .{
+            .content = content,
+            .api = model.api,
+            .provider = model.provider,
+            .model = model.id,
+            .usage = mockUsage(10, 10, 0, 0),
+            .stop_reason = .stop,
+        };
+    }
+};
+
+fn firstPromptText(context: ai.Context) []const u8 {
+    if (context.messages.len == 0) return "";
+    return switch (context.messages[0]) {
+        .user => |message| if (message.content.len == 0) "" else switch (message.content[0]) {
+            .text => |text| text.text,
+            .image => "",
+        },
+        else => "",
+    };
+}
+
 // Ported from packages/coding-agent/test/compaction-serialization.test.ts.
 test "serializeConversation truncates long tool results" {
     const allocator = std.testing.allocator;
@@ -1297,11 +1646,156 @@ test "compaction summary options use reasoning only for supported non-off thinki
 }
 
 // Ported from packages/coding-agent/test/compaction-summary-reasoning.test.ts.
+test "generateSummary passes reasoning options to the summary executor" {
+    const allocator = std.testing.allocator;
+    const content = [_]ai.UserContent{.{ .text = .{ .text = "Summarize this." } }};
+    const messages = [_]CodingAgentMessage{.{ .user = .{
+        .content = &content,
+        .timestamp_ms = 1,
+    } }};
+
+    var mock = MockSummaryExecutor.init(allocator, &.{"## Goal\nTest summary"});
+    defer mock.deinit();
+
+    const summary = try generateSummaryAlloc(
+        allocator,
+        &messages,
+        summaryTestModel(true, 8192),
+        2000,
+        .{ .api_key = "test-key", .thinking_level = .medium },
+        mock.executor(),
+    );
+    defer allocator.free(summary);
+
+    try std.testing.expectEqualStrings("## Goal\nTest summary", summary);
+    try std.testing.expectEqual(@as(usize, 1), mock.calls.items.len);
+    try std.testing.expectEqual(ai.ThinkingLevel.medium, mock.calls.items[0].reasoning.?);
+    try std.testing.expectEqualStrings("test-key", mock.calls.items[0].api_key.?);
+    try std.testing.expect(std.mem.indexOf(u8, mock.calls.items[0].prompt, "<conversation>\n[User]: Summarize this.\n</conversation>") != null);
+}
+
+test "generateSummary reports summary stop errors" {
+    const allocator = std.testing.allocator;
+    const content = [_]ai.UserContent{.{ .text = .{ .text = "Summarize this." } }};
+    const messages = [_]CodingAgentMessage{.{ .user = .{
+        .content = &content,
+        .timestamp_ms = 1,
+    } }};
+
+    var mock = MockSummaryExecutor.init(allocator, &.{});
+    defer mock.deinit();
+    mock.fail_on_call = 0;
+
+    try std.testing.expectError(
+        error.SummarizationFailed,
+        generateSummaryAlloc(
+            allocator,
+            &messages,
+            summaryTestModel(false, 8192),
+            2000,
+            .{},
+            mock.executor(),
+        ),
+    );
+}
+
+// Ported from packages/coding-agent/test/compaction-summary-reasoning.test.ts.
 test "compaction summary maxTokens are clamped to model output cap" {
     const model = summaryTestModel(false, 128_000);
 
     try std.testing.expectEqual(@as(u64, 128_000), historySummaryMaxTokens(model, 500_000));
     try std.testing.expectEqual(@as(u64, 128_000), turnPrefixSummaryMaxTokens(model, 500_000));
+}
+
+// Ported from packages/coding-agent/test/compaction-summary-reasoning.test.ts.
+test "compact invokes history and turn-prefix summaries with clamped maxTokens" {
+    const allocator = std.testing.allocator;
+    const content = [_]ai.UserContent{.{ .text = .{ .text = "Summarize this." } }};
+    const messages = [_]CodingAgentMessage{.{ .user = .{
+        .content = &content,
+        .timestamp_ms = 1,
+    } }};
+    var preparation: CompactionPreparation = .{
+        .arena = std.heap.ArenaAllocator.init(allocator),
+        .first_kept_entry_id = "entry-keep",
+        .messages_to_summarize = &messages,
+        .turn_prefix_messages = &messages,
+        .is_split_turn = true,
+        .tokens_before = 600_000,
+        .file_ops = .{},
+        .settings = .{ .enabled = true, .reserve_tokens = 500_000, .keep_recent_tokens = 20_000 },
+    };
+    defer preparation.arena.deinit();
+
+    var mock = MockSummaryExecutor.init(allocator, &.{ "history summary", "turn prefix summary" });
+    defer mock.deinit();
+
+    var result = try compactAlloc(
+        allocator,
+        &preparation,
+        summaryTestModel(false, 128_000),
+        .{ .api_key = "test-key" },
+        mock.executor(),
+    );
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), mock.calls.items.len);
+    try std.testing.expectEqual(@as(u64, 128_000), mock.calls.items[0].max_tokens.?);
+    try std.testing.expectEqual(@as(u64, 128_000), mock.calls.items[1].max_tokens.?);
+    try std.testing.expectEqualStrings(
+        "history summary\n\n---\n\n**Turn Context (split turn):**\n\nturn prefix summary",
+        result.summary,
+    );
+    try std.testing.expectEqualStrings("entry-keep", result.first_kept_entry_id);
+    try std.testing.expectEqual(@as(u64, 600_000), result.tokens_before);
+    try std.testing.expectEqualStrings("{\"readFiles\":[],\"modifiedFiles\":[]}", result.details_json);
+}
+
+test "compact appends file operation sections and details" {
+    const allocator = std.testing.allocator;
+    const content = [_]ai.UserContent{.{ .text = .{ .text = "Summarize this." } }};
+    const messages = [_]CodingAgentMessage{.{ .user = .{
+        .content = &content,
+        .timestamp_ms = 1,
+    } }};
+    const read_ops = [_][]const u8{ "src/a.zig", "src/b.zig" };
+    const written_ops = [_][]const u8{"src/b.zig"};
+    const edited_ops = [_][]const u8{"src/c.zig"};
+    var preparation: CompactionPreparation = .{
+        .arena = std.heap.ArenaAllocator.init(allocator),
+        .first_kept_entry_id = "entry-keep",
+        .messages_to_summarize = &messages,
+        .turn_prefix_messages = &.{},
+        .is_split_turn = false,
+        .tokens_before = 1234,
+        .file_ops = .{
+            .read = &read_ops,
+            .written = &written_ops,
+            .edited = &edited_ops,
+        },
+        .settings = default_compaction_settings,
+    };
+    defer preparation.arena.deinit();
+
+    var mock = MockSummaryExecutor.init(allocator, &.{"history summary"});
+    defer mock.deinit();
+
+    var result = try compactAlloc(
+        allocator,
+        &preparation,
+        summaryTestModel(false, 8192),
+        .{},
+        mock.executor(),
+    );
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), mock.calls.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, result.summary, "<read-files>\nsrc/a.zig\n</read-files>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.summary, "<modified-files>\nsrc/b.zig\nsrc/c.zig\n</modified-files>") != null);
+    try std.testing.expectEqual(@as(usize, 1), result.details.read_files.len);
+    try std.testing.expectEqualStrings("src/a.zig", result.details.read_files[0]);
+    try std.testing.expectEqual(@as(usize, 2), result.details.modified_files.len);
+    try std.testing.expectEqualStrings("{\"readFiles\":[\"src/a.zig\"],\"modifiedFiles\":[\"src/b.zig\",\"src/c.zig\"]}", result.details_json);
 }
 
 test "compaction summary request wraps conversation previous summary and focus" {
