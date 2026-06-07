@@ -65,6 +65,7 @@ pub const SessionManager = session_manager.SessionManager;
 pub const SessionEventBridge = session_events.SessionEventBridge;
 pub const SessionEvent = session_events.SessionEvent;
 pub const SessionEventListener = session_events.SessionEventListener;
+pub const SessionSubscription = session_events.SessionSubscription;
 pub const MessageEndListener = session_events.MessageEndListener;
 pub const AutoRetryController = session_events.AutoRetryController;
 pub const AgentSessionReplay = session_events.AgentSessionReplay;

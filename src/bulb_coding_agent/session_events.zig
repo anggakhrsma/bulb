@@ -93,6 +93,16 @@ pub const SessionEventListener = struct {
     }
 };
 
+pub const SessionSubscription = struct {
+    id: usize,
+};
+
+const RegisteredSessionEventListener = struct {
+    id: usize,
+    active: bool = true,
+    listener: SessionEventListener,
+};
+
 pub const MessageEndListener = struct {
     ptr: ?*anyopaque = null,
     call_fn: *const fn (?*anyopaque, messages.CodingAgentMessage) void,
@@ -106,8 +116,10 @@ pub const SessionEventBridge = struct {
     allocator: std.mem.Allocator,
     turn_index: usize = 0,
     message_end_replacements: std.ArrayList(extensions.MessageEndEmitResult) = .empty,
-    event_listeners: std.ArrayList(SessionEventListener) = .empty,
+    event_listeners: std.ArrayList(RegisteredSessionEventListener) = .empty,
     message_end_listeners: std.ArrayList(MessageEndListener) = .empty,
+    next_listener_id: usize = 1,
+    public_emit_depth: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator) SessionEventBridge {
         return .{ .allocator = allocator };
@@ -122,7 +134,31 @@ pub const SessionEventBridge = struct {
     }
 
     pub fn subscribe(self: *SessionEventBridge, listener: SessionEventListener) !void {
-        try self.event_listeners.append(self.allocator, listener);
+        _ = try self.subscribeWithHandle(listener);
+    }
+
+    pub fn subscribeWithHandle(
+        self: *SessionEventBridge,
+        listener: SessionEventListener,
+    ) !SessionSubscription {
+        const subscription = SessionSubscription{ .id = self.next_listener_id };
+        self.next_listener_id += 1;
+        try self.event_listeners.append(self.allocator, .{
+            .id = subscription.id,
+            .listener = listener,
+        });
+        return subscription;
+    }
+
+    pub fn unsubscribe(self: *SessionEventBridge, subscription: SessionSubscription) bool {
+        for (self.event_listeners.items) |*registered| {
+            if (registered.id == subscription.id and registered.active) {
+                registered.active = false;
+                if (self.public_emit_depth == 0) self.compactInactiveEventListeners();
+                return true;
+            }
+        }
+        return false;
     }
 
     pub fn onMessageEnd(self: *SessionEventBridge, listener: MessageEndListener) !void {
@@ -291,12 +327,32 @@ pub const SessionEventBridge = struct {
     }
 
     fn emitPublic(self: *SessionEventBridge, event: SessionEvent) void {
-        for (self.event_listeners.items) |listener| listener.call(event);
+        self.public_emit_depth += 1;
+        const initial_len = self.event_listeners.items.len;
+        var index: usize = 0;
+        while (index < initial_len and index < self.event_listeners.items.len) : (index += 1) {
+            const registered = self.event_listeners.items[index];
+            if (registered.active) registered.listener.call(event);
+        }
+        self.public_emit_depth -= 1;
+        if (self.public_emit_depth == 0) self.compactInactiveEventListeners();
+
         switch (event) {
             .message_end => |payload| {
                 for (self.message_end_listeners.items) |listener| listener.call(payload.message);
             },
             else => {},
+        }
+    }
+
+    fn compactInactiveEventListeners(self: *SessionEventBridge) void {
+        var index: usize = 0;
+        while (index < self.event_listeners.items.len) {
+            if (!self.event_listeners.items[index].active) {
+                _ = self.event_listeners.orderedRemove(index);
+                continue;
+            }
+            index += 1;
         }
     }
 };
@@ -578,25 +634,52 @@ pub const AgentSessionReplay = struct {
             switch (content) {
                 .thinking => |thinking| if (thinking.thinking.len > 0) {
                     try self.bridge.handleMessageUpdate(self.runner, .{ .assistant = assistant_message }, .{
+                        .thinking_start = .{ .content_index = index },
+                    });
+                    try self.bridge.handleMessageUpdate(self.runner, .{ .assistant = assistant_message }, .{
                         .thinking_delta = .{
                             .content_index = index,
                             .delta = thinking.thinking,
                         },
                     });
+                    try self.bridge.handleMessageUpdate(self.runner, .{ .assistant = assistant_message }, .{
+                        .thinking_end = .{
+                            .content_index = index,
+                            .content = thinking.thinking,
+                        },
+                    });
                 },
                 .text => |text| if (text.text.len > 0) {
+                    try self.bridge.handleMessageUpdate(self.runner, .{ .assistant = assistant_message }, .{
+                        .text_start = .{ .content_index = index },
+                    });
                     try self.bridge.handleMessageUpdate(self.runner, .{ .assistant = assistant_message }, .{
                         .text_delta = .{
                             .content_index = index,
                             .delta = text.text,
                         },
                     });
+                    try self.bridge.handleMessageUpdate(self.runner, .{ .assistant = assistant_message }, .{
+                        .text_end = .{
+                            .content_index = index,
+                            .content = text.text,
+                        },
+                    });
                 },
                 .tool_call => |tool_call| {
+                    try self.bridge.handleMessageUpdate(self.runner, .{ .assistant = assistant_message }, .{
+                        .toolcall_start = .{ .content_index = index },
+                    });
                     try self.bridge.handleMessageUpdate(self.runner, .{ .assistant = assistant_message }, .{
                         .toolcall_delta = .{
                             .content_index = index,
                             .delta = tool_call.arguments_json,
+                        },
+                    });
+                    try self.bridge.handleMessageUpdate(self.runner, .{ .assistant = assistant_message }, .{
+                        .toolcall_end = .{
+                            .content_index = index,
+                            .tool_call = tool_call,
                         },
                     });
                 },
@@ -1161,6 +1244,42 @@ test "AgentSession bridge emits lifecycle events extension-first and advances tu
     try std.testing.expectEqual(@as(usize, 1), bridge.turn_index);
 }
 
+test "AgentSession bridge subscription handles unsubscribe safely during emit" {
+    const allocator = std.testing.allocator;
+    var harness = try TestHarness.init(allocator);
+    defer harness.deinit();
+
+    var runner = extensions.ExtensionRunner.init(
+        allocator,
+        &.{},
+        harness.runtime,
+        "/tmp",
+        harness.sessions,
+        harness.registry,
+    );
+    defer runner.deinit();
+
+    var bridge = SessionEventBridge.init(allocator);
+    defer bridge.deinit();
+
+    var state = SubscriptionTestState{ .bridge = &bridge };
+    const self_handle = try bridge.subscribeWithHandle(.{ .ptr = &state, .call_fn = SubscriptionTestState.selfListener });
+    state.self_handle = self_handle;
+    const other_handle = try bridge.subscribeWithHandle(.{ .ptr = &state, .call_fn = SubscriptionTestState.otherListener });
+
+    try bridge.handleAgentStart(&runner);
+    try bridge.handleAgentStart(&runner);
+
+    try std.testing.expectEqual(@as(usize, 1), state.self_calls);
+    try std.testing.expectEqual(@as(usize, 2), state.other_calls);
+    try std.testing.expect(!bridge.unsubscribe(self_handle));
+    try std.testing.expect(bridge.unsubscribe(other_handle));
+
+    try bridge.handleAgentStart(&runner);
+    try std.testing.expectEqual(@as(usize, 1), state.self_calls);
+    try std.testing.expectEqual(@as(usize, 2), state.other_calls);
+}
+
 test "AgentSession retry controller emits retry start and success end events" {
     const allocator = std.testing.allocator;
     var bridge = SessionEventBridge.init(allocator);
@@ -1346,6 +1465,105 @@ test "AgentSession replay emits upstream single prompt event order" {
     try std.testing.expectEqualSlices(bool, &[_]bool{false}, will_retry_flags.items);
     try std.testing.expectEqual(@as(usize, 2), replay.messages.items.len);
     try std.testing.expectEqual(@as(usize, 0), replay.pendingResponseCount());
+}
+
+test "AgentSession replay emits rich streaming update boundaries" {
+    const allocator = std.testing.allocator;
+    var harness = try TestHarness.init(allocator);
+    defer harness.deinit();
+
+    var runner = extensions.ExtensionRunner.init(
+        allocator,
+        &.{},
+        harness.runtime,
+        "/tmp",
+        harness.sessions,
+        harness.registry,
+    );
+    defer runner.deinit();
+
+    var bridge = SessionEventBridge.init(allocator);
+    defer bridge.deinit();
+    var observed_events: std.ArrayList(ReplayEventObservation) = .empty;
+    defer observed_events.deinit(allocator);
+    var will_retry_flags: std.ArrayList(bool) = .empty;
+    defer will_retry_flags.deinit(allocator);
+    var update_tags: std.ArrayList(std.meta.Tag(ai.StreamEvent)) = .empty;
+    defer update_tags.deinit(allocator);
+    var update_indexes: std.ArrayList(usize) = .empty;
+    defer update_indexes.deinit(allocator);
+    var update_deltas: std.ArrayList(ReplayUpdateDeltaKind) = .empty;
+    defer update_deltas.deinit(allocator);
+    var recorder = ReplayEventRecorder{
+        .allocator = allocator,
+        .events = &observed_events,
+        .will_retry_flags = &will_retry_flags,
+        .update_tags = &update_tags,
+        .update_indexes = &update_indexes,
+        .update_deltas = &update_deltas,
+    };
+    try bridge.subscribe(.{ .ptr = &recorder, .call_fn = ReplayEventRecorder.publicListener });
+
+    var echo_state = EchoToolState{ .allocator = allocator };
+    defer echo_state.deinit();
+    const echo_tool = echoTool(&echo_state);
+    const replay_tools = [_]tools.tool_registry.AgentTool{echo_tool};
+
+    const mixed_content = [_]ai.AssistantContent{
+        .{ .thinking = .{ .thinking = "plan", .thinking_signature = "sig" } },
+        .{ .text = .{ .text = "answer" } },
+        .{ .tool_call = .{
+            .id = "call-1",
+            .name = "echo",
+            .arguments_json = "{\"text\":\"hello\"}",
+        } },
+    };
+    const final_content = [_]ai.AssistantContent{.{ .text = .{ .text = "done" } }};
+    const responses = [_]ai.AssistantMessage{
+        assistantMessage(&mixed_content, .tool_use),
+        assistantMessage(&final_content, .stop),
+    };
+    var replay = AgentSessionReplay.init(
+        allocator,
+        &bridge,
+        &runner,
+        harness.sessions,
+        AutoRetryController.init(.{ .enabled = false }, null),
+        &replay_tools,
+    );
+    defer replay.deinit();
+    replay.setResponses(&responses);
+
+    try replay.prompt(std.testing.io, "hi", 123);
+
+    const expected_tags = [_]std.meta.Tag(ai.StreamEvent){
+        .thinking_start,
+        .thinking_delta,
+        .thinking_end,
+        .text_start,
+        .text_delta,
+        .text_end,
+        .toolcall_start,
+        .toolcall_delta,
+        .toolcall_end,
+    };
+    const expected_indexes = [_]usize{ 0, 0, 0, 1, 1, 1, 2, 2, 2 };
+    const expected_deltas = [_]ReplayUpdateDeltaKind{
+        .none,
+        .thinking_plan,
+        .thinking_plan,
+        .none,
+        .text_answer,
+        .text_answer,
+        .none,
+        .tool_args,
+        .tool_args,
+    };
+    try std.testing.expect(update_tags.items.len >= expected_tags.len);
+    try std.testing.expectEqualSlices(std.meta.Tag(ai.StreamEvent), &expected_tags, update_tags.items[0..expected_tags.len]);
+    try std.testing.expectEqualSlices(usize, &expected_indexes, update_indexes.items[0..expected_indexes.len]);
+    try std.testing.expectEqualSlices(ReplayUpdateDeltaKind, &expected_deltas, update_deltas.items[0..expected_deltas.len]);
+    try std.testing.expectEqual(@as(usize, 1), echo_state.runs.items.len);
 }
 
 test "AgentSession replay waits for retry recovery tool loop before returning" {
@@ -1640,6 +1858,32 @@ const LifecycleOrderState = struct {
     }
 };
 
+const SubscriptionTestState = struct {
+    bridge: *SessionEventBridge,
+    self_handle: ?SessionSubscription = null,
+    self_calls: usize = 0,
+    other_calls: usize = 0,
+
+    fn selfListener(ptr: ?*anyopaque, event: SessionEvent) void {
+        const state: *@This() = @ptrCast(@alignCast(ptr.?));
+        switch (event) {
+            .agent_start => {
+                state.self_calls += 1;
+                _ = state.bridge.unsubscribe(state.self_handle.?);
+            },
+            else => {},
+        }
+    }
+
+    fn otherListener(ptr: ?*anyopaque, event: SessionEvent) void {
+        const state: *@This() = @ptrCast(@alignCast(ptr.?));
+        switch (event) {
+            .agent_start => state.other_calls += 1,
+            else => {},
+        }
+    }
+};
+
 const ObservedRetryEvent = enum {
     start,
     end,
@@ -1710,6 +1954,8 @@ const ReplayEventRecorder = struct {
     events: *std.ArrayList(ReplayEventObservation),
     will_retry_flags: *std.ArrayList(bool),
     update_tags: *std.ArrayList(std.meta.Tag(ai.StreamEvent)),
+    update_indexes: ?*std.ArrayList(usize) = null,
+    update_deltas: ?*std.ArrayList(ReplayUpdateDeltaKind) = null,
 
     fn publicListener(ptr: ?*anyopaque, event: SessionEvent) void {
         const recorder: *@This() = @ptrCast(@alignCast(ptr.?));
@@ -1726,6 +1972,12 @@ const ReplayEventRecorder = struct {
             .message_start => |payload| recorder.append(messageObservation(.start, payload.message) orelse return) catch @panic("out of memory"),
             .message_update => |payload| {
                 recorder.update_tags.append(recorder.allocator, std.meta.activeTag(payload.assistant_message_event)) catch @panic("out of memory");
+                if (recorder.update_indexes) |indexes| {
+                    indexes.append(recorder.allocator, streamEventContentIndex(payload.assistant_message_event)) catch @panic("out of memory");
+                }
+                if (recorder.update_deltas) |deltas| {
+                    deltas.append(recorder.allocator, replayUpdateDeltaKind(payload.assistant_message_event)) catch @panic("out of memory");
+                }
                 recorder.append(.message_update) catch @panic("out of memory");
             },
             .message_end => |payload| recorder.append(messageObservation(.end, payload.message) orelse return) catch @panic("out of memory"),
@@ -1746,6 +1998,48 @@ const ReplayEventRecorder = struct {
         try self.events.append(self.allocator, observation);
     }
 };
+
+const ReplayUpdateDeltaKind = enum {
+    none,
+    thinking_plan,
+    text_answer,
+    tool_args,
+    other,
+};
+
+fn streamEventContentIndex(event: ai.StreamEvent) usize {
+    return switch (event) {
+        .text_start => |payload| payload.content_index,
+        .text_delta => |payload| payload.content_index,
+        .text_end => |payload| payload.content_index,
+        .thinking_start => |payload| payload.content_index,
+        .thinking_delta => |payload| payload.content_index,
+        .thinking_end => |payload| payload.content_index,
+        .toolcall_start => |payload| payload.content_index,
+        .toolcall_delta => |payload| payload.content_index,
+        .toolcall_end => |payload| payload.content_index,
+        else => 0,
+    };
+}
+
+fn replayUpdateDeltaKind(event: ai.StreamEvent) ReplayUpdateDeltaKind {
+    return switch (event) {
+        .thinking_delta => |payload| replayDeltaTextKind(payload.delta),
+        .thinking_end => |payload| replayDeltaTextKind(payload.content),
+        .text_delta => |payload| replayDeltaTextKind(payload.delta),
+        .text_end => |payload| replayDeltaTextKind(payload.content),
+        .toolcall_delta => |payload| replayDeltaTextKind(payload.delta),
+        .toolcall_end => |payload| replayDeltaTextKind(payload.tool_call.arguments_json),
+        else => .none,
+    };
+}
+
+fn replayDeltaTextKind(text: []const u8) ReplayUpdateDeltaKind {
+    if (std.mem.eql(u8, text, "plan")) return .thinking_plan;
+    if (std.mem.eql(u8, text, "answer")) return .text_answer;
+    if (std.mem.eql(u8, text, "{\"text\":\"hello\"}")) return .tool_args;
+    return .other;
+}
 
 const MessageBoundary = enum {
     start,
