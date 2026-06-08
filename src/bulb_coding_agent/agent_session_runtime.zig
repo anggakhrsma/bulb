@@ -2,6 +2,7 @@ const std = @import("std");
 
 const agent_session_services = @import("agent_session_services.zig");
 const extensions = @import("extensions/root.zig");
+const paths = @import("paths.zig");
 const session_cwd = @import("session_cwd.zig");
 const session_manager = @import("session_manager.zig");
 const source_info = @import("source_info.zig");
@@ -14,6 +15,15 @@ pub const RuntimeError = error{
     InvalidForkEntry,
     PersistedSessionMissingFile,
     ReplacedSessionContextUnavailable,
+    SessionImportFileNotFound,
+};
+
+pub const SessionImportFileNotFoundError = struct {
+    file_path: []const u8,
+
+    pub fn messageAlloc(self: SessionImportFileNotFoundError, allocator: std.mem.Allocator) ![]u8 {
+        return std.fmt.allocPrint(allocator, "File not found: {s}", .{self.file_path});
+    }
 };
 
 pub const CreateAgentSessionRuntimeOptions = struct {
@@ -344,6 +354,70 @@ pub const AgentSessionRuntime = struct {
         return .{ .selected_text = target.selected_text };
     }
 
+    pub fn importFromJsonl(
+        self: *AgentSessionRuntime,
+        input_path: []const u8,
+        cwd_override: ?[]const u8,
+    ) !SessionChangeResult {
+        const process_cwd = try std.process.currentPathAlloc(self.io, self.allocator);
+        defer self.allocator.free(process_cwd);
+        const resolved_path = try paths.resolvePathAlloc(self.allocator, input_path, process_cwd, .{});
+        defer self.allocator.free(resolved_path);
+        try assertImportInputExists(self.io, resolved_path);
+
+        const session_dir = try self.allocator.dupe(u8, self.session.getSessionManager().getSessionDir());
+        defer self.allocator.free(session_dir);
+        if (session_dir.len > 0) {
+            try std.Io.Dir.cwd().createDirPath(self.io, session_dir);
+        }
+
+        const destination_path = try std.fs.path.join(self.allocator, &.{ session_dir, std.fs.path.basename(resolved_path) });
+        defer self.allocator.free(destination_path);
+        const before_result = try self.emitBeforeSwitch(.@"resume", destination_path);
+        if (before_result.cancelled) return before_result;
+
+        const previous_session_file = self.session.getSessionFile();
+        const agent_dir = try self.allocator.dupe(u8, self.services.agent_dir);
+        defer self.allocator.free(agent_dir);
+        const fallback_cwd = try self.allocator.dupe(u8, self.cwd());
+        defer self.allocator.free(fallback_cwd);
+
+        const resolved_destination_path = try paths.resolvePathAlloc(self.allocator, destination_path, process_cwd, .{});
+        defer self.allocator.free(resolved_destination_path);
+        if (!std.mem.eql(u8, resolved_destination_path, resolved_path)) {
+            try std.Io.Dir.copyFileAbsolute(resolved_path, resolved_destination_path, self.io, .{
+                .make_path = true,
+                .replace = true,
+            });
+        }
+
+        const opened_manager = try self.boxSessionManager(try session_manager.SessionManager.open(
+            self.allocator,
+            self.io,
+            destination_path,
+            .{
+                .session_dir = session_dir,
+                .cwd_override = cwd_override,
+            },
+        ));
+        var manager_owned = true;
+        errdefer if (manager_owned) destroySessionManager(self.allocator, opened_manager);
+
+        try session_cwd.assertSessionCwdExists(self.io, opened_manager.cwdSource(), fallback_cwd);
+        try self.teardownCurrent(.@"resume", opened_manager.getSessionFile());
+        const result = try self.create_runtime.call(self.allocator, self.io, .{
+            .cwd = opened_manager.getCwd(),
+            .agent_dir = agent_dir,
+            .session_manager = opened_manager,
+            .session_start_event = .{ .reason = .@"resume", .previous_session_file = previous_session_file },
+        });
+        manager_owned = false;
+        self.apply(result);
+
+        try self.finishSessionReplacement(null);
+        return .{};
+    }
+
     pub fn dispose(self: *AgentSessionRuntime) !void {
         if (!self.active) return;
         try self.teardownCurrent(.quit, null);
@@ -532,6 +606,18 @@ fn extractUserMessageTextAlloc(allocator: std.mem.Allocator, raw_json: []const u
         },
         else => return null,
     }
+}
+
+fn assertImportInputExists(io: std.Io, file_path: []const u8) !void {
+    std.Io.Dir.cwd().access(io, file_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return RuntimeError.SessionImportFileNotFound,
+        else => |access_error| return access_error,
+    };
+}
+
+fn pathExists(io: std.Io, file_path: []const u8) bool {
+    std.Io.Dir.cwd().access(io, file_path, .{}) catch return false;
+    return true;
 }
 
 const TestSession = struct {
@@ -857,6 +943,18 @@ fn createBoxedSessionManager(
 fn appendPersistingMessages(manager: *session_manager.SessionManager, io: std.Io) !void {
     _ = try manager.appendMessageJson(io, "{\"role\":\"user\",\"content\":\"hello\",\"timestamp\":1}");
     _ = try manager.appendMessageJson(io, "{\"role\":\"assistant\",\"content\":\"ok\",\"timestamp\":2}");
+}
+
+fn createImportSourceSession(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    session_dir: []const u8,
+) !session_manager.SessionManager {
+    var manager = try session_manager.SessionManager.create(allocator, io, cwd, session_dir, .{});
+    errdefer manager.deinit();
+    try appendPersistingMessages(&manager, io);
+    return manager;
 }
 
 fn expectRecordedEvent(event: RecordedEvent, name: []const u8, reason: []const u8) !void {
@@ -1207,4 +1305,166 @@ test "AgentSessionRuntime forks in-memory sessions and returns selected text" {
     try std.testing.expectEqualStrings("onetwo", result.selected_text.?);
     try std.testing.expectEqual(@as(?[]const u8, null), runtime.session.getSessionFile());
     try std.testing.expectEqual(@as(usize, 0), runtime.session.getSessionManager().getEntries().len);
+}
+
+test "AgentSessionRuntime importFromJsonl rejects missing files" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try tempDirPathAlloc(allocator, &tmp);
+    defer allocator.free(cwd);
+    const agent_dir = try std.fs.path.join(allocator, &.{ cwd, "agent" });
+    defer allocator.free(agent_dir);
+    const session_dir = try std.fs.path.join(allocator, &.{ cwd, "sessions" });
+    defer allocator.free(session_dir);
+    const missing_file = try std.fs.path.join(allocator, &.{ cwd, "missing.jsonl" });
+    defer allocator.free(missing_file);
+
+    var harness = try RuntimeHarness.init(allocator, io, cwd, &.{});
+    defer harness.deinit();
+
+    const initial_manager = try createBoxedSessionManager(allocator, io, cwd, session_dir);
+    var runtime = try createAgentSessionRuntime(
+        allocator,
+        io,
+        harness.factory(),
+        .{
+            .cwd = cwd,
+            .agent_dir = agent_dir,
+            .session_manager = initial_manager,
+        },
+    );
+    defer runtime.dispose() catch {};
+
+    try std.testing.expectError(
+        RuntimeError.SessionImportFileNotFound,
+        runtime.importFromJsonl(missing_file, null),
+    );
+}
+
+test "AgentSessionRuntime importFromJsonl cancellation happens before copy" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try tempDirPathAlloc(allocator, &tmp);
+    defer allocator.free(cwd);
+    const agent_dir = try std.fs.path.join(allocator, &.{ cwd, "agent" });
+    defer allocator.free(agent_dir);
+    const session_dir = try std.fs.path.join(allocator, &.{ cwd, "sessions" });
+    defer allocator.free(session_dir);
+    const source_dir = try std.fs.path.join(allocator, &.{ cwd, "import-source" });
+    defer allocator.free(source_dir);
+
+    var source_manager = try createImportSourceSession(allocator, io, cwd, source_dir);
+    defer source_manager.deinit();
+    const source_file = source_manager.getSessionFile().?;
+    const destination_path = try std.fs.path.join(allocator, &.{ session_dir, std.fs.path.basename(source_file) });
+    defer allocator.free(destination_path);
+
+    var recorder = EventRecorder.init(allocator);
+    recorder.cancel_next_switch = true;
+    defer recorder.deinit();
+    const handlers = [_]extensions.ExtensionHandler{
+        .{ .ptr = &recorder, .event_name = .session_before_switch, .handler_fn = EventRecorder.handler },
+        .{ .ptr = &recorder, .event_name = .session_shutdown, .handler_fn = EventRecorder.handler },
+        .{ .ptr = &recorder, .event_name = .session_start, .handler_fn = EventRecorder.handler },
+    };
+    const extension_list = [_]extensions.Extension{testExtension("/tmp/runtime-import-cancel.zig", &handlers)};
+    var harness = try RuntimeHarness.init(allocator, io, cwd, &extension_list);
+    defer harness.deinit();
+
+    const initial_manager = try createBoxedSessionManager(allocator, io, cwd, session_dir);
+    var runtime = try createAgentSessionRuntime(
+        allocator,
+        io,
+        harness.factory(),
+        .{
+            .cwd = cwd,
+            .agent_dir = agent_dir,
+            .session_manager = initial_manager,
+            .session_start_event = .{ .reason = .startup },
+        },
+    );
+    defer runtime.dispose() catch {};
+    const original_session_file = runtime.session.getSessionFile().?;
+    recorder.deinit();
+    recorder = EventRecorder.init(allocator);
+    recorder.cancel_next_switch = true;
+
+    const result = try runtime.importFromJsonl(source_file, null);
+    try std.testing.expect(result.cancelled);
+    try std.testing.expectEqualStrings(original_session_file, runtime.session.getSessionFile().?);
+    try std.testing.expect(!pathExists(io, destination_path));
+    try std.testing.expectEqual(@as(usize, 1), recorder.events.items.len);
+    try expectRecordedEvent(recorder.events.items[0], "session_before_switch", "resume");
+    try std.testing.expectEqualStrings(destination_path, recorder.events.items[0].target_session_file.?);
+}
+
+test "AgentSessionRuntime importFromJsonl copies and resumes imported session" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try tempDirPathAlloc(allocator, &tmp);
+    defer allocator.free(cwd);
+    const agent_dir = try std.fs.path.join(allocator, &.{ cwd, "agent" });
+    defer allocator.free(agent_dir);
+    const session_dir = try std.fs.path.join(allocator, &.{ cwd, "sessions" });
+    defer allocator.free(session_dir);
+    const source_dir = try std.fs.path.join(allocator, &.{ cwd, "external-sessions" });
+    defer allocator.free(source_dir);
+
+    var source_manager = try createImportSourceSession(allocator, io, cwd, source_dir);
+    defer source_manager.deinit();
+    const source_file = source_manager.getSessionFile().?;
+    const destination_path = try std.fs.path.join(allocator, &.{ session_dir, std.fs.path.basename(source_file) });
+    defer allocator.free(destination_path);
+
+    var recorder = EventRecorder.init(allocator);
+    defer recorder.deinit();
+    const handlers = [_]extensions.ExtensionHandler{
+        .{ .ptr = &recorder, .event_name = .session_before_switch, .handler_fn = EventRecorder.handler },
+        .{ .ptr = &recorder, .event_name = .session_shutdown, .handler_fn = EventRecorder.handler },
+        .{ .ptr = &recorder, .event_name = .session_start, .handler_fn = EventRecorder.handler },
+    };
+    const extension_list = [_]extensions.Extension{testExtension("/tmp/runtime-import.zig", &handlers)};
+    var harness = try RuntimeHarness.init(allocator, io, cwd, &extension_list);
+    defer harness.deinit();
+
+    const initial_manager = try createBoxedSessionManager(allocator, io, cwd, session_dir);
+    try appendPersistingMessages(initial_manager, io);
+    var runtime = try createAgentSessionRuntime(
+        allocator,
+        io,
+        harness.factory(),
+        .{
+            .cwd = cwd,
+            .agent_dir = agent_dir,
+            .session_manager = initial_manager,
+            .session_start_event = .{ .reason = .startup },
+        },
+    );
+    defer runtime.dispose() catch {};
+    const previous_session_file = runtime.session.getSessionFile().?;
+    recorder.deinit();
+    recorder = EventRecorder.init(allocator);
+
+    const result = try runtime.importFromJsonl(source_file, null);
+    try std.testing.expect(!result.cancelled);
+    try std.testing.expect(pathExists(io, destination_path));
+    try std.testing.expectEqualStrings(destination_path, runtime.session.getSessionFile().?);
+    try std.testing.expectEqualStrings(cwd, runtime.session.getSessionManager().getCwd());
+    try std.testing.expectEqual(@as(usize, 2), runtime.session.getSessionManager().getEntries().len);
+    try std.testing.expectEqual(@as(usize, 3), recorder.events.items.len);
+    try expectRecordedEvent(recorder.events.items[0], "session_before_switch", "resume");
+    try std.testing.expectEqualStrings(destination_path, recorder.events.items[0].target_session_file.?);
+    try expectRecordedEvent(recorder.events.items[1], "session_shutdown", "resume");
+    try std.testing.expectEqualStrings(destination_path, recorder.events.items[1].target_session_file.?);
+    try expectRecordedEvent(recorder.events.items[2], "session_start", "resume");
+    try std.testing.expectEqualStrings(previous_session_file, recorder.events.items[2].previous_session_file.?);
 }
