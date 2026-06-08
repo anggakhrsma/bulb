@@ -516,7 +516,7 @@ packages/coding-agent/src/modes/interactive/components/tree-selector.ts	bulb_cod
 packages/coding-agent/src/modes/interactive/components/user-message-selector.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/modes/interactive/components/user-message.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/modes/interactive/components/visual-truncate.ts	bulb_coding_agent	source	pending		
-packages/coding-agent/src/modes/interactive/interactive-mode.ts	bulb_coding_agent	source	in_progress	src/bulb_coding_agent/interactive_mode.zig	isApiKeyLoginProvider built-in/OAuth provider split ported for login selectors; Pi-compatible formatResumeCommand helper, /import path parsing, confirmation/status flow, runtime import dispatch, missing-cwd retry hook, and non-fatal SessionImportFileNotFound handling ported; broader interactive mode remains
+packages/coding-agent/src/modes/interactive/interactive-mode.ts	bulb_coding_agent	source	in_progress	src/bulb_coding_agent/interactive_mode.zig	isApiKeyLoginProvider built-in/OAuth provider split ported for login selectors; Pi-compatible formatResumeCommand helper, /import path parsing, confirmation/status flow, runtime import dispatch, missing-cwd retry hook, non-fatal SessionImportFileNotFound handling, /clone current-leaf fork/status/editor-reset flow, and startup input queue/getUserInput behavior ported; broader interactive mode remains
 packages/coding-agent/src/modes/interactive/theme/dark.json	bulb_coding_agent	source	pending		
 packages/coding-agent/src/modes/interactive/theme/light.json	bulb_coding_agent	source	pending		
 packages/coding-agent/src/modes/interactive/theme/theme-schema.json	bulb_coding_agent	source	pending		
@@ -625,10 +625,10 @@ packages/coding-agent/test/image-resize-callers.test.ts	bulb_coding_agent	test	p
 packages/coding-agent/test/initial-message.test.ts	bulb_coding_agent	test	implemented	src/bulb_coding_agent/initial_message.zig	Upstream stdin plus first CLI message merge, stdin-only prompt, and stdin file-text CLI-message ordering regressions ported
 packages/coding-agent/test/input-transform-streaming-example.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/interactive-mode-anthropic-warning.test.ts	bulb_coding_agent	test	pending		
-packages/coding-agent/test/interactive-mode-clone-command.test.ts	bulb_coding_agent	test	pending		
+packages/coding-agent/test/interactive-mode-clone-command.test.ts	bulb_coding_agent	test	implemented	src/bulb_coding_agent/interactive_mode.zig	Upstream /clone current leaf fork, render/editor reset/status, and no-leaf status regressions ported
 packages/coding-agent/test/interactive-mode-compaction.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/interactive-mode-import-command.test.ts	bulb_coding_agent	test	implemented	src/bulb_coding_agent/interactive_mode.zig	Upstream quoted /import path, apostrophe preservation, command-boundary parsing, confirmation, runtime dispatch, success status, and missing-file non-fatal error regressions ported
-packages/coding-agent/test/interactive-mode-startup-input.test.ts	bulb_coding_agent	test	pending		
+packages/coding-agent/test/interactive-mode-startup-input.test.ts	bulb_coding_agent	test	implemented	src/bulb_coding_agent/interactive_mode.zig	Upstream startup prompt queueing before input callback, pending bash flush, history append, and queued getUserInput precedence regressions ported
 packages/coding-agent/test/interactive-mode-status.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/interactive-mode-suspend.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/keybindings-migration.test.ts	bulb_coding_agent	test	implemented	src/bulb_coding_agent/keybindings.zig	Upstream legacy keybindings rewrite, namespaced-precedence, and in-memory migrated load-before-write regressions ported

@@ -1,7 +1,198 @@
 const std = @import("std");
 const agent_session_runtime = @import("agent_session_runtime.zig");
 const config = @import("config.zig");
+const extension_types = @import("extensions/types.zig");
 const session_manager_mod = @import("session_manager.zig");
+
+pub const CloneSessionManagerView = struct {
+    ptr: ?*anyopaque = null,
+    get_leaf_id_fn: *const fn (?*anyopaque) ?[]const u8,
+
+    fn getLeafId(self: CloneSessionManagerView) ?[]const u8 {
+        return self.get_leaf_id_fn(self.ptr);
+    }
+};
+
+pub const CloneRuntimeHost = struct {
+    ptr: ?*anyopaque = null,
+    fork_fn: *const fn (?*anyopaque, []const u8, extension_types.ForkOptions) anyerror!agent_session_runtime.SessionChangeResult,
+
+    fn fork(
+        self: CloneRuntimeHost,
+        entry_id: []const u8,
+        options: extension_types.ForkOptions,
+    ) !agent_session_runtime.SessionChangeResult {
+        return self.fork_fn(self.ptr, entry_id, options);
+    }
+};
+
+pub const CloneCommandEditor = struct {
+    ptr: ?*anyopaque = null,
+    set_text_fn: *const fn (?*anyopaque, []const u8) anyerror!void,
+
+    fn setText(self: CloneCommandEditor, text: []const u8) !void {
+        try self.set_text_fn(self.ptr, text);
+    }
+};
+
+pub const CloneCommandUi = struct {
+    ptr: ?*anyopaque = null,
+    show_status_fn: *const fn (?*anyopaque, []const u8) anyerror!void,
+    show_error_fn: *const fn (?*anyopaque, []const u8) anyerror!void,
+    render_current_session_state_fn: *const fn (?*anyopaque) anyerror!void,
+    request_render_fn: *const fn (?*anyopaque) anyerror!void,
+
+    fn showStatus(self: CloneCommandUi, message: []const u8) !void {
+        try self.show_status_fn(self.ptr, message);
+    }
+
+    fn showError(self: CloneCommandUi, message: []const u8) !void {
+        try self.show_error_fn(self.ptr, message);
+    }
+
+    fn renderCurrentSessionState(self: CloneCommandUi) !void {
+        try self.render_current_session_state_fn(self.ptr);
+    }
+
+    fn requestRender(self: CloneCommandUi) !void {
+        try self.request_render_fn(self.ptr);
+    }
+};
+
+pub const CloneCommandContext = struct {
+    session_manager: CloneSessionManagerView,
+    runtime_host: CloneRuntimeHost,
+    editor: CloneCommandEditor,
+    ui: CloneCommandUi,
+};
+
+pub fn handleCloneCommand(
+    allocator: std.mem.Allocator,
+    context: CloneCommandContext,
+) !void {
+    const leaf_id = context.session_manager.getLeafId() orelse {
+        try context.ui.showStatus("Nothing to clone yet");
+        return;
+    };
+
+    var result = context.runtime_host.fork(leaf_id, .{ .position = .at }) catch |err| {
+        try context.ui.showError(@errorName(err));
+        return;
+    };
+    defer result.deinit(allocator);
+
+    if (result.cancelled) {
+        try context.ui.requestRender();
+        return;
+    }
+
+    try context.ui.renderCurrentSessionState();
+    try context.editor.setText("");
+    try context.ui.showStatus("Cloned to new session");
+}
+
+pub const StartupInputCallback = struct {
+    ptr: ?*anyopaque = null,
+    call_fn: *const fn (?*anyopaque, []const u8) anyerror!void,
+
+    fn call(self: StartupInputCallback, text: []const u8) !void {
+        try self.call_fn(self.ptr, text);
+    }
+};
+
+pub const StartupFlushCallback = struct {
+    ptr: ?*anyopaque = null,
+    call_fn: *const fn (?*anyopaque) anyerror!void,
+
+    fn call(self: StartupFlushCallback) !void {
+        try self.call_fn(self.ptr);
+    }
+};
+
+pub const StartupSubmitEditor = struct {
+    ptr: ?*anyopaque = null,
+    add_to_history_fn: ?*const fn (?*anyopaque, []const u8) anyerror!void = null,
+    set_text_fn: ?*const fn (?*anyopaque, []const u8) anyerror!void = null,
+
+    fn addToHistory(self: StartupSubmitEditor, text: []const u8) !void {
+        if (self.add_to_history_fn) |add_fn| try add_fn(self.ptr, text);
+    }
+
+    fn setText(self: StartupSubmitEditor, text: []const u8) !void {
+        if (self.set_text_fn) |set_fn| try set_fn(self.ptr, text);
+    }
+};
+
+pub const StartupSubmitSessionState = struct {
+    is_compacting: bool = false,
+    is_streaming: bool = false,
+    is_bash_running: bool = false,
+};
+
+pub const StartupSubmitContext = struct {
+    editor: StartupSubmitEditor,
+    session: StartupSubmitSessionState = .{},
+    flush_pending_bash_components: StartupFlushCallback,
+};
+
+pub const StartupUserInputResult = union(enum) {
+    queued: []u8,
+    waiting,
+};
+
+pub const StartupInputController = struct {
+    allocator: std.mem.Allocator,
+    pending_user_inputs: std.ArrayList([]u8) = .empty,
+    on_input_callback: ?StartupInputCallback = null,
+
+    pub fn init(allocator: std.mem.Allocator) StartupInputController {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *StartupInputController) void {
+        freeMessageList(self.allocator, &self.pending_user_inputs);
+        self.* = undefined;
+    }
+
+    pub fn queueInput(self: *StartupInputController, text: []const u8) !void {
+        const copy = try self.allocator.dupe(u8, text);
+        errdefer self.allocator.free(copy);
+        try self.pending_user_inputs.append(self.allocator, copy);
+    }
+
+    pub fn submitEditorText(
+        self: *StartupInputController,
+        context: StartupSubmitContext,
+        submitted_text: []const u8,
+    ) !void {
+        const text = std.mem.trim(u8, submitted_text, " \t\n\r");
+        if (text.len == 0) return;
+
+        if (context.session.is_compacting or context.session.is_streaming or context.session.is_bash_running) {
+            return error.UnsupportedStartupInputState;
+        }
+
+        try context.flush_pending_bash_components.call();
+        if (self.on_input_callback) |callback| {
+            try callback.call(text);
+        } else {
+            try self.queueInput(text);
+        }
+        try context.editor.addToHistory(text);
+    }
+
+    pub fn getUserInput(
+        self: *StartupInputController,
+        callback: StartupInputCallback,
+    ) !StartupUserInputResult {
+        if (self.pending_user_inputs.items.len > 0) {
+            return .{ .queued = self.pending_user_inputs.orderedRemove(0) };
+        }
+
+        self.on_input_callback = callback;
+        return .waiting;
+    }
+};
 
 pub const ImportRuntimeHost = struct {
     ptr: ?*anyopaque = null,
@@ -485,6 +676,230 @@ fn freeMessageList(allocator: std.mem.Allocator, list: *std.ArrayList([]u8)) voi
     list.deinit(allocator);
 }
 
+const TestCloneSessionManager = struct {
+    leaf_id: ?[]const u8 = null,
+
+    fn callbacks(self: *TestCloneSessionManager) CloneSessionManagerView {
+        return .{
+            .ptr = self,
+            .get_leaf_id_fn = getLeafId,
+        };
+    }
+
+    fn getLeafId(ptr: ?*anyopaque) ?[]const u8 {
+        const self: *TestCloneSessionManager = @ptrCast(@alignCast(ptr.?));
+        return self.leaf_id;
+    }
+};
+
+const CloneForkCall = struct {
+    entry_id: []u8,
+    position: extension_types.ForkPosition,
+};
+
+const TestCloneRuntimeHost = struct {
+    allocator: std.mem.Allocator,
+    calls: std.ArrayList(CloneForkCall) = .empty,
+
+    fn init(allocator: std.mem.Allocator) TestCloneRuntimeHost {
+        return .{ .allocator = allocator };
+    }
+
+    fn deinit(self: *TestCloneRuntimeHost) void {
+        for (self.calls.items) |call| self.allocator.free(call.entry_id);
+        self.calls.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    fn callbacks(self: *TestCloneRuntimeHost) CloneRuntimeHost {
+        return .{
+            .ptr = self,
+            .fork_fn = fork,
+        };
+    }
+
+    fn fork(
+        ptr: ?*anyopaque,
+        entry_id: []const u8,
+        options: extension_types.ForkOptions,
+    ) !agent_session_runtime.SessionChangeResult {
+        const self: *TestCloneRuntimeHost = @ptrCast(@alignCast(ptr.?));
+        const entry_id_copy = try self.allocator.dupe(u8, entry_id);
+        errdefer self.allocator.free(entry_id_copy);
+        try self.calls.append(self.allocator, .{
+            .entry_id = entry_id_copy,
+            .position = options.position,
+        });
+        return .{};
+    }
+};
+
+const TestCloneEditor = struct {
+    allocator: std.mem.Allocator,
+    texts: std.ArrayList([]u8) = .empty,
+
+    fn init(allocator: std.mem.Allocator) TestCloneEditor {
+        return .{ .allocator = allocator };
+    }
+
+    fn deinit(self: *TestCloneEditor) void {
+        freeMessageList(self.allocator, &self.texts);
+        self.* = undefined;
+    }
+
+    fn callbacks(self: *TestCloneEditor) CloneCommandEditor {
+        return .{
+            .ptr = self,
+            .set_text_fn = setText,
+        };
+    }
+
+    fn setText(ptr: ?*anyopaque, text: []const u8) !void {
+        const self: *TestCloneEditor = @ptrCast(@alignCast(ptr.?));
+        const copy = try self.allocator.dupe(u8, text);
+        errdefer self.allocator.free(copy);
+        try self.texts.append(self.allocator, copy);
+    }
+};
+
+const TestCloneUi = struct {
+    allocator: std.mem.Allocator,
+    statuses: std.ArrayList([]u8) = .empty,
+    errors: std.ArrayList([]u8) = .empty,
+    render_count: usize = 0,
+    request_render_count: usize = 0,
+
+    fn init(allocator: std.mem.Allocator) TestCloneUi {
+        return .{ .allocator = allocator };
+    }
+
+    fn deinit(self: *TestCloneUi) void {
+        freeMessageList(self.allocator, &self.statuses);
+        freeMessageList(self.allocator, &self.errors);
+        self.* = undefined;
+    }
+
+    fn callbacks(self: *TestCloneUi) CloneCommandUi {
+        return .{
+            .ptr = self,
+            .show_status_fn = showStatus,
+            .show_error_fn = showError,
+            .render_current_session_state_fn = renderCurrentSessionState,
+            .request_render_fn = requestRender,
+        };
+    }
+
+    fn appendMessage(self: *TestCloneUi, list: *std.ArrayList([]u8), message: []const u8) !void {
+        const copy = try self.allocator.dupe(u8, message);
+        errdefer self.allocator.free(copy);
+        try list.append(self.allocator, copy);
+    }
+
+    fn showStatus(ptr: ?*anyopaque, message: []const u8) !void {
+        const self: *TestCloneUi = @ptrCast(@alignCast(ptr.?));
+        try self.appendMessage(&self.statuses, message);
+    }
+
+    fn showError(ptr: ?*anyopaque, message: []const u8) !void {
+        const self: *TestCloneUi = @ptrCast(@alignCast(ptr.?));
+        try self.appendMessage(&self.errors, message);
+    }
+
+    fn renderCurrentSessionState(ptr: ?*anyopaque) !void {
+        const self: *TestCloneUi = @ptrCast(@alignCast(ptr.?));
+        self.render_count += 1;
+    }
+
+    fn requestRender(ptr: ?*anyopaque) !void {
+        const self: *TestCloneUi = @ptrCast(@alignCast(ptr.?));
+        self.request_render_count += 1;
+    }
+};
+
+const TestStartupEditor = struct {
+    allocator: std.mem.Allocator,
+    history: std.ArrayList([]u8) = .empty,
+    texts: std.ArrayList([]u8) = .empty,
+
+    fn init(allocator: std.mem.Allocator) TestStartupEditor {
+        return .{ .allocator = allocator };
+    }
+
+    fn deinit(self: *TestStartupEditor) void {
+        freeMessageList(self.allocator, &self.history);
+        freeMessageList(self.allocator, &self.texts);
+        self.* = undefined;
+    }
+
+    fn callbacks(self: *TestStartupEditor) StartupSubmitEditor {
+        return .{
+            .ptr = self,
+            .add_to_history_fn = addToHistory,
+            .set_text_fn = setText,
+        };
+    }
+
+    fn appendMessage(self: *TestStartupEditor, list: *std.ArrayList([]u8), message: []const u8) !void {
+        const copy = try self.allocator.dupe(u8, message);
+        errdefer self.allocator.free(copy);
+        try list.append(self.allocator, copy);
+    }
+
+    fn addToHistory(ptr: ?*anyopaque, text: []const u8) !void {
+        const self: *TestStartupEditor = @ptrCast(@alignCast(ptr.?));
+        try self.appendMessage(&self.history, text);
+    }
+
+    fn setText(ptr: ?*anyopaque, text: []const u8) !void {
+        const self: *TestStartupEditor = @ptrCast(@alignCast(ptr.?));
+        try self.appendMessage(&self.texts, text);
+    }
+};
+
+const TestStartupFlush = struct {
+    count: usize = 0,
+
+    fn callbacks(self: *TestStartupFlush) StartupFlushCallback {
+        return .{
+            .ptr = self,
+            .call_fn = call,
+        };
+    }
+
+    fn call(ptr: ?*anyopaque) !void {
+        const self: *TestStartupFlush = @ptrCast(@alignCast(ptr.?));
+        self.count += 1;
+    }
+};
+
+const TestStartupInputCallback = struct {
+    allocator: std.mem.Allocator,
+    inputs: std.ArrayList([]u8) = .empty,
+
+    fn init(allocator: std.mem.Allocator) TestStartupInputCallback {
+        return .{ .allocator = allocator };
+    }
+
+    fn deinit(self: *TestStartupInputCallback) void {
+        freeMessageList(self.allocator, &self.inputs);
+        self.* = undefined;
+    }
+
+    fn callbacks(self: *TestStartupInputCallback) StartupInputCallback {
+        return .{
+            .ptr = self,
+            .call_fn = call,
+        };
+    }
+
+    fn call(ptr: ?*anyopaque, text: []const u8) !void {
+        const self: *TestStartupInputCallback = @ptrCast(@alignCast(ptr.?));
+        const copy = try self.allocator.dupe(u8, text);
+        errdefer self.allocator.free(copy);
+        try self.inputs.append(self.allocator, copy);
+    }
+};
+
 const ImportRuntimeScenario = enum {
     success,
     cancelled,
@@ -648,4 +1063,104 @@ test "InteractiveMode handleImportCommand shows non-fatal error for missing impo
     );
     try std.testing.expectEqual(@as(usize, 0), ui.statuses.items.len);
     try std.testing.expectEqual(@as(usize, 0), ui.fatal_count);
+}
+
+// Ported from packages/coding-agent/test/interactive-mode-clone-command.test.ts.
+test "InteractiveMode /clone clones the current leaf into a new session" {
+    const allocator = std.testing.allocator;
+    var session_manager = TestCloneSessionManager{ .leaf_id = "leaf-123" };
+    var runtime = TestCloneRuntimeHost.init(allocator);
+    defer runtime.deinit();
+    var editor = TestCloneEditor.init(allocator);
+    defer editor.deinit();
+    var ui = TestCloneUi.init(allocator);
+    defer ui.deinit();
+
+    try handleCloneCommand(allocator, .{
+        .session_manager = session_manager.callbacks(),
+        .runtime_host = runtime.callbacks(),
+        .editor = editor.callbacks(),
+        .ui = ui.callbacks(),
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), runtime.calls.items.len);
+    try std.testing.expectEqualStrings("leaf-123", runtime.calls.items[0].entry_id);
+    try std.testing.expectEqual(extension_types.ForkPosition.at, runtime.calls.items[0].position);
+    try std.testing.expectEqual(@as(usize, 1), ui.render_count);
+    try std.testing.expectEqual(@as(usize, 1), editor.texts.items.len);
+    try std.testing.expectEqualStrings("", editor.texts.items[0]);
+    try std.testing.expectEqual(@as(usize, 1), ui.statuses.items.len);
+    try std.testing.expectEqualStrings("Cloned to new session", ui.statuses.items[0]);
+    try std.testing.expectEqual(@as(usize, 0), ui.errors.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ui.request_render_count);
+}
+
+test "InteractiveMode /clone shows status when there is nothing to clone" {
+    const allocator = std.testing.allocator;
+    var session_manager = TestCloneSessionManager{};
+    var runtime = TestCloneRuntimeHost.init(allocator);
+    defer runtime.deinit();
+    var editor = TestCloneEditor.init(allocator);
+    defer editor.deinit();
+    var ui = TestCloneUi.init(allocator);
+    defer ui.deinit();
+
+    try handleCloneCommand(allocator, .{
+        .session_manager = session_manager.callbacks(),
+        .runtime_host = runtime.callbacks(),
+        .editor = editor.callbacks(),
+        .ui = ui.callbacks(),
+    });
+
+    try std.testing.expectEqual(@as(usize, 0), runtime.calls.items.len);
+    try std.testing.expectEqual(@as(usize, 1), ui.statuses.items.len);
+    try std.testing.expectEqualStrings("Nothing to clone yet", ui.statuses.items[0]);
+    try std.testing.expectEqual(@as(usize, 0), ui.errors.items.len);
+}
+
+// Ported from packages/coding-agent/test/interactive-mode-startup-input.test.ts.
+test "InteractiveMode startup input queues normal prompt before callback is installed" {
+    const allocator = std.testing.allocator;
+    var controller = StartupInputController.init(allocator);
+    defer controller.deinit();
+    var editor = TestStartupEditor.init(allocator);
+    defer editor.deinit();
+    var flush = TestStartupFlush{};
+
+    try controller.submitEditorText(.{
+        .editor = editor.callbacks(),
+        .session = .{
+            .is_compacting = false,
+            .is_streaming = false,
+            .is_bash_running = false,
+        },
+        .flush_pending_bash_components = flush.callbacks(),
+    }, " early prompt ");
+
+    try std.testing.expectEqual(@as(usize, 1), controller.pending_user_inputs.items.len);
+    try std.testing.expectEqualStrings("early prompt", controller.pending_user_inputs.items[0]);
+    try std.testing.expectEqual(@as(usize, 1), flush.count);
+    try std.testing.expectEqual(@as(usize, 1), editor.history.items.len);
+    try std.testing.expectEqualStrings("early prompt", editor.history.items[0]);
+}
+
+test "InteractiveMode startup input returns queued prompt before installing callback" {
+    const allocator = std.testing.allocator;
+    var controller = StartupInputController.init(allocator);
+    defer controller.deinit();
+    var callback = TestStartupInputCallback.init(allocator);
+    defer callback.deinit();
+
+    try controller.queueInput("queued prompt");
+    const result = try controller.getUserInput(callback.callbacks());
+    const queued = switch (result) {
+        .queued => |value| value,
+        .waiting => return error.ExpectedQueuedStartupInput,
+    };
+    defer allocator.free(queued);
+
+    try std.testing.expectEqualStrings("queued prompt", queued);
+    try std.testing.expect(controller.on_input_callback == null);
+    try std.testing.expectEqual(@as(usize, 0), controller.pending_user_inputs.items.len);
+    try std.testing.expectEqual(@as(usize, 0), callback.inputs.items.len);
 }
