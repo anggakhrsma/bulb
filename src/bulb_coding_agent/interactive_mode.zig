@@ -4,6 +4,96 @@ const config = @import("config.zig");
 const extension_types = @import("extensions/types.zig");
 const session_manager_mod = @import("session_manager.zig");
 
+pub const anthropic_subscription_auth_warning =
+    "Anthropic subscription auth is active. Third-party harness usage draws from extra usage and is billed per token, not your Claude plan limits. Manage extra usage at https://claude.ai/settings/usage.";
+
+pub const AnthropicWarningModel = struct {
+    provider: []const u8,
+};
+
+pub const AnthropicWarningSettings = struct {
+    anthropic_extra_usage: ?bool = null,
+
+    fn isAnthropicExtraUsageEnabled(self: AnthropicWarningSettings) bool {
+        return self.anthropic_extra_usage orelse true;
+    }
+};
+
+pub const AnthropicWarningAuthType = enum {
+    api_key,
+    oauth,
+};
+
+pub const AnthropicWarningModelRegistry = struct {
+    ptr: ?*anyopaque = null,
+    get_stored_auth_type_fn: *const fn (?*anyopaque, []const u8) ?AnthropicWarningAuthType,
+    get_api_key_for_provider_fn: *const fn (?*anyopaque, std.mem.Allocator, []const u8) anyerror!?[]u8,
+
+    fn getStoredAuthType(self: AnthropicWarningModelRegistry, provider: []const u8) ?AnthropicWarningAuthType {
+        return self.get_stored_auth_type_fn(self.ptr, provider);
+    }
+
+    fn getApiKeyForProviderAlloc(
+        self: AnthropicWarningModelRegistry,
+        allocator: std.mem.Allocator,
+        provider: []const u8,
+    ) !?[]u8 {
+        return self.get_api_key_for_provider_fn(self.ptr, allocator, provider);
+    }
+};
+
+pub const AnthropicWarningUi = struct {
+    ptr: ?*anyopaque = null,
+    show_warning_fn: *const fn (?*anyopaque, []const u8) anyerror!void,
+
+    fn showWarning(self: AnthropicWarningUi, message: []const u8) !void {
+        try self.show_warning_fn(self.ptr, message);
+    }
+};
+
+pub const AnthropicSubscriptionWarningState = struct {
+    shown: bool = false,
+};
+
+pub const AnthropicWarningContext = struct {
+    state: *AnthropicSubscriptionWarningState,
+    settings: AnthropicWarningSettings = .{},
+    model_registry: AnthropicWarningModelRegistry,
+    ui: AnthropicWarningUi,
+};
+
+pub fn isAnthropicSubscriptionAuthKey(api_key: ?[]const u8) bool {
+    const key = api_key orelse return false;
+    return std.mem.startsWith(u8, key, "sk-ant-oat");
+}
+
+pub fn maybeWarnAboutAnthropicSubscriptionAuth(
+    allocator: std.mem.Allocator,
+    context: AnthropicWarningContext,
+    model: ?AnthropicWarningModel,
+) !void {
+    if (!context.settings.isAnthropicExtraUsageEnabled()) return;
+    if (context.state.shown) return;
+
+    const selected_model = model orelse return;
+    if (!std.mem.eql(u8, selected_model.provider, "anthropic")) return;
+
+    if (context.model_registry.getStoredAuthType("anthropic")) |credential_type| {
+        if (credential_type == .oauth) {
+            context.state.shown = true;
+            try context.ui.showWarning(anthropic_subscription_auth_warning);
+            return;
+        }
+    }
+
+    const api_key = context.model_registry.getApiKeyForProviderAlloc(allocator, selected_model.provider) catch return;
+    defer if (api_key) |value| allocator.free(value);
+    if (!isAnthropicSubscriptionAuthKey(api_key)) return;
+
+    context.state.shown = true;
+    try context.ui.showWarning(anthropic_subscription_auth_warning);
+}
+
 pub const CloneSessionManagerView = struct {
     ptr: ?*anyopaque = null,
     get_leaf_id_fn: *const fn (?*anyopaque) ?[]const u8,
@@ -676,6 +766,68 @@ fn freeMessageList(allocator: std.mem.Allocator, list: *std.ArrayList([]u8)) voi
     list.deinit(allocator);
 }
 
+const TestAnthropicWarningRegistry = struct {
+    api_key: ?[]const u8 = null,
+    stored_auth_type: ?AnthropicWarningAuthType = null,
+    get_stored_auth_type_count: usize = 0,
+    get_api_key_count: usize = 0,
+
+    fn callbacks(self: *TestAnthropicWarningRegistry) AnthropicWarningModelRegistry {
+        return .{
+            .ptr = self,
+            .get_stored_auth_type_fn = getStoredAuthType,
+            .get_api_key_for_provider_fn = getApiKeyForProvider,
+        };
+    }
+
+    fn getStoredAuthType(ptr: ?*anyopaque, provider: []const u8) ?AnthropicWarningAuthType {
+        const self: *TestAnthropicWarningRegistry = @ptrCast(@alignCast(ptr.?));
+        self.get_stored_auth_type_count += 1;
+        if (!std.mem.eql(u8, provider, "anthropic")) return null;
+        return self.stored_auth_type;
+    }
+
+    fn getApiKeyForProvider(
+        ptr: ?*anyopaque,
+        allocator: std.mem.Allocator,
+        provider: []const u8,
+    ) !?[]u8 {
+        const self: *TestAnthropicWarningRegistry = @ptrCast(@alignCast(ptr.?));
+        self.get_api_key_count += 1;
+        if (!std.mem.eql(u8, provider, "anthropic")) return null;
+        const api_key = self.api_key orelse return null;
+        return try allocator.dupe(u8, api_key);
+    }
+};
+
+const TestAnthropicWarningUi = struct {
+    allocator: std.mem.Allocator,
+    warnings: std.ArrayList([]u8) = .empty,
+
+    fn init(allocator: std.mem.Allocator) TestAnthropicWarningUi {
+        return .{ .allocator = allocator };
+    }
+
+    fn deinit(self: *TestAnthropicWarningUi) void {
+        freeMessageList(self.allocator, &self.warnings);
+        self.* = undefined;
+    }
+
+    fn callbacks(self: *TestAnthropicWarningUi) AnthropicWarningUi {
+        return .{
+            .ptr = self,
+            .show_warning_fn = showWarning,
+        };
+    }
+
+    fn showWarning(ptr: ?*anyopaque, message: []const u8) !void {
+        const self: *TestAnthropicWarningUi = @ptrCast(@alignCast(ptr.?));
+        const copy = try self.allocator.dupe(u8, message);
+        errdefer self.allocator.free(copy);
+        try self.warnings.append(self.allocator, copy);
+    }
+};
+
 const TestCloneSessionManager = struct {
     leaf_id: ?[]const u8 = null,
 
@@ -970,6 +1122,82 @@ const TestImportRuntimeHost = struct {
         }
     }
 };
+
+// Ported from packages/coding-agent/test/interactive-mode-anthropic-warning.test.ts.
+test "InteractiveMode maybeWarnAboutAnthropicSubscriptionAuth warns once when subscription auth is detected" {
+    const allocator = std.testing.allocator;
+    var state = AnthropicSubscriptionWarningState{};
+    var registry = TestAnthropicWarningRegistry{ .api_key = "sk-ant-oat01-test" };
+    var ui = TestAnthropicWarningUi.init(allocator);
+    defer ui.deinit();
+
+    const context = AnthropicWarningContext{
+        .state = &state,
+        .model_registry = registry.callbacks(),
+        .ui = ui.callbacks(),
+    };
+    try maybeWarnAboutAnthropicSubscriptionAuth(allocator, context, .{ .provider = "anthropic" });
+    try maybeWarnAboutAnthropicSubscriptionAuth(allocator, context, .{ .provider = "anthropic" });
+
+    try std.testing.expectEqual(@as(usize, 1), ui.warnings.items.len);
+    try std.testing.expectEqualStrings(anthropic_subscription_auth_warning, ui.warnings.items[0]);
+    try std.testing.expectEqual(@as(usize, 1), registry.get_api_key_count);
+}
+
+test "InteractiveMode maybeWarnAboutAnthropicSubscriptionAuth warns for stored Anthropic OAuth without token lookup" {
+    const allocator = std.testing.allocator;
+    var state = AnthropicSubscriptionWarningState{};
+    var registry = TestAnthropicWarningRegistry{ .stored_auth_type = .oauth };
+    var ui = TestAnthropicWarningUi.init(allocator);
+    defer ui.deinit();
+
+    try maybeWarnAboutAnthropicSubscriptionAuth(allocator, .{
+        .state = &state,
+        .model_registry = registry.callbacks(),
+        .ui = ui.callbacks(),
+    }, .{ .provider = "anthropic" });
+
+    try std.testing.expectEqual(@as(usize, 1), ui.warnings.items.len);
+    try std.testing.expectEqualStrings(anthropic_subscription_auth_warning, ui.warnings.items[0]);
+    try std.testing.expectEqual(@as(usize, 0), registry.get_api_key_count);
+}
+
+test "InteractiveMode maybeWarnAboutAnthropicSubscriptionAuth does not warn for non-Anthropic models" {
+    const allocator = std.testing.allocator;
+    var state = AnthropicSubscriptionWarningState{};
+    var registry = TestAnthropicWarningRegistry{};
+    var ui = TestAnthropicWarningUi.init(allocator);
+    defer ui.deinit();
+
+    try maybeWarnAboutAnthropicSubscriptionAuth(allocator, .{
+        .state = &state,
+        .model_registry = registry.callbacks(),
+        .ui = ui.callbacks(),
+    }, .{ .provider = "openai" });
+
+    try std.testing.expectEqual(@as(usize, 0), ui.warnings.items.len);
+    try std.testing.expectEqual(@as(usize, 0), registry.get_stored_auth_type_count);
+    try std.testing.expectEqual(@as(usize, 0), registry.get_api_key_count);
+}
+
+test "InteractiveMode maybeWarnAboutAnthropicSubscriptionAuth honors disabled extra usage warning" {
+    const allocator = std.testing.allocator;
+    var state = AnthropicSubscriptionWarningState{};
+    var registry = TestAnthropicWarningRegistry{ .api_key = "sk-ant-oat01-test" };
+    var ui = TestAnthropicWarningUi.init(allocator);
+    defer ui.deinit();
+
+    try maybeWarnAboutAnthropicSubscriptionAuth(allocator, .{
+        .state = &state,
+        .settings = .{ .anthropic_extra_usage = false },
+        .model_registry = registry.callbacks(),
+        .ui = ui.callbacks(),
+    }, .{ .provider = "anthropic" });
+
+    try std.testing.expectEqual(@as(usize, 0), ui.warnings.items.len);
+    try std.testing.expectEqual(@as(usize, 0), registry.get_stored_auth_type_count);
+    try std.testing.expectEqual(@as(usize, 0), registry.get_api_key_count);
+}
 
 // Ported from packages/coding-agent/test/interactive-mode-import-command.test.ts.
 test "InteractiveMode /import parsing strips quotes from path arguments" {
