@@ -2,6 +2,8 @@ const std = @import("std");
 const agent_session_runtime = @import("agent_session_runtime.zig");
 const config = @import("config.zig");
 const extension_types = @import("extensions/types.zig");
+const messages_mod = @import("messages.zig");
+const session_events = @import("session_events.zig");
 const session_manager_mod = @import("session_manager.zig");
 
 pub const anthropic_subscription_auth_warning =
@@ -92,6 +94,113 @@ pub fn maybeWarnAboutAnthropicSubscriptionAuth(
 
     context.state.shown = true;
     try context.ui.showWarning(anthropic_subscription_auth_warning);
+}
+
+pub const InteractiveEventUi = struct {
+    ptr: ?*anyopaque = null,
+    clear_chat_fn: *const fn (?*anyopaque) anyerror!void,
+    rebuild_chat_from_messages_fn: *const fn (?*anyopaque) anyerror!void,
+    add_message_to_chat_fn: *const fn (?*anyopaque, messages_mod.CodingAgentMessage) anyerror!void,
+    flush_compaction_queue_fn: *const fn (?*anyopaque, bool) anyerror!void,
+    request_render_fn: ?*const fn (?*anyopaque) anyerror!void = null,
+    invalidate_footer_fn: ?*const fn (?*anyopaque) anyerror!void = null,
+    show_error_fn: ?*const fn (?*anyopaque, []const u8) anyerror!void = null,
+    show_status_fn: ?*const fn (?*anyopaque, []const u8) anyerror!void = null,
+    clear_status_fn: ?*const fn (?*anyopaque) anyerror!void = null,
+    set_terminal_progress_fn: ?*const fn (?*anyopaque, bool) anyerror!void = null,
+
+    fn clearChat(self: InteractiveEventUi) !void {
+        try self.clear_chat_fn(self.ptr);
+    }
+
+    fn rebuildChatFromMessages(self: InteractiveEventUi) !void {
+        try self.rebuild_chat_from_messages_fn(self.ptr);
+    }
+
+    fn addMessageToChat(self: InteractiveEventUi, message: messages_mod.CodingAgentMessage) !void {
+        try self.add_message_to_chat_fn(self.ptr, message);
+    }
+
+    fn flushCompactionQueue(self: InteractiveEventUi, will_retry: bool) !void {
+        try self.flush_compaction_queue_fn(self.ptr, will_retry);
+    }
+
+    fn requestRender(self: InteractiveEventUi) !void {
+        if (self.request_render_fn) |request_fn| try request_fn(self.ptr);
+    }
+
+    fn invalidateFooter(self: InteractiveEventUi) !void {
+        if (self.invalidate_footer_fn) |invalidate_fn| try invalidate_fn(self.ptr);
+    }
+
+    fn showError(self: InteractiveEventUi, message: []const u8) !void {
+        if (self.show_error_fn) |show_fn| try show_fn(self.ptr, message);
+    }
+
+    fn showStatus(self: InteractiveEventUi, message: []const u8) !void {
+        if (self.show_status_fn) |show_fn| try show_fn(self.ptr, message);
+    }
+
+    fn clearStatus(self: InteractiveEventUi) !void {
+        if (self.clear_status_fn) |clear_fn| try clear_fn(self.ptr);
+    }
+
+    fn setTerminalProgress(self: InteractiveEventUi, enabled: bool) !void {
+        if (self.set_terminal_progress_fn) |set_fn| try set_fn(self.ptr, enabled);
+    }
+};
+
+pub const InteractiveEventContext = struct {
+    ui: InteractiveEventUi,
+    show_terminal_progress: bool = false,
+};
+
+pub fn handleInteractiveModeEvent(
+    io: std.Io,
+    context: InteractiveEventContext,
+    event: session_events.SessionEvent,
+) !void {
+    switch (event) {
+        .compaction_end => |compaction_end| try handleCompactionEndEvent(io, context, compaction_end),
+        else => {},
+    }
+}
+
+pub fn handleCompactionEndEvent(
+    io: std.Io,
+    context: InteractiveEventContext,
+    event: session_events.CompactionEndSessionEvent,
+) !void {
+    if (context.show_terminal_progress) {
+        try context.ui.setTerminalProgress(false);
+    }
+    try context.ui.clearStatus();
+
+    if (event.aborted) {
+        if (event.reason == .manual) {
+            try context.ui.showError("Compaction cancelled");
+        } else {
+            try context.ui.showStatus("Auto-compaction cancelled");
+        }
+    } else if (event.result) |result| {
+        try context.ui.clearChat();
+        try context.ui.rebuildChatFromMessages();
+        try context.ui.addMessageToChat(.{ .compaction_summary = .{
+            .summary = result.summary,
+            .tokens_before = result.tokens_before,
+            .timestamp_ms = std.Io.Clock.real.now(io).toMilliseconds(),
+        } });
+        try context.ui.invalidateFooter();
+    } else if (event.error_message) |message| {
+        if (event.reason == .manual) {
+            try context.ui.showError(message);
+        } else {
+            try context.ui.showStatus(message);
+        }
+    }
+
+    try context.ui.flushCompactionQueue(event.will_retry);
+    try context.ui.requestRender();
 }
 
 pub const CloneSessionManagerView = struct {
@@ -766,6 +875,105 @@ fn freeMessageList(allocator: std.mem.Allocator, list: *std.ArrayList([]u8)) voi
     list.deinit(allocator);
 }
 
+const TestInteractiveEventUi = struct {
+    allocator: std.mem.Allocator,
+    clear_chat_count: usize = 0,
+    rebuild_chat_count: usize = 0,
+    footer_invalidate_count: usize = 0,
+    request_render_count: usize = 0,
+    clear_status_count: usize = 0,
+    terminal_progress_values: std.ArrayList(bool) = .empty,
+    flush_will_retry_values: std.ArrayList(bool) = .empty,
+    messages: std.ArrayList(messages_mod.CodingAgentMessage) = .empty,
+    errors: std.ArrayList([]u8) = .empty,
+    statuses: std.ArrayList([]u8) = .empty,
+
+    fn init(allocator: std.mem.Allocator) TestInteractiveEventUi {
+        return .{ .allocator = allocator };
+    }
+
+    fn deinit(self: *TestInteractiveEventUi) void {
+        self.terminal_progress_values.deinit(self.allocator);
+        self.flush_will_retry_values.deinit(self.allocator);
+        self.messages.deinit(self.allocator);
+        freeMessageList(self.allocator, &self.errors);
+        freeMessageList(self.allocator, &self.statuses);
+        self.* = undefined;
+    }
+
+    fn callbacks(self: *TestInteractiveEventUi) InteractiveEventUi {
+        return .{
+            .ptr = self,
+            .clear_chat_fn = clearChat,
+            .rebuild_chat_from_messages_fn = rebuildChatFromMessages,
+            .add_message_to_chat_fn = addMessageToChat,
+            .flush_compaction_queue_fn = flushCompactionQueue,
+            .request_render_fn = requestRender,
+            .invalidate_footer_fn = invalidateFooter,
+            .show_error_fn = showError,
+            .show_status_fn = showStatus,
+            .clear_status_fn = clearStatus,
+            .set_terminal_progress_fn = setTerminalProgress,
+        };
+    }
+
+    fn appendMessage(self: *TestInteractiveEventUi, list: *std.ArrayList([]u8), message: []const u8) !void {
+        const copy = try self.allocator.dupe(u8, message);
+        errdefer self.allocator.free(copy);
+        try list.append(self.allocator, copy);
+    }
+
+    fn clearChat(ptr: ?*anyopaque) !void {
+        const self: *TestInteractiveEventUi = @ptrCast(@alignCast(ptr.?));
+        self.clear_chat_count += 1;
+    }
+
+    fn rebuildChatFromMessages(ptr: ?*anyopaque) !void {
+        const self: *TestInteractiveEventUi = @ptrCast(@alignCast(ptr.?));
+        self.rebuild_chat_count += 1;
+    }
+
+    fn addMessageToChat(ptr: ?*anyopaque, message: messages_mod.CodingAgentMessage) !void {
+        const self: *TestInteractiveEventUi = @ptrCast(@alignCast(ptr.?));
+        try self.messages.append(self.allocator, message);
+    }
+
+    fn flushCompactionQueue(ptr: ?*anyopaque, will_retry: bool) !void {
+        const self: *TestInteractiveEventUi = @ptrCast(@alignCast(ptr.?));
+        try self.flush_will_retry_values.append(self.allocator, will_retry);
+    }
+
+    fn requestRender(ptr: ?*anyopaque) !void {
+        const self: *TestInteractiveEventUi = @ptrCast(@alignCast(ptr.?));
+        self.request_render_count += 1;
+    }
+
+    fn invalidateFooter(ptr: ?*anyopaque) !void {
+        const self: *TestInteractiveEventUi = @ptrCast(@alignCast(ptr.?));
+        self.footer_invalidate_count += 1;
+    }
+
+    fn showError(ptr: ?*anyopaque, message: []const u8) !void {
+        const self: *TestInteractiveEventUi = @ptrCast(@alignCast(ptr.?));
+        try self.appendMessage(&self.errors, message);
+    }
+
+    fn showStatus(ptr: ?*anyopaque, message: []const u8) !void {
+        const self: *TestInteractiveEventUi = @ptrCast(@alignCast(ptr.?));
+        try self.appendMessage(&self.statuses, message);
+    }
+
+    fn clearStatus(ptr: ?*anyopaque) !void {
+        const self: *TestInteractiveEventUi = @ptrCast(@alignCast(ptr.?));
+        self.clear_status_count += 1;
+    }
+
+    fn setTerminalProgress(ptr: ?*anyopaque, enabled: bool) !void {
+        const self: *TestInteractiveEventUi = @ptrCast(@alignCast(ptr.?));
+        try self.terminal_progress_values.append(self.allocator, enabled);
+    }
+};
+
 const TestAnthropicWarningRegistry = struct {
     api_key: ?[]const u8 = null,
     stored_auth_type: ?AnthropicWarningAuthType = null,
@@ -1122,6 +1330,39 @@ const TestImportRuntimeHost = struct {
         }
     }
 };
+
+// Ported from packages/coding-agent/test/interactive-mode-compaction.test.ts.
+test "InteractiveMode compaction events rebuilds chat and appends a synthetic summary at the bottom" {
+    const allocator = std.testing.allocator;
+    var ui = TestInteractiveEventUi.init(allocator);
+    defer ui.deinit();
+
+    try handleInteractiveModeEvent(std.testing.io, .{
+        .ui = ui.callbacks(),
+    }, .{ .compaction_end = .{
+        .reason = .manual,
+        .result = .{
+            .summary = "summary",
+            .first_kept_entry_id = "kept-entry",
+            .tokens_before = 123,
+        },
+        .aborted = false,
+        .will_retry = false,
+    } });
+
+    try std.testing.expectEqual(@as(usize, 1), ui.clear_chat_count);
+    try std.testing.expectEqual(@as(usize, 1), ui.rebuild_chat_count);
+    try std.testing.expectEqual(@as(usize, 1), ui.messages.items.len);
+    const summary = switch (ui.messages.items[0]) {
+        .compaction_summary => |message| message,
+        else => return error.ExpectedCompactionSummaryMessage,
+    };
+    try std.testing.expectEqualStrings("summary", summary.summary);
+    try std.testing.expectEqual(@as(u64, 123), summary.tokens_before);
+    try std.testing.expect(summary.timestamp_ms > 0);
+    try std.testing.expectEqual(@as(usize, 1), ui.flush_will_retry_values.items.len);
+    try std.testing.expectEqual(false, ui.flush_will_retry_values.items[0]);
+}
 
 // Ported from packages/coding-agent/test/interactive-mode-anthropic-warning.test.ts.
 test "InteractiveMode maybeWarnAboutAnthropicSubscriptionAuth warns once when subscription auth is detected" {
