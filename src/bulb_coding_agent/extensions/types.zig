@@ -578,7 +578,7 @@ pub const NewSessionOptions = struct {
 };
 
 pub const ForkOptions = struct {
-    position: ForkPosition = .at,
+    position: ForkPosition = .before,
     with_session: ?WithSessionCallback = null,
 };
 

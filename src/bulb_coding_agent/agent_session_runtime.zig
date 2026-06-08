@@ -10,6 +10,9 @@ const stale_session_message =
     "This extension ctx is stale after session replacement or reload. Do not use a captured Bulb ctx after session replacement or reload.";
 
 pub const RuntimeError = error{
+    FailedToCreateForkedSession,
+    InvalidForkEntry,
+    PersistedSessionMissingFile,
     ReplacedSessionContextUnavailable,
 };
 
@@ -46,6 +49,7 @@ pub const RuntimeSession = struct {
     get_session_manager_fn: *const fn (*anyopaque) *session_manager.SessionManager,
     get_extension_runner_fn: *const fn (*anyopaque) *extensions.ExtensionRunner,
     dispose_fn: *const fn (*anyopaque) void,
+    release_session_manager_fn: ?*const fn (*anyopaque) void = null,
     create_replaced_session_context_fn: ?*const fn (*anyopaque) extensions.ReplacedSessionContext = null,
     refresh_session_context_fn: ?*const fn (*anyopaque) anyerror!void = null,
 
@@ -63,6 +67,11 @@ pub const RuntimeSession = struct {
 
     pub fn dispose(self: RuntimeSession) void {
         self.dispose_fn(self.ptr);
+    }
+
+    pub fn releaseSessionManager(self: RuntimeSession) void {
+        const release_fn = self.release_session_manager_fn orelse return;
+        release_fn(self.ptr);
     }
 
     pub fn createReplacedSessionContext(self: RuntimeSession) !extensions.ReplacedSessionContext {
@@ -96,6 +105,11 @@ pub const BeforeSessionInvalidateCallback = struct {
 
 pub const SessionChangeResult = struct {
     cancelled: bool = false,
+    selected_text: ?[]u8 = null,
+
+    pub fn deinit(self: SessionChangeResult, allocator: std.mem.Allocator) void {
+        if (self.selected_text) |text| allocator.free(text);
+    }
 };
 
 pub const SwitchSessionOptions = struct {
@@ -236,6 +250,100 @@ pub const AgentSessionRuntime = struct {
         return .{};
     }
 
+    pub fn fork(
+        self: *AgentSessionRuntime,
+        entry_id: []const u8,
+        options: ?extensions.types.ForkOptions,
+    ) !SessionChangeResult {
+        const fork_options: extensions.types.ForkOptions = options orelse .{};
+        const before_result = try self.emitBeforeFork(entry_id, fork_options.position);
+        if (before_result.cancelled) return before_result;
+
+        const target = try self.resolveForkTarget(entry_id, fork_options.position);
+        defer if (target.target_leaf_id) |id| self.allocator.free(id);
+        errdefer if (target.selected_text) |text| self.allocator.free(text);
+
+        const previous_session_file = self.session.getSessionFile();
+        const agent_dir = try self.allocator.dupe(u8, self.services.agent_dir);
+        defer self.allocator.free(agent_dir);
+        const current_cwd = try self.allocator.dupe(u8, self.cwd());
+        defer self.allocator.free(current_cwd);
+
+        const current_manager = self.session.getSessionManager();
+        if (current_manager.isPersisted()) {
+            const current_session_file = self.session.getSessionFile() orelse return RuntimeError.PersistedSessionMissingFile;
+            const session_dir = try self.allocator.dupe(u8, current_manager.getSessionDir());
+            defer self.allocator.free(session_dir);
+
+            if (target.target_leaf_id == null) {
+                const new_manager = try self.boxSessionManager(try session_manager.SessionManager.create(
+                    self.allocator,
+                    self.io,
+                    current_cwd,
+                    session_dir,
+                    .{ .parent_session = current_session_file },
+                ));
+                var manager_owned = true;
+                errdefer if (manager_owned) destroySessionManager(self.allocator, new_manager);
+
+                try self.teardownCurrent(.fork, new_manager.getSessionFile());
+                const result = try self.create_runtime.call(self.allocator, self.io, .{
+                    .cwd = new_manager.getCwd(),
+                    .agent_dir = agent_dir,
+                    .session_manager = new_manager,
+                    .session_start_event = .{ .reason = .fork, .previous_session_file = previous_session_file },
+                });
+                manager_owned = false;
+                self.apply(result);
+
+                try self.finishSessionReplacement(fork_options.with_session);
+                return .{ .selected_text = target.selected_text };
+            }
+
+            const opened_manager = try self.boxSessionManager(try session_manager.SessionManager.open(
+                self.allocator,
+                self.io,
+                current_session_file,
+                .{ .session_dir = session_dir },
+            ));
+            var manager_owned = true;
+            errdefer if (manager_owned) destroySessionManager(self.allocator, opened_manager);
+
+            const forked_session_path = try opened_manager.createBranchedSession(self.io, target.target_leaf_id.?);
+            if (forked_session_path == null) return RuntimeError.FailedToCreateForkedSession;
+
+            try self.teardownCurrent(.fork, opened_manager.getSessionFile());
+            const result = try self.create_runtime.call(self.allocator, self.io, .{
+                .cwd = opened_manager.getCwd(),
+                .agent_dir = agent_dir,
+                .session_manager = opened_manager,
+                .session_start_event = .{ .reason = .fork, .previous_session_file = previous_session_file },
+            });
+            manager_owned = false;
+            self.apply(result);
+
+            try self.finishSessionReplacement(fork_options.with_session);
+            return .{ .selected_text = target.selected_text };
+        }
+
+        if (target.target_leaf_id) |target_leaf_id| {
+            _ = try current_manager.createBranchedSession(self.io, target_leaf_id);
+        } else {
+            _ = try current_manager.newSession(self.io, .{ .parent_session = self.session.getSessionFile() });
+        }
+        try self.teardownCurrentTransferringManager(.fork, current_manager.getSessionFile());
+        const result = try self.create_runtime.call(self.allocator, self.io, .{
+            .cwd = current_manager.getCwd(),
+            .agent_dir = agent_dir,
+            .session_manager = current_manager,
+            .session_start_event = .{ .reason = .fork, .previous_session_file = previous_session_file },
+        });
+        self.apply(result);
+
+        try self.finishSessionReplacement(fork_options.with_session);
+        return .{ .selected_text = target.selected_text };
+    }
+
     pub fn dispose(self: *AgentSessionRuntime) !void {
         if (!self.active) return;
         try self.teardownCurrent(.quit, null);
@@ -256,10 +364,46 @@ pub const AgentSessionRuntime = struct {
         return .{ .cancelled = if (result) |value| value.cancel else false };
     }
 
+    fn emitBeforeFork(
+        self: *AgentSessionRuntime,
+        entry_id: []const u8,
+        position: extensions.types.ForkPosition,
+    ) !SessionChangeResult {
+        const runner = self.session.getExtensionRunner();
+        if (!runner.hasHandlers(.session_before_fork)) return .{};
+
+        const result = try runner.emitSessionBeforeFork(.{
+            .entry_id = entry_id,
+            .position = position,
+        });
+        return .{ .cancelled = if (result) |value| value.cancel else false };
+    }
+
     fn teardownCurrent(
         self: *AgentSessionRuntime,
         reason: extensions.types.SessionShutdownReason,
         target_session_file: ?[]const u8,
+    ) !void {
+        try self.teardownCurrentWithOptions(reason, target_session_file, .{});
+    }
+
+    fn teardownCurrentTransferringManager(
+        self: *AgentSessionRuntime,
+        reason: extensions.types.SessionShutdownReason,
+        target_session_file: ?[]const u8,
+    ) !void {
+        try self.teardownCurrentWithOptions(reason, target_session_file, .{ .release_session_manager = true });
+    }
+
+    const TeardownOptions = struct {
+        release_session_manager: bool = false,
+    };
+
+    fn teardownCurrentWithOptions(
+        self: *AgentSessionRuntime,
+        reason: extensions.types.SessionShutdownReason,
+        target_session_file: ?[]const u8,
+        options: TeardownOptions,
     ) !void {
         if (!self.active) return;
         const runner = self.session.getExtensionRunner();
@@ -270,6 +414,7 @@ pub const AgentSessionRuntime = struct {
             } } });
         }
         if (self.before_session_invalidate) |callback| try callback.call();
+        if (options.release_session_manager) self.session.releaseSessionManager();
         self.session.dispose();
         destroyServices(self.allocator, self.services);
         self.active = false;
@@ -301,6 +446,36 @@ pub const AgentSessionRuntime = struct {
         boxed.* = manager;
         return boxed;
     }
+
+    const ForkTarget = struct {
+        target_leaf_id: ?[]const u8 = null,
+        selected_text: ?[]u8 = null,
+    };
+
+    fn resolveForkTarget(
+        self: *AgentSessionRuntime,
+        entry_id: []const u8,
+        position: extensions.types.ForkPosition,
+    ) !ForkTarget {
+        const selected_entry = self.session.getSessionManager().getEntry(entry_id) orelse return RuntimeError.InvalidForkEntry;
+        const selected_entry_id = selected_entry.id orelse return RuntimeError.InvalidForkEntry;
+
+        switch (position) {
+            .at => return .{
+                .target_leaf_id = try self.allocator.dupe(u8, selected_entry_id),
+            },
+            .before => {
+                const selected_text = try extractUserMessageTextAlloc(self.allocator, selected_entry.raw_json) orelse
+                    return RuntimeError.InvalidForkEntry;
+                errdefer self.allocator.free(selected_text);
+                const target_leaf_id = try session_manager.entryStringFieldAlloc(self.allocator, selected_entry.raw_json, "parentId");
+                return .{
+                    .target_leaf_id = target_leaf_id,
+                    .selected_text = selected_text,
+                };
+            },
+        }
+    }
 };
 
 pub fn createAgentSessionRuntime(
@@ -324,9 +499,44 @@ fn destroySessionManager(allocator: std.mem.Allocator, manager: *session_manager
     allocator.destroy(manager);
 }
 
+fn extractUserMessageTextAlloc(allocator: std.mem.Allocator, raw_json: []const u8) !?[]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw_json, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return null,
+    };
+    defer parsed.deinit();
+
+    if (parsed.value != .object) return null;
+    const message_value = parsed.value.object.get("message") orelse return null;
+    if (message_value != .object) return null;
+    const message_object = message_value.object;
+    const role_value = message_object.get("role") orelse return null;
+    if (role_value != .string or !std.mem.eql(u8, role_value.string, "user")) return null;
+    const content_value = message_object.get("content") orelse return try allocator.dupe(u8, "");
+
+    switch (content_value) {
+        .string => |text| return try allocator.dupe(u8, text),
+        .array => |array| {
+            var joined: std.ArrayList(u8) = .empty;
+            errdefer joined.deinit(allocator);
+            for (array.items) |block| {
+                if (block != .object) continue;
+                const block_object = block.object;
+                const block_type = block_object.get("type") orelse continue;
+                if (block_type != .string or !std.mem.eql(u8, block_type.string, "text")) continue;
+                const text_value = block_object.get("text") orelse continue;
+                if (text_value != .string) continue;
+                try joined.appendSlice(allocator, text_value.string);
+            }
+            return try joined.toOwnedSlice(allocator);
+        },
+        else => return null,
+    }
+}
+
 const TestSession = struct {
     allocator: std.mem.Allocator,
-    manager: *session_manager.SessionManager,
+    manager: ?*session_manager.SessionManager,
     runtime: *extensions.loader.ExtensionRuntimeController,
     runner: *extensions.ExtensionRunner,
     disposed: bool = false,
@@ -369,7 +579,7 @@ const TestSession = struct {
         self.allocator.destroy(self.runner);
         self.runtime.deinit();
         self.allocator.destroy(self.runtime);
-        destroySessionManager(self.allocator, self.manager);
+        if (self.manager) |manager| destroySessionManager(self.allocator, manager);
         self.allocator.destroy(self);
     }
 
@@ -380,18 +590,19 @@ const TestSession = struct {
             .get_session_manager_fn = getSessionManager,
             .get_extension_runner_fn = getExtensionRunner,
             .dispose_fn = dispose,
+            .release_session_manager_fn = releaseSessionManager,
             .create_replaced_session_context_fn = createReplacedSessionContext,
         };
     }
 
     fn getSessionFile(ptr: *anyopaque) ?[]const u8 {
         const self: *TestSession = @ptrCast(@alignCast(ptr));
-        return self.manager.getSessionFile();
+        return self.manager.?.getSessionFile();
     }
 
     fn getSessionManager(ptr: *anyopaque) *session_manager.SessionManager {
         const self: *TestSession = @ptrCast(@alignCast(ptr));
-        return self.manager;
+        return self.manager.?;
     }
 
     fn getExtensionRunner(ptr: *anyopaque) *extensions.ExtensionRunner {
@@ -403,6 +614,11 @@ const TestSession = struct {
         const self: *TestSession = @ptrCast(@alignCast(ptr));
         self.runner.invalidate(stale_session_message);
         self.disposed = true;
+    }
+
+    fn releaseSessionManager(ptr: *anyopaque) void {
+        const self: *TestSession = @ptrCast(@alignCast(ptr));
+        self.manager = null;
     }
 
     fn createReplacedSessionContext(ptr: *anyopaque) extensions.ReplacedSessionContext {
@@ -500,6 +716,7 @@ const EventRecorder = struct {
     json_arena: std.heap.ArenaAllocator,
     events: std.ArrayList(RecordedEvent) = .empty,
     cancel_next_switch: bool = false,
+    cancel_next_fork: bool = false,
 
     fn init(allocator: std.mem.Allocator) EventRecorder {
         return .{
@@ -551,6 +768,12 @@ const EventRecorder = struct {
                         .entry_id = try optionalDupe(self.allocator, event.entry_id),
                         .position = event.position.text(),
                     });
+                    if (self.cancel_next_fork) {
+                        self.cancel_next_fork = false;
+                        var object = std.json.Value{ .object = .empty };
+                        try object.object.put(self.json_arena.allocator(), "cancel", .{ .bool = true });
+                        return object;
+                    }
                 },
                 .shutdown => |event| {
                     try self.events.append(self.allocator, .{
@@ -858,4 +1081,130 @@ test "AgentSessionRuntime runs invalidation before rebind" {
     try std.testing.expectEqualStrings("beforeSessionInvalidate", phases.phases.items[1]);
     try std.testing.expectEqualStrings("rebindSession", phases.phases.items[2]);
     try std.testing.expectError(error.ExtensionContextStale, old_session.getExtensionRunner().assertActive());
+}
+
+test "AgentSessionRuntime emits fork lifecycle events and honors cancellation" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try tempDirPathAlloc(allocator, &tmp);
+    defer allocator.free(cwd);
+    const agent_dir = try std.fs.path.join(allocator, &.{ cwd, "agent" });
+    defer allocator.free(agent_dir);
+    const session_dir = try std.fs.path.join(allocator, &.{ cwd, "sessions" });
+    defer allocator.free(session_dir);
+
+    var recorder = EventRecorder.init(allocator);
+    defer recorder.deinit();
+    const handlers = [_]extensions.ExtensionHandler{
+        .{ .ptr = &recorder, .event_name = .session_start, .handler_fn = EventRecorder.handler },
+        .{ .ptr = &recorder, .event_name = .session_before_fork, .handler_fn = EventRecorder.handler },
+        .{ .ptr = &recorder, .event_name = .session_shutdown, .handler_fn = EventRecorder.handler },
+    };
+    const extension_list = [_]extensions.Extension{testExtension("/tmp/runtime-fork-events.zig", &handlers)};
+    var harness = try RuntimeHarness.init(allocator, io, cwd, &extension_list);
+    defer harness.deinit();
+
+    const initial_manager = try createBoxedSessionManager(allocator, io, cwd, session_dir);
+    const user_id = try initial_manager.appendMessageJson(io, "{\"role\":\"user\",\"content\":\"hello\",\"timestamp\":1}");
+    _ = try initial_manager.appendMessageJson(io, "{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"ok\"}],\"timestamp\":2}");
+    var runtime = try createAgentSessionRuntime(
+        allocator,
+        io,
+        harness.factory(),
+        .{
+            .cwd = cwd,
+            .agent_dir = agent_dir,
+            .session_manager = initial_manager,
+            .session_start_event = .{ .reason = .startup },
+        },
+    );
+    defer runtime.dispose() catch {};
+
+    try std.testing.expectEqual(@as(usize, 1), recorder.events.items.len);
+    try expectRecordedEvent(recorder.events.items[0], "session_start", "startup");
+    const previous_session_file = runtime.session.getSessionFile().?;
+    recorder.deinit();
+    recorder = EventRecorder.init(allocator);
+
+    const success_result = try runtime.fork(user_id, null);
+    defer success_result.deinit(allocator);
+    try std.testing.expect(!success_result.cancelled);
+    try std.testing.expectEqualStrings("hello", success_result.selected_text.?);
+    try std.testing.expectEqual(@as(usize, 3), recorder.events.items.len);
+    try expectRecordedEvent(recorder.events.items[0], "session_before_fork", "fork");
+    try std.testing.expectEqualStrings(user_id, recorder.events.items[0].entry_id.?);
+    try std.testing.expectEqualStrings("before", recorder.events.items[0].position.?);
+    try expectRecordedEvent(recorder.events.items[1], "session_shutdown", "fork");
+    try std.testing.expectEqualStrings(runtime.session.getSessionFile().?, recorder.events.items[1].target_session_file.?);
+    try expectRecordedEvent(recorder.events.items[2], "session_start", "fork");
+    try std.testing.expectEqualStrings(previous_session_file, recorder.events.items[2].previous_session_file.?);
+
+    recorder.deinit();
+    recorder = EventRecorder.init(allocator);
+    recorder.cancel_next_fork = true;
+
+    const cancel_result = try runtime.fork(user_id, null);
+    try std.testing.expect(cancel_result.cancelled);
+    try std.testing.expectEqual(@as(usize, 1), recorder.events.items.len);
+    try expectRecordedEvent(recorder.events.items[0], "session_before_fork", "fork");
+    try std.testing.expectEqualStrings(user_id, recorder.events.items[0].entry_id.?);
+    try std.testing.expectEqualStrings("before", recorder.events.items[0].position.?);
+
+    recorder.deinit();
+    recorder = EventRecorder.init(allocator);
+    recorder.cancel_next_fork = true;
+
+    const cancel_missing_result = try runtime.fork("missing-entry", .{ .position = .at });
+    try std.testing.expect(cancel_missing_result.cancelled);
+    try std.testing.expectEqual(@as(usize, 1), recorder.events.items.len);
+    try expectRecordedEvent(recorder.events.items[0], "session_before_fork", "fork");
+    try std.testing.expectEqualStrings("missing-entry", recorder.events.items[0].entry_id.?);
+    try std.testing.expectEqualStrings("at", recorder.events.items[0].position.?);
+}
+
+test "AgentSessionRuntime forks in-memory sessions and returns selected text" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try tempDirPathAlloc(allocator, &tmp);
+    defer allocator.free(cwd);
+    const agent_dir = try std.fs.path.join(allocator, &.{ cwd, "agent" });
+    defer allocator.free(agent_dir);
+
+    var harness = try RuntimeHarness.init(allocator, io, cwd, &.{});
+    defer harness.deinit();
+
+    const initial_manager = try allocator.create(session_manager.SessionManager);
+    initial_manager.* = try session_manager.SessionManager.inMemory(allocator, io, cwd);
+    const user_id = try initial_manager.appendMessageJson(
+        io,
+        "{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"one\"},{\"type\":\"image\",\"source\":\"ignored\"},{\"type\":\"text\",\"text\":\"two\"}],\"timestamp\":1}",
+    );
+    _ = try initial_manager.appendMessageJson(io, "{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"ok\"}],\"timestamp\":2}");
+
+    var runtime = try createAgentSessionRuntime(
+        allocator,
+        io,
+        harness.factory(),
+        .{
+            .cwd = cwd,
+            .agent_dir = agent_dir,
+            .session_manager = initial_manager,
+        },
+    );
+    defer runtime.dispose() catch {};
+
+    try std.testing.expectEqual(@as(?[]const u8, null), runtime.session.getSessionFile());
+    const result = try runtime.fork(user_id, null);
+    defer result.deinit(allocator);
+
+    try std.testing.expect(!result.cancelled);
+    try std.testing.expectEqualStrings("onetwo", result.selected_text.?);
+    try std.testing.expectEqual(@as(?[]const u8, null), runtime.session.getSessionFile());
+    try std.testing.expectEqual(@as(usize, 0), runtime.session.getSessionManager().getEntries().len);
 }
