@@ -526,11 +526,65 @@ const QueuedSessionMessage = struct {
     message: messages.CodingAgentMessage,
 };
 
+pub const CompactionAuthMode = enum {
+    require_api_key,
+    optional,
+};
+
+pub const ResolvedCompactionRequestOptions = struct {
+    options: compaction_mod.SummaryRequestOptions,
+    owned_auth: ?model_registry.RequestAuth = null,
+
+    pub fn deinit(self: *ResolvedCompactionRequestOptions, allocator: std.mem.Allocator) void {
+        if (self.owned_auth) |*auth| auth.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+pub const CompactionRequestAuthResolver = struct {
+    registry: *model_registry.ModelRegistry,
+    mode: CompactionAuthMode = .require_api_key,
+
+    pub fn resolveAlloc(
+        self: CompactionRequestAuthResolver,
+        allocator: std.mem.Allocator,
+        model: ai.Model,
+        base_options: compaction_mod.SummaryRequestOptions,
+    ) !?ResolvedCompactionRequestOptions {
+        const result = try self.registry.getApiKeyAndHeadersAlloc(allocator, &model);
+        switch (result) {
+            .failure => |message| {
+                allocator.free(message);
+                if (self.mode == .optional) {
+                    return .{ .options = base_options };
+                }
+                return null;
+            },
+            .ok => |request_auth_value| {
+                var request_auth = request_auth_value;
+                if (self.mode == .require_api_key and request_auth.api_key == null) {
+                    request_auth.deinit(allocator);
+                    return null;
+                }
+
+                var options = base_options;
+                options.api_key = request_auth.api_key;
+                options.headers = request_auth.headers;
+                return .{
+                    .options = options,
+                    .owned_auth = request_auth,
+                };
+            },
+        }
+    }
+};
+
 pub const AutoCompactionConfig = struct {
     model: ai.Model,
     executor: compaction_mod.SummaryExecutor,
     settings: compaction_mod.CompactionSettings = compaction_mod.default_compaction_settings,
     request_options: compaction_mod.SummaryRequestOptions = .{},
+    auth_resolver: ?CompactionRequestAuthResolver = null,
 };
 
 pub const AgentSessionReplay = struct {
@@ -876,6 +930,27 @@ pub const AgentSessionReplay = struct {
             return false;
         };
 
+        var resolved_request_options: ?ResolvedCompactionRequestOptions = null;
+        defer {
+            if (resolved_request_options) |*resolved| resolved.deinit(self.allocator);
+        }
+        var request_options = config.request_options;
+        if (config.auth_resolver) |resolver| {
+            resolved_request_options = try resolver.resolveAlloc(self.allocator, config.model, config.request_options);
+            if (resolved_request_options) |resolved| {
+                request_options = resolved.options;
+            } else {
+                self.bridge.handleCompactionStart(reason);
+                self.bridge.handleCompactionEnd(.{
+                    .reason = reason,
+                    .result = null,
+                    .aborted = false,
+                    .will_retry = false,
+                });
+                return false;
+            }
+        }
+
         const branch_entries = try self.sessions.getBranchAlloc(self.allocator, null);
         defer self.allocator.free(branch_entries);
         var preparation = (try compaction_mod.prepareCompaction(self.allocator, branch_entries, config.settings)) orelse {
@@ -894,7 +969,7 @@ pub const AgentSessionReplay = struct {
             io,
             &preparation,
             config.model,
-            config.request_options,
+            request_options,
             config.executor,
             reason,
             will_retry,
@@ -3430,6 +3505,183 @@ test "AgentSession replay auto-compaction returns true when queued messages shou
     try std.testing.expectEqualSlices(CompactionEventObservation, &expected_events, public_events.items[public_events.items.len - 2 ..]);
 }
 
+test "AgentSession replay auto-compaction resolves registry auth for built-in summary streams" {
+    const allocator = std.testing.allocator;
+    var harness = try TestHarness.init(allocator);
+    defer harness.deinit();
+    try harness.storage.setApiKey("openai", "stored-key");
+
+    var runner = extensions.ExtensionRunner.init(
+        allocator,
+        &.{},
+        harness.runtime,
+        "/tmp",
+        harness.sessions,
+        harness.registry,
+    );
+    defer runner.deinit();
+
+    var bridge = SessionEventBridge.init(allocator);
+    defer bridge.deinit();
+    var public_events: std.ArrayList(CompactionEventObservation) = .empty;
+    defer public_events.deinit(allocator);
+    var observer = CompactionEventObserver{ .allocator = allocator, .events = &public_events };
+    try bridge.subscribe(.{ .ptr = &observer, .call_fn = CompactionEventObserver.publicListener });
+
+    const assistant_content = [_]ai.AssistantContent{.{ .text = .{ .text = "reply" } }};
+    const responses = [_]ai.AssistantMessage{assistantUsageMessage(&assistant_content, .stop, 20_000, 200)};
+    var replay = AgentSessionReplay.init(
+        allocator,
+        &bridge,
+        &runner,
+        harness.sessions,
+        AutoRetryController.init(.{ .enabled = false }, null),
+        &.{},
+    );
+    defer replay.deinit();
+    replay.setResponses(&responses);
+    try replay.prompt(std.testing.io, "message to compact", 100);
+
+    const model_headers = [_]ai.Header{.{ .name = "X-Bulb-Test", .value = "from-model" }};
+    var model = sessionCompactionModel();
+    model.headers = &model_headers;
+    var summary_state = GeneratedSummaryState{
+        .summary = "registry-auth summary",
+        .expected_api_key = "stored-key",
+        .expected_header_name = "X-Bulb-Test",
+        .expected_header_value = "from-model",
+    };
+    replay.setAutoCompaction(.{
+        .model = model,
+        .executor = summary_state.executor(),
+        .settings = .{ .reserve_tokens = 1_000, .keep_recent_tokens = 1 },
+        .auth_resolver = .{ .registry = harness.registry, .mode = .require_api_key },
+    });
+
+    try std.testing.expect(!try replay.runAutoCompaction(std.testing.io, .threshold, false));
+    try std.testing.expectEqual(@as(usize, 1), summary_state.calls);
+    try std.testing.expect(summary_state.saw_expected_api_key);
+    try std.testing.expect(summary_state.saw_expected_header);
+    try expectEntryType(harness.sessions.getEntries()[2], "compaction");
+
+    const expected_events = [_]CompactionEventObservation{
+        .{ .event = .start, .reason = .threshold },
+        .{ .event = .end, .reason = .threshold, .aborted = false, .will_retry = false, .summary = .other },
+    };
+    try std.testing.expectEqualSlices(CompactionEventObservation, &expected_events, public_events.items);
+}
+
+test "AgentSession replay auto-compaction skips built-in summary when auth is missing" {
+    const allocator = std.testing.allocator;
+    var harness = try TestHarness.init(allocator);
+    defer harness.deinit();
+
+    var runner = extensions.ExtensionRunner.init(
+        allocator,
+        &.{},
+        harness.runtime,
+        "/tmp",
+        harness.sessions,
+        harness.registry,
+    );
+    defer runner.deinit();
+
+    var bridge = SessionEventBridge.init(allocator);
+    defer bridge.deinit();
+    var public_events: std.ArrayList(CompactionEventObservation) = .empty;
+    defer public_events.deinit(allocator);
+    var observer = CompactionEventObserver{ .allocator = allocator, .events = &public_events };
+    try bridge.subscribe(.{ .ptr = &observer, .call_fn = CompactionEventObserver.publicListener });
+
+    const assistant_content = [_]ai.AssistantContent{.{ .text = .{ .text = "reply" } }};
+    const responses = [_]ai.AssistantMessage{assistantUsageMessage(&assistant_content, .stop, 20_000, 200)};
+    var replay = AgentSessionReplay.init(
+        allocator,
+        &bridge,
+        &runner,
+        harness.sessions,
+        AutoRetryController.init(.{ .enabled = false }, null),
+        &.{},
+    );
+    defer replay.deinit();
+    replay.setResponses(&responses);
+    try replay.prompt(std.testing.io, "message to compact", 100);
+
+    var summary_state = GeneratedSummaryState{ .summary = "should not run" };
+    replay.setAutoCompaction(.{
+        .model = sessionCompactionModel(),
+        .executor = summary_state.executor(),
+        .settings = .{ .reserve_tokens = 1_000, .keep_recent_tokens = 1 },
+        .auth_resolver = .{ .registry = harness.registry, .mode = .require_api_key },
+    });
+
+    try std.testing.expect(!try replay.runAutoCompaction(std.testing.io, .threshold, false));
+    try std.testing.expectEqual(@as(usize, 0), summary_state.calls);
+    try std.testing.expectEqual(@as(usize, 2), harness.sessions.getEntries().len);
+
+    const expected_events = [_]CompactionEventObservation{
+        .{ .event = .start, .reason = .threshold },
+        .{ .event = .end, .reason = .threshold, .aborted = false, .will_retry = false },
+    };
+    try std.testing.expectEqualSlices(CompactionEventObservation, &expected_events, public_events.items);
+}
+
+test "AgentSession replay auto-compaction allows injected summaries without auth" {
+    const allocator = std.testing.allocator;
+    var harness = try TestHarness.init(allocator);
+    defer harness.deinit();
+
+    var runner = extensions.ExtensionRunner.init(
+        allocator,
+        &.{},
+        harness.runtime,
+        "/tmp",
+        harness.sessions,
+        harness.registry,
+    );
+    defer runner.deinit();
+
+    var bridge = SessionEventBridge.init(allocator);
+    defer bridge.deinit();
+    var public_events: std.ArrayList(CompactionEventObservation) = .empty;
+    defer public_events.deinit(allocator);
+    var observer = CompactionEventObserver{ .allocator = allocator, .events = &public_events };
+    try bridge.subscribe(.{ .ptr = &observer, .call_fn = CompactionEventObserver.publicListener });
+
+    const assistant_content = [_]ai.AssistantContent{.{ .text = .{ .text = "reply" } }};
+    const responses = [_]ai.AssistantMessage{assistantUsageMessage(&assistant_content, .stop, 20_000, 200)};
+    var replay = AgentSessionReplay.init(
+        allocator,
+        &bridge,
+        &runner,
+        harness.sessions,
+        AutoRetryController.init(.{ .enabled = false }, null),
+        &.{},
+    );
+    defer replay.deinit();
+    replay.setResponses(&responses);
+    try replay.prompt(std.testing.io, "message to compact", 100);
+
+    var summary_state = GeneratedSummaryState{ .summary = "optional-auth summary" };
+    replay.setAutoCompaction(.{
+        .model = sessionCompactionModel(),
+        .executor = summary_state.executor(),
+        .settings = .{ .reserve_tokens = 1_000, .keep_recent_tokens = 1 },
+        .auth_resolver = .{ .registry = harness.registry, .mode = .optional },
+    });
+
+    try std.testing.expect(!try replay.runAutoCompaction(std.testing.io, .threshold, false));
+    try std.testing.expectEqual(@as(usize, 1), summary_state.calls);
+    try std.testing.expect(summary_state.seen_api_key == null);
+    try expectEntryType(harness.sessions.getEntries()[2], "compaction");
+
+    const expected_events = [_]CompactionEventObservation{
+        .{ .event = .start, .reason = .threshold },
+        .{ .event = .end, .reason = .threshold, .aborted = false, .will_retry = false, .summary = .other },
+    };
+    try std.testing.expectEqualSlices(CompactionEventObservation, &expected_events, public_events.items);
+}
+
 test "AgentSession replay auto-compaction ignores stale pre-compaction assistant usage" {
     const allocator = std.testing.allocator;
     var harness = try TestHarness.init(allocator);
@@ -4194,6 +4446,11 @@ const GeneratedSummaryState = struct {
     calls: usize = 0,
     seen_max_tokens: ?u64 = null,
     seen_api_key: ?[]const u8 = null,
+    expected_api_key: ?[]const u8 = null,
+    saw_expected_api_key: bool = false,
+    expected_header_name: ?[]const u8 = null,
+    expected_header_value: ?[]const u8 = null,
+    saw_expected_header: bool = false,
     content: [1]ai.AssistantContent = undefined,
 
     fn executor(self: *@This()) compaction_mod.SummaryExecutor {
@@ -4211,6 +4468,19 @@ const GeneratedSummaryState = struct {
         state.calls += 1;
         state.seen_max_tokens = options.base.max_tokens;
         state.seen_api_key = options.base.api_key;
+        if (state.expected_api_key) |expected| {
+            state.saw_expected_api_key = if (options.base.api_key) |actual|
+                std.mem.eql(u8, actual, expected)
+            else
+                false;
+        }
+        if (state.expected_header_name) |name| {
+            const expected_value = state.expected_header_value orelse "";
+            state.saw_expected_header = if (findAiHeader(options.base.headers, name)) |actual|
+                std.mem.eql(u8, actual, expected_value)
+            else
+                false;
+        }
         state.content[0] = .{ .text = .{ .text = state.summary } };
         return .{
             .content = state.content[0..],
@@ -4221,6 +4491,15 @@ const GeneratedSummaryState = struct {
         };
     }
 };
+
+fn findAiHeader(headers: []const ai.Header, name: []const u8) ?[]const u8 {
+    var index = headers.len;
+    while (index > 0) {
+        index -= 1;
+        if (std.ascii.eqlIgnoreCase(headers[index].name, name)) return headers[index].value;
+    }
+    return null;
+}
 
 const CompactExtensionState = struct {
     allocator: std.mem.Allocator,
