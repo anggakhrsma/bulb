@@ -526,6 +526,13 @@ const QueuedSessionMessage = struct {
     message: messages.CodingAgentMessage,
 };
 
+pub const AutoCompactionConfig = struct {
+    model: ai.Model,
+    executor: compaction_mod.SummaryExecutor,
+    settings: compaction_mod.CompactionSettings = compaction_mod.default_compaction_settings,
+    request_options: compaction_mod.SummaryRequestOptions = .{},
+};
+
 pub const AgentSessionReplay = struct {
     allocator: std.mem.Allocator,
     bridge: *SessionEventBridge,
@@ -538,6 +545,8 @@ pub const AgentSessionReplay = struct {
     messages: std.ArrayList(messages.CodingAgentMessage) = .empty,
     owned_texts: std.ArrayList([]u8) = .empty,
     owned_content: std.ArrayList([]ai.UserContent) = .empty,
+    owned_assistant_content: std.ArrayList([]ai.AssistantContent) = .empty,
+    owned_diagnostics: std.ArrayList([]ai.AssistantMessageDiagnostic) = .empty,
     owned_details: std.ArrayList([]u8) = .empty,
     steering_messages: std.ArrayList(QueuedSessionMessage) = .empty,
     follow_up_messages: std.ArrayList(QueuedSessionMessage) = .empty,
@@ -546,6 +555,8 @@ pub const AgentSessionReplay = struct {
     steering_mode: QueueMode = .one_at_a_time,
     follow_up_mode: QueueMode = .one_at_a_time,
     is_streaming: bool = false,
+    auto_compaction: ?AutoCompactionConfig = null,
+    overflow_recovery_attempted: bool = false,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -570,6 +581,10 @@ pub const AgentSessionReplay = struct {
         self.owned_texts.deinit(self.allocator);
         for (self.owned_content.items) |content| self.allocator.free(content);
         self.owned_content.deinit(self.allocator);
+        for (self.owned_assistant_content.items) |content| self.allocator.free(content);
+        self.owned_assistant_content.deinit(self.allocator);
+        for (self.owned_diagnostics.items) |diagnostics| self.allocator.free(diagnostics);
+        self.owned_diagnostics.deinit(self.allocator);
         for (self.owned_details.items) |details| self.allocator.free(details);
         self.owned_details.deinit(self.allocator);
         self.steering_messages.deinit(self.allocator);
@@ -585,12 +600,22 @@ pub const AgentSessionReplay = struct {
         self.next_response = 0;
     }
 
+    pub fn setAutoCompaction(self: *AgentSessionReplay, config: ?AutoCompactionConfig) void {
+        self.auto_compaction = config;
+    }
+
     pub fn pendingResponseCount(self: *const AgentSessionReplay) usize {
         return self.responses.len - self.next_response;
     }
 
     pub fn pendingMessageCount(self: *const AgentSessionReplay) usize {
         return self.steering_messages.items.len + self.follow_up_messages.items.len;
+    }
+
+    pub fn hasQueuedMessages(self: *const AgentSessionReplay) bool {
+        return self.steering_messages.items.len > 0 or
+            self.follow_up_messages.items.len > 0 or
+            self.next_turn_messages.items.len > 0;
     }
 
     pub fn isRetrying(self: *const AgentSessionReplay) bool {
@@ -780,6 +805,108 @@ pub const AgentSessionReplay = struct {
         );
     }
 
+    pub fn checkAutoCompaction(
+        self: *AgentSessionReplay,
+        io: std.Io,
+        assistant_message: ai.AssistantMessage,
+        skip_aborted_check: bool,
+    ) !bool {
+        const config = self.auto_compaction orelse return false;
+        if (!config.settings.enabled) return false;
+        if (skip_aborted_check and assistant_message.stop_reason == .aborted) return false;
+
+        const branch_entries = try self.sessions.getBranchAlloc(self.allocator, null);
+        defer self.allocator.free(branch_entries);
+        const compaction_boundary_ms = try latestCompactionTimestampMsAlloc(self.allocator, branch_entries);
+        if (compaction_boundary_ms) |boundary_ms| {
+            if (assistant_message.timestamp_ms <= boundary_ms) return false;
+        }
+
+        const same_model = std.mem.eql(u8, assistant_message.provider, config.model.provider) and
+            std.mem.eql(u8, assistant_message.model, config.model.id);
+        if (same_model and ai.overflow.isContextOverflow(assistant_message, config.model.context_window)) {
+            if (self.overflow_recovery_attempted) {
+                self.bridge.handleCompactionEnd(.{
+                    .reason = .overflow,
+                    .result = null,
+                    .aborted = false,
+                    .will_retry = false,
+                    .error_message = "Context overflow recovery failed after one compact-and-retry attempt. Try reducing context or switching to a larger-context model.",
+                });
+                return false;
+            }
+
+            self.overflow_recovery_attempted = true;
+            self.removeTrailingAssistantError();
+            return try self.runAutoCompaction(io, .overflow, true);
+        }
+
+        const context_tokens = if (assistant_message.stop_reason == .@"error") context_tokens: {
+            const estimate = compaction_mod.estimateContextTokens(self.messages.items);
+            const usage_index = estimate.last_usage_index orelse return false;
+            if (compaction_boundary_ms) |boundary_ms| {
+                const usage_message = self.messages.items[usage_index];
+                if (usage_message == .assistant and usage_message.assistant.timestamp_ms <= boundary_ms) {
+                    return false;
+                }
+            }
+            break :context_tokens estimate.tokens;
+        } else compaction_mod.calculateContextTokens(assistant_message.usage);
+
+        if (compaction_mod.shouldCompact(context_tokens, config.model.context_window, config.settings)) {
+            return try self.runAutoCompaction(io, .threshold, false);
+        }
+        return false;
+    }
+
+    pub fn runAutoCompaction(
+        self: *AgentSessionReplay,
+        io: std.Io,
+        reason: CompactionReason,
+        will_retry: bool,
+    ) !bool {
+        const config = self.auto_compaction orelse {
+            self.bridge.handleCompactionStart(reason);
+            self.bridge.handleCompactionEnd(.{
+                .reason = reason,
+                .result = null,
+                .aborted = false,
+                .will_retry = false,
+            });
+            return false;
+        };
+
+        const branch_entries = try self.sessions.getBranchAlloc(self.allocator, null);
+        defer self.allocator.free(branch_entries);
+        var preparation = (try compaction_mod.prepareCompaction(self.allocator, branch_entries, config.settings)) orelse {
+            self.bridge.handleCompactionStart(reason);
+            self.bridge.handleCompactionEnd(.{
+                .reason = reason,
+                .result = null,
+                .aborted = false,
+                .will_retry = false,
+            });
+            return false;
+        };
+        defer preparation.deinit();
+
+        _ = self.compactWithGeneratedSummary(
+            io,
+            &preparation,
+            config.model,
+            config.request_options,
+            config.executor,
+            reason,
+            will_retry,
+        ) catch return false;
+
+        if (will_retry) {
+            self.removeTrailingAssistantError();
+            return true;
+        }
+        return self.hasQueuedMessages();
+    }
+
     fn persistCompactionResult(
         self: *AgentSessionReplay,
         io: std.Io,
@@ -807,6 +934,8 @@ pub const AgentSessionReplay = struct {
             from_extension,
         );
         const compaction_entry = self.sessions.getEntry(entry_id) orelse return error.MissingCompactionEntry;
+
+        try self.refreshMessagesFromSessionContext();
 
         _ = try self.runner.emit(.{ .session = .{ .compact = .{
             .compaction_entry = compaction_entry,
@@ -931,13 +1060,16 @@ pub const AgentSessionReplay = struct {
             try self.bridge.handleMessageEnd(io, self.runner, self.sessions, &coding_assistant);
             assistant_message = coding_assistant.assistant;
             try self.messages.append(self.allocator, coding_assistant);
+            if (assistant_message.stop_reason != .@"error") {
+                self.overflow_recovery_attempted = false;
+            }
 
             if (assistant_message.stop_reason != .@"error" and self.retry.retry_attempt > 0) {
                 _ = self.retry.completeRetrySuccess(self.bridge);
             }
 
             if (assistant_message.stop_reason == .@"error" or assistant_message.stop_reason == .aborted) {
-                if (try self.finishTurnAndMaybeRetry(assistant_message)) {
+                if (try self.finishTurnAndMaybeRetry(io, assistant_message)) {
                     try self.bridge.handleAgentStart(self.runner);
                     emit_prompt = false;
                     continue;
@@ -962,6 +1094,9 @@ pub const AgentSessionReplay = struct {
             }
 
             try self.bridge.handleAgentEnd(self.runner, self.messages.items, false);
+            if (try self.checkAutoCompaction(io, assistant_message, true)) {
+                continue;
+            }
             if (self.steering_messages.items.len > 0 or self.follow_up_messages.items.len > 0) {
                 drain_follow_up = true;
                 continue;
@@ -970,13 +1105,21 @@ pub const AgentSessionReplay = struct {
         }
     }
 
-    fn finishTurnAndMaybeRetry(self: *AgentSessionReplay, assistant_message: ai.AssistantMessage) !bool {
+    fn finishTurnAndMaybeRetry(
+        self: *AgentSessionReplay,
+        io: std.Io,
+        assistant_message: ai.AssistantMessage,
+    ) !bool {
         var no_tool_results: [0]ai.ToolResultMessage = .{};
         const will_retry = self.retry.willRetryAfterAgentEnd(self.messages.items);
         try self.bridge.handleTurnEnd(self.runner, .{ .assistant = assistant_message }, no_tool_results[0..]);
         try self.bridge.handleAgentEnd(self.runner, self.messages.items, will_retry);
 
         if (assistant_message.stop_reason == .aborted) return false;
+
+        if (try self.checkAutoCompaction(io, assistant_message, true)) {
+            return true;
+        }
 
         if (self.retry.prepareRetry(self.bridge, assistant_message)) |event| {
             try self.retry_sleeps.append(self.allocator, event.delay_ms);
@@ -1083,6 +1226,177 @@ pub const AgentSessionReplay = struct {
             if (emit_update) try self.emitQueueUpdate();
             try self.emitAndStoreMessage(io, queued.message);
         }
+    }
+
+    fn refreshMessagesFromSessionContext(self: *AgentSessionReplay) !void {
+        var context = try self.sessions.buildSessionContextAlloc(self.allocator);
+        defer context.deinit();
+
+        self.messages.clearRetainingCapacity();
+        for (context.messages) |message| {
+            try self.messages.append(self.allocator, try self.cloneCodingAgentMessage(message));
+        }
+    }
+
+    fn removeTrailingAssistantError(self: *AgentSessionReplay) void {
+        if (self.messages.items.len == 0) return;
+        const last = self.messages.items[self.messages.items.len - 1];
+        if (last == .assistant and last.assistant.stop_reason == .@"error") {
+            self.messages.items.len -= 1;
+        }
+    }
+
+    fn cloneCodingAgentMessage(
+        self: *AgentSessionReplay,
+        message: messages.CodingAgentMessage,
+    ) !messages.CodingAgentMessage {
+        return switch (message) {
+            .user => |user| .{ .user = .{
+                .content = try self.cloneUserContentSlice(user.content),
+                .timestamp_ms = user.timestamp_ms,
+            } },
+            .assistant => |assistant| .{ .assistant = try self.cloneAssistantMessage(assistant) },
+            .tool_result => |tool_result| .{ .tool_result = .{
+                .tool_call_id = try self.retainText(tool_result.tool_call_id),
+                .tool_name = try self.retainText(tool_result.tool_name),
+                .content = try self.cloneUserContentSlice(tool_result.content),
+                .is_error = tool_result.is_error,
+                .timestamp_ms = tool_result.timestamp_ms,
+            } },
+            .bash_execution => |bash| .{ .bash_execution = .{
+                .command = try self.retainText(bash.command),
+                .output = try self.retainText(bash.output),
+                .exit_code = bash.exit_code,
+                .cancelled = bash.cancelled,
+                .truncated = bash.truncated,
+                .full_output_path = try self.optionalRetainText(bash.full_output_path),
+                .timestamp_ms = bash.timestamp_ms,
+                .exclude_from_context = bash.exclude_from_context,
+            } },
+            .custom => |custom| .{ .custom = .{
+                .custom_type = try self.retainText(custom.custom_type),
+                .content = switch (custom.content) {
+                    .text => |text| .{ .text = try self.retainText(text) },
+                    .parts => |parts| .{ .parts = try self.cloneUserContentSlice(parts) },
+                },
+                .display = custom.display,
+                .details_json = if (custom.details_json) |details| try self.retainDetails(details) else null,
+                .timestamp_ms = custom.timestamp_ms,
+            } },
+            .branch_summary => |summary| .{ .branch_summary = .{
+                .summary = try self.retainText(summary.summary),
+                .from_id = try self.retainText(summary.from_id),
+                .timestamp_ms = summary.timestamp_ms,
+            } },
+            .compaction_summary => |summary| .{ .compaction_summary = .{
+                .summary = try self.retainText(summary.summary),
+                .tokens_before = summary.tokens_before,
+                .timestamp_ms = summary.timestamp_ms,
+            } },
+        };
+    }
+
+    fn cloneAssistantMessage(self: *AgentSessionReplay, source: ai.AssistantMessage) !ai.AssistantMessage {
+        return .{
+            .content = try self.cloneAssistantContentSlice(source.content),
+            .api = source.api,
+            .provider = try self.retainText(source.provider),
+            .model = try self.retainText(source.model),
+            .response_model = try self.optionalRetainText(source.response_model),
+            .usage = source.usage,
+            .stop_reason = source.stop_reason,
+            .error_message = try self.optionalRetainText(source.error_message),
+            .response_id = try self.optionalRetainText(source.response_id),
+            .diagnostics = try self.cloneDiagnosticsSlice(source.diagnostics),
+            .timestamp_ms = source.timestamp_ms,
+        };
+    }
+
+    fn cloneUserContentSlice(
+        self: *AgentSessionReplay,
+        content: []const ai.UserContent,
+    ) ![]ai.UserContent {
+        const cloned = try self.allocator.alloc(ai.UserContent, content.len);
+        var registered = false;
+        errdefer if (!registered) self.allocator.free(cloned);
+
+        for (content, 0..) |block, index| {
+            cloned[index] = switch (block) {
+                .text => |text| .{ .text = .{
+                    .text = try self.retainText(text.text),
+                    .text_signature = try self.optionalRetainText(text.text_signature),
+                } },
+                .image => |image| .{ .image = .{
+                    .data = try self.retainText(image.data),
+                    .mime_type = try self.retainText(image.mime_type),
+                } },
+            };
+        }
+        try self.owned_content.append(self.allocator, cloned);
+        registered = true;
+        return cloned;
+    }
+
+    fn cloneAssistantContentSlice(
+        self: *AgentSessionReplay,
+        content: []const ai.AssistantContent,
+    ) ![]ai.AssistantContent {
+        const cloned = try self.allocator.alloc(ai.AssistantContent, content.len);
+        var registered = false;
+        errdefer if (!registered) self.allocator.free(cloned);
+
+        for (content, 0..) |block, index| {
+            cloned[index] = switch (block) {
+                .text => |text| .{ .text = .{
+                    .text = try self.retainText(text.text),
+                    .text_signature = try self.optionalRetainText(text.text_signature),
+                } },
+                .thinking => |thinking| .{ .thinking = .{
+                    .thinking = try self.retainText(thinking.thinking),
+                    .thinking_signature = try self.optionalRetainText(thinking.thinking_signature),
+                    .redacted = thinking.redacted,
+                } },
+                .tool_call => |tool_call| .{ .tool_call = .{
+                    .id = try self.retainText(tool_call.id),
+                    .name = try self.retainText(tool_call.name),
+                    .arguments_json = try self.retainText(tool_call.arguments_json),
+                    .thought_signature = try self.optionalRetainText(tool_call.thought_signature),
+                } },
+            };
+        }
+        try self.owned_assistant_content.append(self.allocator, cloned);
+        registered = true;
+        return cloned;
+    }
+
+    fn cloneDiagnosticsSlice(
+        self: *AgentSessionReplay,
+        diagnostics: []const ai.AssistantMessageDiagnostic,
+    ) ![]ai.AssistantMessageDiagnostic {
+        const cloned = try self.allocator.alloc(ai.AssistantMessageDiagnostic, diagnostics.len);
+        var registered = false;
+        errdefer if (!registered) self.allocator.free(cloned);
+
+        for (diagnostics, 0..) |diagnostic, index| {
+            cloned[index] = .{
+                .type = try self.retainText(diagnostic.type),
+                .timestamp_ms = diagnostic.timestamp_ms,
+                .@"error" = if (diagnostic.@"error") |err| .{
+                    .name = try self.optionalRetainText(err.name),
+                    .message = try self.retainText(err.message),
+                    .stack = try self.optionalRetainText(err.stack),
+                    .code = err.code,
+                } else null,
+                .details_json = try self.optionalRetainText(diagnostic.details_json),
+            };
+        }
+        try self.owned_diagnostics.append(self.allocator, cloned);
+        registered = true;
+        return cloned;
+    }
+
+    fn optionalRetainText(self: *AgentSessionReplay, maybe_text: ?[]const u8) !?[]u8 {
+        return if (maybe_text) |text| try self.retainText(text) else null;
     }
 
     fn retainText(self: *AgentSessionReplay, text: []const u8) ![]u8 {
@@ -1267,6 +1581,35 @@ pub const AgentSessionReplay = struct {
         };
     }
 };
+
+fn latestCompactionTimestampMsAlloc(
+    allocator: std.mem.Allocator,
+    branch_entries: []const session_manager.FileEntry,
+) !?i64 {
+    var index = branch_entries.len;
+    while (index > 0) {
+        index -= 1;
+        if (!try fileEntryTypeEqualsAlloc(allocator, branch_entries[index], "compaction")) continue;
+        const timestamp = try session_manager.entryStringFieldAlloc(
+            allocator,
+            branch_entries[index].raw_json,
+            "timestamp",
+        );
+        defer if (timestamp) |value| allocator.free(value);
+        return if (timestamp) |value| messages.parseTimestampMs(value) catch null else null;
+    }
+    return null;
+}
+
+fn fileEntryTypeEqualsAlloc(
+    allocator: std.mem.Allocator,
+    entry: session_manager.FileEntry,
+    expected: []const u8,
+) !bool {
+    const entry_type = try session_manager.entryStringFieldAlloc(allocator, entry.raw_json, "type");
+    defer if (entry_type) |value| allocator.free(value);
+    return if (entry_type) |value| std.mem.eql(u8, value, expected) else false;
+}
 
 const never_aborted_signal: ai.AbortSignal = .{};
 
@@ -3031,6 +3374,296 @@ test "AgentSession replay generated compact lets extension-provided summary win"
     try expectEntryJsonBoolField(allocator, compaction_entry, "fromHook", true);
 }
 
+test "AgentSession replay auto-compaction returns true when queued messages should resume" {
+    const allocator = std.testing.allocator;
+    var harness = try TestHarness.init(allocator);
+    defer harness.deinit();
+
+    var runner = extensions.ExtensionRunner.init(
+        allocator,
+        &.{},
+        harness.runtime,
+        "/tmp",
+        harness.sessions,
+        harness.registry,
+    );
+    defer runner.deinit();
+
+    var bridge = SessionEventBridge.init(allocator);
+    defer bridge.deinit();
+    var public_events: std.ArrayList(CompactionEventObservation) = .empty;
+    defer public_events.deinit(allocator);
+    var observer = CompactionEventObserver{ .allocator = allocator, .events = &public_events };
+    try bridge.subscribe(.{ .ptr = &observer, .call_fn = CompactionEventObserver.publicListener });
+
+    const assistant_content = [_]ai.AssistantContent{.{ .text = .{ .text = "reply" } }};
+    const responses = [_]ai.AssistantMessage{assistantUsageMessage(&assistant_content, .stop, 20_000, 200)};
+    var replay = AgentSessionReplay.init(
+        allocator,
+        &bridge,
+        &runner,
+        harness.sessions,
+        AutoRetryController.init(.{ .enabled = false }, null),
+        &.{},
+    );
+    defer replay.deinit();
+    replay.setResponses(&responses);
+    try replay.prompt(std.testing.io, "message to compact", 100);
+    try replay.followUp("queued custom", 300);
+
+    var summary_state = GeneratedSummaryState{ .summary = "threshold summary" };
+    replay.setAutoCompaction(.{
+        .model = sessionCompactionModel(),
+        .executor = summary_state.executor(),
+        .settings = .{ .reserve_tokens = 1_000, .keep_recent_tokens = 1 },
+        .request_options = .{ .api_key = "test-key" },
+    });
+
+    try std.testing.expect(try replay.runAutoCompaction(std.testing.io, .threshold, false));
+    try std.testing.expectEqual(@as(usize, 1), replay.pendingMessageCount());
+    try std.testing.expectEqual(@as(usize, 1), summary_state.calls);
+
+    const expected_events = [_]CompactionEventObservation{
+        .{ .event = .start, .reason = .threshold },
+        .{ .event = .end, .reason = .threshold, .aborted = false, .will_retry = false, .summary = .other },
+    };
+    try std.testing.expectEqualSlices(CompactionEventObservation, &expected_events, public_events.items[public_events.items.len - 2 ..]);
+}
+
+test "AgentSession replay auto-compaction ignores stale pre-compaction assistant usage" {
+    const allocator = std.testing.allocator;
+    var harness = try TestHarness.init(allocator);
+    defer harness.deinit();
+
+    var runner = extensions.ExtensionRunner.init(
+        allocator,
+        &.{},
+        harness.runtime,
+        "/tmp",
+        harness.sessions,
+        harness.registry,
+    );
+    defer runner.deinit();
+
+    var bridge = SessionEventBridge.init(allocator);
+    defer bridge.deinit();
+    var public_events: std.ArrayList(CompactionEventObservation) = .empty;
+    defer public_events.deinit(allocator);
+    var observer = CompactionEventObserver{ .allocator = allocator, .events = &public_events };
+    try bridge.subscribe(.{ .ptr = &observer, .call_fn = CompactionEventObserver.publicListener });
+
+    const stale_content = [_]ai.AssistantContent{.{ .text = .{ .text = "large response before compaction" } }};
+    const stale_assistant = assistantUsageMessage(&stale_content, .stop, 610_000, 100);
+    const responses = [_]ai.AssistantMessage{stale_assistant};
+    var replay = AgentSessionReplay.init(
+        allocator,
+        &bridge,
+        &runner,
+        harness.sessions,
+        AutoRetryController.init(.{ .enabled = false }, null),
+        &.{},
+    );
+    defer replay.deinit();
+    replay.setResponses(&responses);
+    try replay.prompt(std.testing.io, "before compaction", 50);
+
+    const first_kept_entry_id = harness.sessions.getEntries()[0].id.?;
+    _ = try harness.sessions.appendCompactionJson(
+        std.testing.io,
+        "summary",
+        first_kept_entry_id,
+        stale_assistant.usage.total_tokens,
+        null,
+        false,
+    );
+
+    var summary_state = GeneratedSummaryState{ .summary = "should not run" };
+    replay.setAutoCompaction(.{
+        .model = sessionCompactionModel(),
+        .executor = summary_state.executor(),
+        .settings = .{ .reserve_tokens = 1_000 },
+        .request_options = .{ .api_key = "test-key" },
+    });
+
+    try std.testing.expect(!try replay.checkAutoCompaction(std.testing.io, stale_assistant, false));
+    try std.testing.expectEqual(@as(usize, 0), summary_state.calls);
+    try std.testing.expectEqual(@as(usize, 0), public_events.items.len);
+}
+
+test "AgentSession replay auto-compaction thresholds error messages using last successful usage" {
+    const allocator = std.testing.allocator;
+    var harness = try TestHarness.init(allocator);
+    defer harness.deinit();
+
+    var runner = extensions.ExtensionRunner.init(
+        allocator,
+        &.{},
+        harness.runtime,
+        "/tmp",
+        harness.sessions,
+        harness.registry,
+    );
+    defer runner.deinit();
+
+    var bridge = SessionEventBridge.init(allocator);
+    defer bridge.deinit();
+    var public_events: std.ArrayList(CompactionEventObservation) = .empty;
+    defer public_events.deinit(allocator);
+    var observer = CompactionEventObserver{ .allocator = allocator, .events = &public_events };
+    try bridge.subscribe(.{ .ptr = &observer, .call_fn = CompactionEventObserver.publicListener });
+
+    const success_content = [_]ai.AssistantContent{.{ .text = .{ .text = "large successful response" } }};
+    const error_content = [_]ai.AssistantContent{.{ .text = .{ .text = "" } }};
+    const responses = [_]ai.AssistantMessage{
+        assistantUsageMessage(&success_content, .stop, 190_000, 200),
+        assistantErrorAt(&error_content, "529 overloaded", 400),
+    };
+    var replay = AgentSessionReplay.init(
+        allocator,
+        &bridge,
+        &runner,
+        harness.sessions,
+        AutoRetryController.init(.{ .enabled = false }, null),
+        &.{},
+    );
+    defer replay.deinit();
+    replay.setResponses(&responses);
+    try replay.prompt(std.testing.io, "hello", 100);
+
+    var summary_state = GeneratedSummaryState{ .summary = "error-threshold summary" };
+    replay.setAutoCompaction(.{
+        .model = sessionCompactionModel(),
+        .executor = summary_state.executor(),
+        .settings = .{ .reserve_tokens = 10_000, .keep_recent_tokens = 1 },
+        .request_options = .{ .api_key = "test-key" },
+    });
+
+    try replay.prompt(std.testing.io, "another prompt", 300);
+    try std.testing.expectEqual(@as(usize, 1), summary_state.calls);
+    try expectEntryType(harness.sessions.getEntries()[4], "compaction");
+
+    const expected_events = [_]CompactionEventObservation{
+        .{ .event = .start, .reason = .threshold },
+        .{ .event = .end, .reason = .threshold, .aborted = false, .will_retry = false, .summary = .other },
+    };
+    try std.testing.expectEqualSlices(CompactionEventObservation, &expected_events, public_events.items);
+}
+
+test "AgentSession replay auto-compaction skips error threshold without post-compaction usage" {
+    const allocator = std.testing.allocator;
+    var harness = try TestHarness.init(allocator);
+    defer harness.deinit();
+
+    var runner = extensions.ExtensionRunner.init(
+        allocator,
+        &.{},
+        harness.runtime,
+        "/tmp",
+        harness.sessions,
+        harness.registry,
+    );
+    defer runner.deinit();
+
+    var bridge = SessionEventBridge.init(allocator);
+    defer bridge.deinit();
+    var public_events: std.ArrayList(CompactionEventObservation) = .empty;
+    defer public_events.deinit(allocator);
+    var observer = CompactionEventObserver{ .allocator = allocator, .events = &public_events };
+    try bridge.subscribe(.{ .ptr = &observer, .call_fn = CompactionEventObserver.publicListener });
+
+    const error_content = [_]ai.AssistantContent{.{ .text = .{ .text = "" } }};
+    const responses = [_]ai.AssistantMessage{assistantErrorAt(&error_content, "529 overloaded", 200)};
+    var replay = AgentSessionReplay.init(
+        allocator,
+        &bridge,
+        &runner,
+        harness.sessions,
+        AutoRetryController.init(.{ .enabled = false }, null),
+        &.{},
+    );
+    defer replay.deinit();
+    var summary_state = GeneratedSummaryState{ .summary = "should not run" };
+    replay.setAutoCompaction(.{
+        .model = sessionCompactionModel(),
+        .executor = summary_state.executor(),
+        .settings = .{ .reserve_tokens = 10_000 },
+        .request_options = .{ .api_key = "test-key" },
+    });
+    replay.setResponses(&responses);
+
+    try replay.prompt(std.testing.io, "hello", 100);
+    try std.testing.expectEqual(@as(usize, 0), summary_state.calls);
+    try std.testing.expectEqual(@as(usize, 0), public_events.items.len);
+}
+
+test "AgentSession replay auto-compaction ignores kept pre-compaction usage for error threshold" {
+    const allocator = std.testing.allocator;
+    var harness = try TestHarness.init(allocator);
+    defer harness.deinit();
+
+    var runner = extensions.ExtensionRunner.init(
+        allocator,
+        &.{},
+        harness.runtime,
+        "/tmp",
+        harness.sessions,
+        harness.registry,
+    );
+    defer runner.deinit();
+
+    var bridge = SessionEventBridge.init(allocator);
+    defer bridge.deinit();
+    var public_events: std.ArrayList(CompactionEventObservation) = .empty;
+    defer public_events.deinit(allocator);
+    var observer = CompactionEventObserver{ .allocator = allocator, .events = &public_events };
+    try bridge.subscribe(.{ .ptr = &observer, .call_fn = CompactionEventObserver.publicListener });
+
+    const kept_content = [_]ai.AssistantContent{.{ .text = .{ .text = "kept response from before compaction" } }};
+    const kept_assistant = assistantUsageMessage(&kept_content, .stop, 190_000, 100);
+    const responses = [_]ai.AssistantMessage{kept_assistant};
+    var replay = AgentSessionReplay.init(
+        allocator,
+        &bridge,
+        &runner,
+        harness.sessions,
+        AutoRetryController.init(.{ .enabled = false }, null),
+        &.{},
+    );
+    defer replay.deinit();
+    replay.setResponses(&responses);
+    try replay.prompt(std.testing.io, "before compaction", 50);
+
+    const first_kept_entry_id = harness.sessions.getEntries()[0].id.?;
+    _ = try harness.sessions.appendCompactionJson(
+        std.testing.io,
+        "summary",
+        first_kept_entry_id,
+        kept_assistant.usage.total_tokens,
+        null,
+        false,
+    );
+
+    const error_content = [_]ai.AssistantContent{.{ .text = .{ .text = "" } }};
+    const error_assistant = assistantErrorAt(&error_content, "529 overloaded", 1_000_000);
+    try replay.messages.append(allocator, .{ .user = .{
+        .content = &[_]ai.UserContent{.{ .text = .{ .text = "new prompt" } }},
+        .timestamp_ms = 999_900,
+    } });
+    try replay.messages.append(allocator, .{ .assistant = error_assistant });
+
+    var summary_state = GeneratedSummaryState{ .summary = "should not run" };
+    replay.setAutoCompaction(.{
+        .model = sessionCompactionModel(),
+        .executor = summary_state.executor(),
+        .settings = .{ .reserve_tokens = 10_000 },
+        .request_options = .{ .api_key = "test-key" },
+    });
+
+    try std.testing.expect(!try replay.checkAutoCompaction(std.testing.io, error_assistant, true));
+    try std.testing.expectEqual(@as(usize, 0), summary_state.calls);
+    try std.testing.expectEqual(@as(usize, 0), public_events.items.len);
+}
+
 test "AgentSession replay compact cancellation stops session_compact and persistence" {
     const allocator = std.testing.allocator;
     var harness = try TestHarness.init(allocator);
@@ -4000,6 +4633,25 @@ fn assistantMessage(content: []const ai.AssistantContent, stop_reason: ai.StopRe
     };
 }
 
+fn assistantUsageMessage(
+    content: []const ai.AssistantContent,
+    stop_reason: ai.StopReason,
+    total_tokens: u64,
+    timestamp_ms: i64,
+) ai.AssistantMessage {
+    var message = assistantMessage(content, stop_reason);
+    message.usage = .{
+        .input = total_tokens,
+        .output = 0,
+        .cache_read = 0,
+        .cache_write = 0,
+        .total_tokens = total_tokens,
+        .cost = .{},
+    };
+    message.timestamp_ms = timestamp_ms;
+    return message;
+}
+
 fn sessionCompactionModel() ai.Model {
     return .{
         .id = "gpt-test",
@@ -4009,6 +4661,22 @@ fn sessionCompactionModel() ai.Model {
         .base_url = "https://example.invalid",
         .context_window = 200_000,
         .max_tokens = 8192,
+    };
+}
+
+fn assistantErrorAt(
+    content: []const ai.AssistantContent,
+    error_message: []const u8,
+    timestamp_ms: i64,
+) ai.AssistantMessage {
+    return .{
+        .content = content,
+        .api = ai.types.api.openai_responses,
+        .provider = "openai",
+        .model = "gpt-test",
+        .stop_reason = .@"error",
+        .error_message = error_message,
+        .timestamp_ms = timestamp_ms,
     };
 }
 
