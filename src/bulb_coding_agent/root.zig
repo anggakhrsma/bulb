@@ -14,6 +14,7 @@ pub const compaction = @import("compaction.zig");
 pub const settings_manager = @import("settings_manager.zig");
 pub const session_selector = @import("session_selector.zig");
 pub const session_selector_search = @import("session_selector_search.zig");
+pub const tree_selector = @import("tree_selector.zig");
 pub const system_prompt = @import("system_prompt.zig");
 pub const extensions = @import("extensions/root.zig");
 pub const tools = @import("tools/root.zig");
@@ -211,6 +212,7 @@ test {
     _ = @import("settings_manager.zig");
     _ = @import("session_selector.zig");
     _ = @import("session_selector_search.zig");
+    _ = @import("tree_selector.zig");
     _ = @import("system_prompt.zig");
     _ = @import("extensions/root.zig");
     _ = @import("tools/root.zig");

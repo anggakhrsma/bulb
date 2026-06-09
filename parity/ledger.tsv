@@ -512,7 +512,7 @@ packages/coding-agent/src/modes/interactive/components/skill-invocation-message.
 packages/coding-agent/src/modes/interactive/components/theme-selector.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/modes/interactive/components/thinking-selector.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/modes/interactive/components/tool-execution.ts	bulb_coding_agent	source	pending		
-packages/coding-agent/src/modes/interactive/components/tree-selector.ts	bulb_coding_agent	source	pending		
+packages/coding-agent/src/modes/interactive/components/tree-selector.ts	bulb_coding_agent	source	in_progress	src/bulb_coding_agent/tree_selector.zig	Native tree selector controller started with nearest-visible selection, metadata ancestor focus, user/default/labeled filters, empty-filter selection restoration, label timestamp rendering, branch folding, Ctrl/Alt left-right segment navigation, and fold reset on search/filter changes; full TUI container/label editor rendering remains
 packages/coding-agent/src/modes/interactive/components/user-message-selector.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/modes/interactive/components/user-message.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/modes/interactive/components/visual-truncate.ts	bulb_coding_agent	source	pending		
@@ -714,7 +714,7 @@ packages/coding-agent/test/theme-export.test.ts	bulb_coding_agent	test	pending
 packages/coding-agent/test/theme-picker.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/tool-execution-component.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/tools.test.ts	bulb_coding_agent	test	in_progress	src/bulb_coding_agent/tools/bash.zig	Built-in ls, find, grep, read, write, edit, and bash sections ported with native Zig tests; remaining upstream coverage belongs to broader tool-wrapper, TUI render, and integration surfaces
-packages/coding-agent/test/tree-selector.test.ts	bulb_coding_agent	test	pending		
+packages/coding-agent/test/tree-selector.test.ts	bulb_coding_agent	test	implemented	src/bulb_coding_agent/tree_selector.zig	All 15 upstream TreeSelector regression behaviors ported in native grouped tests: metadata leaf ancestor focus, filter parent traversal, label timestamp toggling, empty labeled-filter restoration, branch folding/navigation, multiple roots, filtered intermediate descendants, and search/filter fold reset
 packages/coding-agent/test/trigger-compact-extension.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/truncate-to-width.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/user-message.test.ts	bulb_coding_agent	test	pending		
