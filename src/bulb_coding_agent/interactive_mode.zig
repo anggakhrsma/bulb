@@ -2,10 +2,15 @@ const std = @import("std");
 const agent_session_runtime = @import("agent_session_runtime.zig");
 const config = @import("config.zig");
 const extension_types = @import("extensions/types.zig");
+const git = @import("git.zig");
 const messages_mod = @import("messages.zig");
+const paths = @import("paths.zig");
+const resource_loader = @import("resource_loader.zig");
 const session_events = @import("session_events.zig");
 const session_manager_mod = @import("session_manager.zig");
+const source_info = @import("source_info.zig");
 const theme_mod = @import("theme.zig");
+const render_utils = @import("tools/render_utils.zig");
 const tui = @import("bulb_tui");
 
 pub const anthropic_subscription_auth_warning =
@@ -605,6 +610,1213 @@ pub fn showExtensionCustom(
         .overlay = options.overlay,
         .overlay_handle = overlay_handle,
     };
+}
+
+pub const LoadedResourceSourceInfo = source_info.SourceInfo;
+
+pub const LoadedResource = struct {
+    path: []const u8,
+    source_info: ?LoadedResourceSourceInfo = null,
+};
+
+pub const LoadedContextFile = struct {
+    path: []const u8,
+    content: []const u8 = "",
+};
+
+pub const LoadedSkillResource = struct {
+    file_path: []const u8,
+    name: []const u8,
+    source_info: ?LoadedResourceSourceInfo = null,
+};
+
+pub const LoadedPromptResource = struct {
+    file_path: []const u8,
+    name: []const u8,
+    source_info: ?LoadedResourceSourceInfo = null,
+};
+
+pub const LoadedThemeResource = struct {
+    name: ?[]const u8 = null,
+    source_path: ?[]const u8 = null,
+    source_info: ?LoadedResourceSourceInfo = null,
+};
+
+pub const LoadedExtensionError = struct {
+    path: []const u8,
+    error_message: []const u8,
+};
+
+pub const LoadedResourcesSnapshot = struct {
+    context_files: []const LoadedContextFile = &.{},
+    skills: []const LoadedSkillResource = &.{},
+    skill_diagnostics: []const resource_loader.ResourceDiagnostic = &.{},
+    prompts: []const LoadedPromptResource = &.{},
+    prompt_diagnostics: []const resource_loader.ResourceDiagnostic = &.{},
+    extensions: []const LoadedResource = &.{},
+    extension_errors: []const LoadedExtensionError = &.{},
+    command_diagnostics: []const resource_loader.ResourceDiagnostic = &.{},
+    shortcut_diagnostics: []const resource_loader.ResourceDiagnostic = &.{},
+    built_in_command_conflict_diagnostics: []const resource_loader.ResourceDiagnostic = &.{},
+    themes: []const LoadedThemeResource = &.{},
+    theme_diagnostics: []const resource_loader.ResourceDiagnostic = &.{},
+};
+
+pub const LoadedResourcesOptions = struct {
+    quiet_startup: bool,
+    verbose: bool = false,
+    tool_output_expanded: bool = false,
+    cwd: []const u8 = ".",
+    home_dir: ?[]const u8 = null,
+    force: bool = false,
+    show_diagnostics_when_quiet: bool = false,
+    theme: render_utils.RenderTheme = .{},
+    scope_groups_override: ?[]const u8 = null,
+};
+
+pub const LoadedResourcesController = struct {
+    allocator: std.mem.Allocator,
+    chat_container: *tui.Container,
+    owned_spacers: std.ArrayList(*tui.Spacer) = .empty,
+    owned_texts: std.ArrayList(*tui.Text) = .empty,
+
+    pub fn init(allocator: std.mem.Allocator, chat_container: *tui.Container) LoadedResourcesController {
+        return .{
+            .allocator = allocator,
+            .chat_container = chat_container,
+        };
+    }
+
+    pub fn deinit(self: *LoadedResourcesController) void {
+        for (self.owned_texts.items) |text| {
+            text.deinit();
+            self.allocator.destroy(text);
+        }
+        for (self.owned_spacers.items) |spacer| self.allocator.destroy(spacer);
+        self.owned_texts.deinit(self.allocator);
+        self.owned_spacers.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    pub fn showLoadedResources(
+        self: *LoadedResourcesController,
+        resources: LoadedResourcesSnapshot,
+        options: LoadedResourcesOptions,
+    ) !void {
+        const show_listing = options.force or options.verbose or !options.quiet_startup;
+        const show_diagnostics = show_listing or options.show_diagnostics_when_quiet;
+        if (!show_listing and !show_diagnostics) return;
+
+        var source_infos: std.ArrayList(SourceInfoEntry) = .empty;
+        defer source_infos.deinit(self.allocator);
+        try collectLoadedSourceInfos(self.allocator, &source_infos, resources);
+
+        if (show_listing) {
+            if (resources.context_files.len > 0) {
+                try self.addSpacer(1);
+                const context_list = try self.formatContextListAlloc(resources.context_files, options);
+                defer self.allocator.free(context_list);
+                const context_compact = try self.formatContextCompactListAlloc(resources.context_files, options);
+                defer self.allocator.free(context_compact);
+                try self.addLoadedSection("Context", context_compact, context_list, options);
+            }
+
+            if (resources.skills.len > 0) {
+                const items = try loadedResourcesFromSkillsAlloc(self.allocator, resources.skills);
+                defer self.allocator.free(items);
+                const skill_list = try self.formatScopeGroupsForKindAlloc(items, .display_path, options, null);
+                defer self.allocator.free(skill_list);
+                const names = try stringListFromSkillsAlloc(self.allocator, resources.skills);
+                defer self.allocator.free(names);
+                const skill_compact = try formatCompactListAlloc(self.allocator, options.theme, names, .{});
+                defer self.allocator.free(skill_compact);
+                try self.addLoadedSection("Skills", skill_compact, skill_list, options);
+            }
+
+            if (resources.prompts.len > 0) {
+                const items = try loadedResourcesFromPromptsAlloc(self.allocator, resources.prompts);
+                defer self.allocator.free(items);
+                const prompt_list = try self.formatPromptScopeGroupsAlloc(items, resources.prompts, options);
+                defer self.allocator.free(prompt_list);
+                const names = try commandNamesFromPromptsAlloc(self.allocator, resources.prompts);
+                defer freeOwnedStrings(self.allocator, names);
+                const prompt_compact = try formatCompactListAlloc(self.allocator, options.theme, names, .{});
+                defer self.allocator.free(prompt_compact);
+                try self.addLoadedSection("Prompts", prompt_compact, prompt_list, options);
+            }
+
+            if (resources.extensions.len > 0) {
+                const extension_list = try self.formatScopeGroupsForKindAlloc(resources.extensions, .extension_path, options, null);
+                defer self.allocator.free(extension_list);
+                const compact_labels = try getCompactExtensionLabelsAlloc(self.allocator, resources.extensions, options);
+                defer freeOwnedStrings(self.allocator, compact_labels);
+                const extension_compact = try formatCompactListAlloc(self.allocator, options.theme, compact_labels, .{});
+                defer self.allocator.free(extension_compact);
+                try self.addLoadedSection("Extensions", extension_compact, extension_list, options);
+            }
+
+            const custom_themes = try loadedResourcesFromThemesAlloc(self.allocator, resources.themes);
+            defer self.allocator.free(custom_themes);
+            if (custom_themes.len > 0) {
+                const theme_list = try self.formatScopeGroupsForKindAlloc(custom_themes, .display_path, options, null);
+                defer self.allocator.free(theme_list);
+                const theme_names = try compactNamesFromThemesAlloc(self.allocator, resources.themes, options);
+                defer freeOwnedStrings(self.allocator, theme_names);
+                const theme_compact = try formatCompactListAlloc(self.allocator, options.theme, theme_names, .{});
+                defer self.allocator.free(theme_compact);
+                try self.addLoadedSection("Themes", theme_compact, theme_list, options);
+            }
+        }
+
+        if (show_diagnostics) {
+            if (resources.skill_diagnostics.len > 0) {
+                const warning_lines = try formatDiagnosticsAlloc(self.allocator, resources.skill_diagnostics, source_infos.items, options);
+                defer self.allocator.free(warning_lines);
+                try self.addDiagnosticSection("Skill conflicts", warning_lines, options);
+            }
+
+            if (resources.prompt_diagnostics.len > 0) {
+                const warning_lines = try formatDiagnosticsAlloc(self.allocator, resources.prompt_diagnostics, source_infos.items, options);
+                defer self.allocator.free(warning_lines);
+                try self.addDiagnosticSection("Prompt conflicts", warning_lines, options);
+            }
+
+            var extension_diagnostics: std.ArrayList(DisplayDiagnostic) = .empty;
+            defer extension_diagnostics.deinit(self.allocator);
+            for (resources.extension_errors) |extension_error| {
+                try extension_diagnostics.append(self.allocator, .{
+                    .type = .@"error",
+                    .message = extension_error.error_message,
+                    .path = extension_error.path,
+                });
+            }
+            try appendResourceDiagnostics(self.allocator, &extension_diagnostics, resources.command_diagnostics);
+            try appendResourceDiagnostics(self.allocator, &extension_diagnostics, resources.built_in_command_conflict_diagnostics);
+            try appendResourceDiagnostics(self.allocator, &extension_diagnostics, resources.shortcut_diagnostics);
+            if (extension_diagnostics.items.len > 0) {
+                const warning_lines = try formatDisplayDiagnosticsAlloc(self.allocator, extension_diagnostics.items, source_infos.items, options);
+                defer self.allocator.free(warning_lines);
+                try self.addDiagnosticSection("Extension issues", warning_lines, options);
+            }
+
+            if (resources.theme_diagnostics.len > 0) {
+                const warning_lines = try formatDiagnosticsAlloc(self.allocator, resources.theme_diagnostics, source_infos.items, options);
+                defer self.allocator.free(warning_lines);
+                try self.addDiagnosticSection("Theme conflicts", warning_lines, options);
+            }
+        }
+    }
+
+    fn addLoadedSection(
+        self: *LoadedResourcesController,
+        name: []const u8,
+        collapsed_body: []const u8,
+        expanded_body: []const u8,
+        options: LoadedResourcesOptions,
+    ) !void {
+        const header = try sectionHeaderAlloc(self.allocator, options.theme, name, .accent);
+        defer self.allocator.free(header);
+        const body = if (options.verbose or options.tool_output_expanded) expanded_body else collapsed_body;
+        const text = try std.fmt.allocPrint(self.allocator, "{s}\n{s}", .{ header, body });
+        defer self.allocator.free(text);
+        try self.addText(text);
+        try self.addSpacer(1);
+    }
+
+    fn addDiagnosticSection(
+        self: *LoadedResourcesController,
+        name: []const u8,
+        body: []const u8,
+        options: LoadedResourcesOptions,
+    ) !void {
+        const header = try sectionHeaderAlloc(self.allocator, options.theme, name, .warning);
+        defer self.allocator.free(header);
+        const text = try std.fmt.allocPrint(self.allocator, "{s}\n{s}", .{ header, body });
+        defer self.allocator.free(text);
+        try self.addText(text);
+        try self.addSpacer(1);
+    }
+
+    fn addText(self: *LoadedResourcesController, value: []const u8) !void {
+        const text = try self.allocator.create(tui.Text);
+        errdefer self.allocator.destroy(text);
+        text.* = try tui.Text.init(self.allocator, value, 0, 0, null);
+        errdefer text.deinit();
+        try self.owned_texts.append(self.allocator, text);
+        try self.chat_container.addChild(tui.Component.from(tui.Text, text));
+    }
+
+    fn addSpacer(self: *LoadedResourcesController, lines: usize) !void {
+        const spacer = try self.allocator.create(tui.Spacer);
+        errdefer self.allocator.destroy(spacer);
+        spacer.* = tui.Spacer.init(lines);
+        try self.owned_spacers.append(self.allocator, spacer);
+        try self.chat_container.addChild(tui.Component.from(tui.Spacer, spacer));
+    }
+
+    fn formatContextListAlloc(
+        self: *LoadedResourcesController,
+        files: []const LoadedContextFile,
+        options: LoadedResourcesOptions,
+    ) ![]u8 {
+        var lines: std.ArrayList([]u8) = .empty;
+        defer freeOwnedStringList(self.allocator, &lines);
+        for (files) |file| {
+            const display = try formatDisplayPathAlloc(self.allocator, file.path, options.home_dir);
+            defer self.allocator.free(display);
+            const raw = try std.fmt.allocPrint(self.allocator, "  {s}", .{display});
+            defer self.allocator.free(raw);
+            try lines.append(self.allocator, try options.theme.fgAlloc(self.allocator, .dim, raw));
+        }
+        return joinLinesAlloc(self.allocator, lines.items);
+    }
+
+    fn formatContextCompactListAlloc(
+        self: *LoadedResourcesController,
+        files: []const LoadedContextFile,
+        options: LoadedResourcesOptions,
+    ) ![]u8 {
+        var labels: std.ArrayList([]u8) = .empty;
+        defer freeOwnedStringList(self.allocator, &labels);
+        for (files) |file| {
+            try labels.append(self.allocator, try formatContextPathAlloc(self.allocator, file.path, options));
+        }
+        return formatCompactListAlloc(self.allocator, options.theme, labels.items, .{ .sort = false });
+    }
+
+    const ScopeFormatKind = enum {
+        display_path,
+        extension_path,
+    };
+
+    fn formatScopeGroupsForKindAlloc(
+        self: *LoadedResourcesController,
+        items: []const LoadedResource,
+        kind: ScopeFormatKind,
+        options: LoadedResourcesOptions,
+        package_prompt_names: ?[]const LoadedPromptResource,
+    ) ![]u8 {
+        if (options.scope_groups_override) |override| return self.allocator.dupe(u8, override);
+
+        var groups = try buildScopeGroups(self.allocator, items);
+        defer groups.deinit();
+        return formatScopeGroupsAlloc(self.allocator, groups.items.items, options, kind, package_prompt_names);
+    }
+
+    fn formatPromptScopeGroupsAlloc(
+        self: *LoadedResourcesController,
+        items: []const LoadedResource,
+        prompts: []const LoadedPromptResource,
+        options: LoadedResourcesOptions,
+    ) ![]u8 {
+        if (options.scope_groups_override) |override| return self.allocator.dupe(u8, override);
+
+        var groups = try buildScopeGroups(self.allocator, items);
+        defer groups.deinit();
+        return formatScopeGroupsAlloc(self.allocator, groups.items.items, options, .display_path, prompts);
+    }
+};
+
+const FormatCompactListOptions = struct {
+    sort: bool = true,
+};
+
+fn formatCompactListAlloc(
+    allocator: std.mem.Allocator,
+    theme: render_utils.RenderTheme,
+    items: []const []const u8,
+    options: FormatCompactListOptions,
+) ![]u8 {
+    var labels: std.ArrayList([]u8) = .empty;
+    defer freeOwnedStringList(allocator, &labels);
+
+    for (items) |item| {
+        const trimmed = std.mem.trim(u8, item, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        try labels.append(allocator, try allocator.dupe(u8, trimmed));
+    }
+
+    if (options.sort) {
+        std.mem.sort([]u8, labels.items, {}, stringLessThan);
+    }
+
+    const joined = try joinWithSeparatorAlloc(allocator, labels.items, ", ");
+    defer allocator.free(joined);
+    const raw = try std.fmt.allocPrint(allocator, "  {s}", .{joined});
+    defer allocator.free(raw);
+    return theme.fgAlloc(allocator, .dim, raw);
+}
+
+fn sectionHeaderAlloc(
+    allocator: std.mem.Allocator,
+    theme: render_utils.RenderTheme,
+    name: []const u8,
+    color: render_utils.ThemeColor,
+) ![]u8 {
+    const raw = try std.fmt.allocPrint(allocator, "[{s}]", .{name});
+    defer allocator.free(raw);
+    return theme.fgAlloc(allocator, color, raw);
+}
+
+fn formatDisplayPathAlloc(allocator: std.mem.Allocator, input_path: []const u8, maybe_home_dir: ?[]const u8) ![]u8 {
+    if (maybe_home_dir) |home_dir| {
+        if (home_dir.len > 0 and std.mem.startsWith(u8, input_path, home_dir)) {
+            return std.fmt.allocPrint(allocator, "~{s}", .{input_path[home_dir.len..]});
+        }
+        return allocator.dupe(u8, input_path);
+    }
+    return allocator.dupe(u8, input_path);
+}
+
+fn formatExtensionDisplayPathAlloc(allocator: std.mem.Allocator, input_path: []const u8, options: LoadedResourcesOptions) ![]u8 {
+    var result = try formatDisplayPathAlloc(allocator, input_path, options.home_dir);
+    if (stripSuffix(result, "/index.ts")) |stripped| {
+        const copy = try allocator.dupe(u8, stripped);
+        allocator.free(result);
+        result = copy;
+    } else if (stripSuffix(result, "/index.js")) |stripped| {
+        const copy = try allocator.dupe(u8, stripped);
+        allocator.free(result);
+        result = copy;
+    }
+    return result;
+}
+
+fn formatContextPathAlloc(allocator: std.mem.Allocator, input_path: []const u8, options: LoadedResourcesOptions) ![]u8 {
+    const cwd = try paths.resolvePathAlloc(allocator, options.cwd, ".", .{});
+    defer allocator.free(cwd);
+    const absolute_path = try paths.resolvePathAlloc(allocator, input_path, cwd, .{});
+    defer allocator.free(absolute_path);
+
+    if (try paths.getCwdRelativePathAlloc(allocator, absolute_path, cwd)) |relative| {
+        defer allocator.free(relative);
+        return slashPathAlloc(allocator, relative);
+    }
+    return formatDisplayPathAlloc(allocator, absolute_path, options.home_dir);
+}
+
+fn getShortPathAlloc(
+    allocator: std.mem.Allocator,
+    full_path: []const u8,
+    maybe_info: ?LoadedResourceSourceInfo,
+    options: LoadedResourcesOptions,
+) ![]u8 {
+    if (maybe_info) |info| {
+        if (info.base_dir) |base_dir| {
+            if (isPackageSource(maybe_info)) {
+                const resolved_base = try paths.resolvePathAlloc(allocator, base_dir, ".", .{});
+                defer allocator.free(resolved_base);
+                const resolved_full = try paths.resolvePathAlloc(allocator, full_path, ".", .{});
+                defer allocator.free(resolved_full);
+                const relative = try std.fs.path.relative(allocator, ".", null, resolved_base, resolved_full);
+                errdefer allocator.free(relative);
+                if (relative.len > 0 and
+                    !std.mem.eql(u8, relative, ".") and
+                    !std.mem.startsWith(u8, relative, "..") and
+                    !std.mem.startsWith(u8, relative, ".." ++ std.fs.path.sep_str) and
+                    !std.fs.path.isAbsolute(relative))
+                {
+                    const slashed = try slashPathAlloc(allocator, relative);
+                    allocator.free(relative);
+                    return slashed;
+                }
+                allocator.free(relative);
+            }
+        }
+
+        if (std.mem.startsWith(u8, info.source, "npm:")) {
+            if (npmPackageRemainder(full_path)) |remainder| return allocator.dupe(u8, remainder);
+        }
+
+        if (std.mem.startsWith(u8, info.source, "git:")) {
+            if (gitPackageRemainder(full_path)) |remainder| return allocator.dupe(u8, remainder);
+        }
+    }
+
+    return formatDisplayPathAlloc(allocator, full_path, options.home_dir);
+}
+
+fn getCompactPathLabelAlloc(
+    allocator: std.mem.Allocator,
+    resource_path: []const u8,
+    maybe_info: ?LoadedResourceSourceInfo,
+    options: LoadedResourcesOptions,
+) ![]u8 {
+    const short_path = try getShortPathAlloc(allocator, resource_path, maybe_info, options);
+    defer allocator.free(short_path);
+    const normalized = try slashPathAlloc(allocator, short_path);
+    defer allocator.free(normalized);
+
+    var it = std.mem.splitScalar(u8, normalized, '/');
+    var last: ?[]const u8 = null;
+    while (it.next()) |segment| {
+        if (segment.len == 0 or std.mem.eql(u8, segment, "~")) continue;
+        last = segment;
+    }
+    return allocator.dupe(u8, last orelse short_path);
+}
+
+fn getCompactPackageSourceLabelAlloc(
+    allocator: std.mem.Allocator,
+    maybe_info: ?LoadedResourceSourceInfo,
+) ![]u8 {
+    const info = maybe_info orelse return allocator.dupe(u8, "");
+    if (std.mem.startsWith(u8, info.source, "npm:")) {
+        const label = info.source["npm:".len..];
+        return allocator.dupe(u8, if (label.len == 0) info.source else label);
+    }
+
+    if (try git.parseGitUrlAlloc(allocator, info.source)) |parsed_value| {
+        var parsed = parsed_value;
+        defer parsed.deinit();
+        return allocator.dupe(u8, if (parsed.path.len == 0) info.source else parsed.path);
+    }
+
+    return allocator.dupe(u8, info.source);
+}
+
+fn getCompactExtensionLabelAlloc(
+    allocator: std.mem.Allocator,
+    resource_path: []const u8,
+    maybe_info: ?LoadedResourceSourceInfo,
+    options: LoadedResourcesOptions,
+) ![]u8 {
+    if (!isPackageSource(maybe_info)) {
+        return getCompactPathLabelAlloc(allocator, resource_path, maybe_info, options);
+    }
+
+    const source_label = try getCompactPackageSourceLabelAlloc(allocator, maybe_info);
+    defer allocator.free(source_label);
+    if (source_label.len == 0) {
+        return getCompactPathLabelAlloc(allocator, resource_path, maybe_info, options);
+    }
+
+    const short_path = try getShortPathAlloc(allocator, resource_path, maybe_info, options);
+    defer allocator.free(short_path);
+    var package_path = try slashPathAlloc(allocator, short_path);
+    defer allocator.free(package_path);
+    if (std.mem.startsWith(u8, package_path, "extensions/")) {
+        const copy = try allocator.dupe(u8, package_path["extensions/".len..]);
+        allocator.free(package_path);
+        package_path = copy;
+    }
+
+    const base = posixBasename(package_path);
+    const stem = pathStem(base);
+    if (std.mem.eql(u8, stem, "index")) {
+        const dir = posixDirname(package_path);
+        if (dir.len == 0 or std.mem.eql(u8, dir, ".")) return allocator.dupe(u8, source_label);
+        return std.fmt.allocPrint(allocator, "{s}:{s}", .{ source_label, dir });
+    }
+
+    return std.fmt.allocPrint(allocator, "{s}:{s}", .{ source_label, package_path });
+}
+
+const CompactDisplayPathSegments = struct {
+    path: []const u8,
+    source_info: ?LoadedResourceSourceInfo,
+    normalized: []u8,
+    segments: [][]const u8,
+    active_len: usize,
+
+    fn deinit(self: *CompactDisplayPathSegments, allocator: std.mem.Allocator) void {
+        allocator.free(self.segments);
+        allocator.free(self.normalized);
+        self.* = undefined;
+    }
+};
+
+fn getCompactDisplayPathSegmentsAlloc(
+    allocator: std.mem.Allocator,
+    resource: LoadedResource,
+    options: LoadedResourcesOptions,
+) !CompactDisplayPathSegments {
+    const display = try formatDisplayPathAlloc(allocator, resource.path, options.home_dir);
+    defer allocator.free(display);
+    const normalized = try slashPathAlloc(allocator, display);
+    errdefer allocator.free(normalized);
+
+    var segments: std.ArrayList([]const u8) = .empty;
+    errdefer segments.deinit(allocator);
+    var it = std.mem.splitScalar(u8, normalized, '/');
+    while (it.next()) |segment| {
+        if (segment.len == 0 or std.mem.eql(u8, segment, "~")) continue;
+        try segments.append(allocator, segment);
+    }
+
+    const active_len = segments.items.len;
+    return .{
+        .path = resource.path,
+        .source_info = resource.source_info,
+        .normalized = normalized,
+        .segments = try segments.toOwnedSlice(allocator),
+        .active_len = active_len,
+    };
+}
+
+fn getCompactNonPackageExtensionLabelAlloc(
+    allocator: std.mem.Allocator,
+    resource_path: []const u8,
+    index: usize,
+    all_paths: []const CompactDisplayPathSegments,
+    options: LoadedResourcesOptions,
+) ![]u8 {
+    if (index >= all_paths.len or all_paths[index].segments.len == 0) {
+        return getCompactPathLabelAlloc(allocator, resource_path, null, options);
+    }
+
+    const segments = all_paths[index].segments[0..all_paths[index].active_len];
+    var segment_count: usize = 1;
+    while (segment_count <= segments.len) : (segment_count += 1) {
+        const candidate = try joinWithSeparatorAlloc(allocator, segments[segments.len - segment_count ..], "/");
+        errdefer allocator.free(candidate);
+        var unique = true;
+        for (all_paths, 0..) |item, item_index| {
+            if (item_index == index) continue;
+            const other_segments = item.segments;
+            const other_active_segments = other_segments[0..item.active_len];
+            if (other_active_segments.len < segment_count) continue;
+            const other = try joinWithSeparatorAlloc(allocator, other_active_segments[other_active_segments.len - segment_count ..], "/");
+            defer allocator.free(other);
+            if (std.mem.eql(u8, candidate, other)) {
+                unique = false;
+                break;
+            }
+        }
+        if (unique) return candidate;
+        allocator.free(candidate);
+    }
+
+    return joinWithSeparatorAlloc(allocator, segments, "/");
+}
+
+fn getCompactExtensionLabelsAlloc(
+    allocator: std.mem.Allocator,
+    extensions: []const LoadedResource,
+    options: LoadedResourcesOptions,
+) ![][]u8 {
+    var non_package: std.ArrayList(CompactDisplayPathSegments) = .empty;
+    defer {
+        for (non_package.items) |*item| item.deinit(allocator);
+        non_package.deinit(allocator);
+    }
+
+    for (extensions) |extension| {
+        if (isPackageSource(extension.source_info)) continue;
+        var segments = try getCompactDisplayPathSegmentsAlloc(allocator, extension, options);
+        errdefer segments.deinit(allocator);
+        if (segments.active_len > 1) {
+            const last = segments.segments[segments.active_len - 1];
+            if (std.mem.eql(u8, last, "index.ts") or std.mem.eql(u8, last, "index.js")) {
+                segments.active_len -= 1;
+            }
+        }
+        try non_package.append(allocator, segments);
+    }
+
+    var labels: std.ArrayList([]u8) = .empty;
+    errdefer freeOwnedStringList(allocator, &labels);
+    for (extensions) |extension| {
+        if (isPackageSource(extension.source_info)) {
+            try labels.append(allocator, try getCompactExtensionLabelAlloc(allocator, extension.path, extension.source_info, options));
+            continue;
+        }
+
+        const non_package_index = findCompactPathIndex(non_package.items, extension.path);
+        if (non_package_index) |index| {
+            try labels.append(
+                allocator,
+                try getCompactNonPackageExtensionLabelAlloc(allocator, extension.path, index, non_package.items, options),
+            );
+        } else {
+            try labels.append(allocator, try getCompactPathLabelAlloc(allocator, extension.path, extension.source_info, options));
+        }
+    }
+    return labels.toOwnedSlice(allocator);
+}
+
+fn findCompactPathIndex(items: []const CompactDisplayPathSegments, path: []const u8) ?usize {
+    for (items, 0..) |item, index| {
+        if (std.mem.eql(u8, item.path, path)) return index;
+    }
+    return null;
+}
+
+const SourceInfoEntry = struct {
+    path: []const u8,
+    source_info: LoadedResourceSourceInfo,
+};
+
+fn collectLoadedSourceInfos(
+    allocator: std.mem.Allocator,
+    entries: *std.ArrayList(SourceInfoEntry),
+    resources: LoadedResourcesSnapshot,
+) !void {
+    for (resources.extensions) |extension| {
+        if (extension.source_info) |info| try entries.append(allocator, .{ .path = extension.path, .source_info = info });
+    }
+    for (resources.skills) |skill| {
+        if (skill.source_info) |info| try entries.append(allocator, .{ .path = skill.file_path, .source_info = info });
+    }
+    for (resources.prompts) |prompt| {
+        if (prompt.source_info) |info| try entries.append(allocator, .{ .path = prompt.file_path, .source_info = info });
+    }
+    for (resources.themes) |loaded_theme| {
+        if (loaded_theme.source_path) |source_path| {
+            if (loaded_theme.source_info) |info| try entries.append(allocator, .{ .path = source_path, .source_info = info });
+        }
+    }
+}
+
+const Scope = enum {
+    user,
+    project,
+    path,
+
+    fn label(self: Scope) []const u8 {
+        return switch (self) {
+            .user => "user",
+            .project => "project",
+            .path => "path",
+        };
+    }
+};
+
+const ScopePackageGroup = struct {
+    source: []const u8,
+    items: std.ArrayList(LoadedResource) = .empty,
+
+    fn deinit(self: *ScopePackageGroup, allocator: std.mem.Allocator) void {
+        self.items.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+const ScopeGroup = struct {
+    scope: Scope,
+    paths: std.ArrayList(LoadedResource) = .empty,
+    packages: std.ArrayList(ScopePackageGroup) = .empty,
+
+    fn deinit(self: *ScopeGroup, allocator: std.mem.Allocator) void {
+        self.paths.deinit(allocator);
+        for (self.packages.items) |*package| package.deinit(allocator);
+        self.packages.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+const ScopeGroups = struct {
+    allocator: std.mem.Allocator,
+    items: std.ArrayList(ScopeGroup),
+
+    fn deinit(self: *ScopeGroups) void {
+        for (self.items.items) |*group| group.deinit(self.allocator);
+        self.items.deinit(self.allocator);
+        self.* = undefined;
+    }
+};
+
+fn buildScopeGroups(allocator: std.mem.Allocator, items: []const LoadedResource) !ScopeGroups {
+    var project = ScopeGroup{ .scope = .project };
+    errdefer project.deinit(allocator);
+    var user = ScopeGroup{ .scope = .user };
+    errdefer user.deinit(allocator);
+    var path = ScopeGroup{ .scope = .path };
+    errdefer path.deinit(allocator);
+
+    for (items) |item| {
+        const group = switch (getScopeGroup(item.source_info)) {
+            .project => &project,
+            .user => &user,
+            .path => &path,
+        };
+        if (isPackageSource(item.source_info)) {
+            const source = if (item.source_info) |info| info.source else "local";
+            try appendPackageItem(allocator, group, source, item);
+        } else {
+            try group.paths.append(allocator, item);
+        }
+    }
+
+    var groups: std.ArrayList(ScopeGroup) = .empty;
+    errdefer {
+        for (groups.items) |*group| group.deinit(allocator);
+        groups.deinit(allocator);
+    }
+    if (project.paths.items.len > 0 or project.packages.items.len > 0) {
+        try groups.append(allocator, project);
+        project = ScopeGroup{ .scope = .project };
+    }
+    if (user.paths.items.len > 0 or user.packages.items.len > 0) {
+        try groups.append(allocator, user);
+        user = ScopeGroup{ .scope = .user };
+    }
+    if (path.paths.items.len > 0 or path.packages.items.len > 0) {
+        try groups.append(allocator, path);
+        path = ScopeGroup{ .scope = .path };
+    }
+
+    return .{ .allocator = allocator, .items = groups };
+}
+
+fn appendPackageItem(
+    allocator: std.mem.Allocator,
+    group: *ScopeGroup,
+    source: []const u8,
+    item: LoadedResource,
+) !void {
+    for (group.packages.items) |*package| {
+        if (std.mem.eql(u8, package.source, source)) {
+            try package.items.append(allocator, item);
+            return;
+        }
+    }
+    var package = ScopePackageGroup{ .source = source };
+    errdefer package.deinit(allocator);
+    try package.items.append(allocator, item);
+    try group.packages.append(allocator, package);
+}
+
+fn getScopeGroup(maybe_info: ?LoadedResourceSourceInfo) Scope {
+    const info = maybe_info orelse return .project;
+    if (std.mem.eql(u8, info.source, "cli") or info.scope == .temporary) return .path;
+    if (info.scope == .user) return .user;
+    if (info.scope == .project) return .project;
+    return .path;
+}
+
+fn isPackageSource(maybe_info: ?LoadedResourceSourceInfo) bool {
+    const info = maybe_info orelse return false;
+    return std.mem.startsWith(u8, info.source, "npm:") or std.mem.startsWith(u8, info.source, "git:");
+}
+
+fn formatScopeGroupsAlloc(
+    allocator: std.mem.Allocator,
+    groups: []ScopeGroup,
+    options: LoadedResourcesOptions,
+    kind: LoadedResourcesController.ScopeFormatKind,
+    prompt_names: ?[]const LoadedPromptResource,
+) ![]u8 {
+    var lines: std.ArrayList([]u8) = .empty;
+    defer freeOwnedStringList(allocator, &lines);
+
+    for (groups) |*group| {
+        std.mem.sort(LoadedResource, group.paths.items, {}, loadedResourceLessThan);
+        std.mem.sort(ScopePackageGroup, group.packages.items, {}, packageGroupLessThan);
+
+        const styled_scope = try options.theme.fgAlloc(allocator, .accent, group.scope.label());
+        defer allocator.free(styled_scope);
+        try lines.append(allocator, try std.fmt.allocPrint(allocator, "  {s}", .{styled_scope}));
+
+        for (group.paths.items) |item| {
+            const label = try formatScopeItemPathAlloc(allocator, item, options, kind, prompt_names, false);
+            defer allocator.free(label);
+            const raw = try std.fmt.allocPrint(allocator, "    {s}", .{label});
+            defer allocator.free(raw);
+            try lines.append(allocator, try options.theme.fgAlloc(allocator, .dim, raw));
+        }
+
+        for (group.packages.items) |*package| {
+            std.mem.sort(LoadedResource, package.items.items, {}, loadedResourceLessThan);
+            const styled_source = try options.theme.fgAlloc(allocator, .accent, package.source);
+            defer allocator.free(styled_source);
+            try lines.append(allocator, try std.fmt.allocPrint(allocator, "    {s}", .{styled_source}));
+            for (package.items.items) |item| {
+                const label = try formatScopeItemPathAlloc(allocator, item, options, kind, prompt_names, true);
+                defer allocator.free(label);
+                const raw = try std.fmt.allocPrint(allocator, "      {s}", .{label});
+                defer allocator.free(raw);
+                try lines.append(allocator, try options.theme.fgAlloc(allocator, .dim, raw));
+            }
+        }
+    }
+
+    return joinLinesAlloc(allocator, lines.items);
+}
+
+fn formatScopeItemPathAlloc(
+    allocator: std.mem.Allocator,
+    item: LoadedResource,
+    options: LoadedResourcesOptions,
+    kind: LoadedResourcesController.ScopeFormatKind,
+    prompt_names: ?[]const LoadedPromptResource,
+    package_path: bool,
+) ![]u8 {
+    if (prompt_names) |prompts| {
+        if (findPromptByPath(prompts, item.path)) |prompt| {
+            return std.fmt.allocPrint(allocator, "/{s}", .{prompt.name});
+        }
+    }
+
+    return switch (kind) {
+        .display_path => if (package_path)
+            getShortPathAlloc(allocator, item.path, item.source_info, options)
+        else
+            formatDisplayPathAlloc(allocator, item.path, options.home_dir),
+        .extension_path => if (package_path) blk: {
+            const short_path = try getShortPathAlloc(allocator, item.path, item.source_info, options);
+            defer allocator.free(short_path);
+            break :blk formatExtensionDisplayPathAlloc(allocator, short_path, options);
+        } else formatExtensionDisplayPathAlloc(allocator, item.path, options),
+    };
+}
+
+fn findPromptByPath(prompts: []const LoadedPromptResource, path: []const u8) ?LoadedPromptResource {
+    for (prompts) |prompt| {
+        if (std.mem.eql(u8, prompt.file_path, path)) return prompt;
+    }
+    return null;
+}
+
+const DisplayDiagnosticType = enum {
+    warning,
+    @"error",
+    collision,
+};
+
+const DisplayDiagnostic = struct {
+    type: DisplayDiagnosticType,
+    message: []const u8,
+    path: []const u8 = "",
+    collision: ?resource_loader.ResourceCollision = null,
+};
+
+fn appendResourceDiagnostics(
+    allocator: std.mem.Allocator,
+    diagnostics: *std.ArrayList(DisplayDiagnostic),
+    source: []const resource_loader.ResourceDiagnostic,
+) !void {
+    for (source) |diagnostic| {
+        try diagnostics.append(allocator, displayDiagnosticFromResourceDiagnostic(diagnostic));
+    }
+}
+
+fn displayDiagnosticFromResourceDiagnostic(diagnostic: resource_loader.ResourceDiagnostic) DisplayDiagnostic {
+    return .{
+        .type = switch (diagnostic.type) {
+            .warning => .warning,
+            .collision => .collision,
+        },
+        .message = diagnostic.message,
+        .path = diagnostic.path,
+        .collision = diagnostic.collision,
+    };
+}
+
+fn formatDiagnosticsAlloc(
+    allocator: std.mem.Allocator,
+    diagnostics: []const resource_loader.ResourceDiagnostic,
+    source_infos: []const SourceInfoEntry,
+    options: LoadedResourcesOptions,
+) ![]u8 {
+    var display: std.ArrayList(DisplayDiagnostic) = .empty;
+    defer display.deinit(allocator);
+    try appendResourceDiagnostics(allocator, &display, diagnostics);
+    return formatDisplayDiagnosticsAlloc(allocator, display.items, source_infos, options);
+}
+
+fn formatDisplayDiagnosticsAlloc(
+    allocator: std.mem.Allocator,
+    diagnostics: []const DisplayDiagnostic,
+    source_infos: []const SourceInfoEntry,
+    options: LoadedResourcesOptions,
+) ![]u8 {
+    var lines: std.ArrayList([]u8) = .empty;
+    defer freeOwnedStringList(allocator, &lines);
+
+    for (diagnostics) |diagnostic| {
+        if (diagnostic.type == .collision and diagnostic.collision != null) {
+            const collision = diagnostic.collision.?;
+            const raw_header = try std.fmt.allocPrint(allocator, "  \"{s}\" collision:", .{collision.name});
+            defer allocator.free(raw_header);
+            try lines.append(allocator, try options.theme.fgAlloc(allocator, .warning, raw_header));
+
+            const winner = try formatPathWithSourceAlloc(
+                allocator,
+                collision.winner_path,
+                findSourceInfoForPath(collision.winner_path, source_infos),
+                options,
+            );
+            defer allocator.free(winner);
+            const raw_winner = try std.fmt.allocPrint(allocator, "    ✓ {s}", .{winner});
+            defer allocator.free(raw_winner);
+            try lines.append(allocator, try options.theme.fgAlloc(allocator, .dim, raw_winner));
+
+            const loser = try formatPathWithSourceAlloc(
+                allocator,
+                collision.loser_path,
+                findSourceInfoForPath(collision.loser_path, source_infos),
+                options,
+            );
+            defer allocator.free(loser);
+            const raw_loser = try std.fmt.allocPrint(allocator, "    ✗ {s} (skipped)", .{loser});
+            defer allocator.free(raw_loser);
+            try lines.append(allocator, try options.theme.fgAlloc(allocator, .dim, raw_loser));
+            continue;
+        }
+
+        const color: render_utils.ThemeColor = if (diagnostic.type == .@"error") .@"error" else .warning;
+        if (diagnostic.path.len > 0) {
+            const formatted_path = try formatPathWithSourceAlloc(
+                allocator,
+                diagnostic.path,
+                findSourceInfoForPath(diagnostic.path, source_infos),
+                options,
+            );
+            defer allocator.free(formatted_path);
+            const raw_path = try std.fmt.allocPrint(allocator, "  {s}", .{formatted_path});
+            defer allocator.free(raw_path);
+            try lines.append(allocator, try options.theme.fgAlloc(allocator, color, raw_path));
+            const raw_message = try std.fmt.allocPrint(allocator, "    {s}", .{diagnostic.message});
+            defer allocator.free(raw_message);
+            try lines.append(allocator, try options.theme.fgAlloc(allocator, color, raw_message));
+        } else {
+            const raw_message = try std.fmt.allocPrint(allocator, "  {s}", .{diagnostic.message});
+            defer allocator.free(raw_message);
+            try lines.append(allocator, try options.theme.fgAlloc(allocator, color, raw_message));
+        }
+    }
+
+    return joinLinesAlloc(allocator, lines.items);
+}
+
+fn findSourceInfoForPath(path: []const u8, source_infos: []const SourceInfoEntry) ?LoadedResourceSourceInfo {
+    for (source_infos) |entry| {
+        if (std.mem.eql(u8, entry.path, path)) return entry.source_info;
+    }
+
+    var current = path;
+    while (std.mem.lastIndexOfScalar(u8, current, '/')) |slash| {
+        current = current[0..slash];
+        for (source_infos) |entry| {
+            if (std.mem.eql(u8, entry.path, current)) return entry.source_info;
+        }
+    }
+    return null;
+}
+
+fn formatPathWithSourceAlloc(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    maybe_info: ?LoadedResourceSourceInfo,
+    options: LoadedResourcesOptions,
+) ![]u8 {
+    const info = maybe_info orelse return formatDisplayPathAlloc(allocator, path, options.home_dir);
+    const short_path = try getShortPathAlloc(allocator, path, info, options);
+    defer allocator.free(short_path);
+    const display = getDisplaySourceInfo(info);
+    if (display.scope_label) |scope_label| {
+        return std.fmt.allocPrint(allocator, "{s} ({s}) {s}", .{ display.label, scope_label, short_path });
+    }
+    return std.fmt.allocPrint(allocator, "{s} {s}", .{ display.label, short_path });
+}
+
+const DisplaySourceInfo = struct {
+    label: []const u8,
+    scope_label: ?[]const u8 = null,
+};
+
+fn getDisplaySourceInfo(info: LoadedResourceSourceInfo) DisplaySourceInfo {
+    if (std.mem.eql(u8, info.source, "local")) {
+        return switch (info.scope) {
+            .user => .{ .label = "user" },
+            .project => .{ .label = "project" },
+            .temporary => .{ .label = "path", .scope_label = "temp" },
+        };
+    }
+
+    if (std.mem.eql(u8, info.source, "cli")) {
+        return .{
+            .label = "path",
+            .scope_label = if (info.scope == .temporary) "temp" else null,
+        };
+    }
+
+    return .{
+        .label = info.source,
+        .scope_label = switch (info.scope) {
+            .user => "user",
+            .project => "project",
+            .temporary => "temp",
+        },
+    };
+}
+
+fn loadedResourcesFromSkillsAlloc(allocator: std.mem.Allocator, skills: []const LoadedSkillResource) ![]LoadedResource {
+    var items = try allocator.alloc(LoadedResource, skills.len);
+    for (skills, 0..) |skill, index| {
+        items[index] = .{ .path = skill.file_path, .source_info = skill.source_info };
+    }
+    return items;
+}
+
+fn loadedResourcesFromPromptsAlloc(allocator: std.mem.Allocator, prompts: []const LoadedPromptResource) ![]LoadedResource {
+    var items = try allocator.alloc(LoadedResource, prompts.len);
+    for (prompts, 0..) |prompt, index| {
+        items[index] = .{ .path = prompt.file_path, .source_info = prompt.source_info };
+    }
+    return items;
+}
+
+fn loadedResourcesFromThemesAlloc(allocator: std.mem.Allocator, themes: []const LoadedThemeResource) ![]LoadedResource {
+    var count: usize = 0;
+    for (themes) |loaded_theme| {
+        if (loaded_theme.source_path != null) count += 1;
+    }
+    var items = try allocator.alloc(LoadedResource, count);
+    var index: usize = 0;
+    for (themes) |loaded_theme| {
+        if (loaded_theme.source_path) |source_path| {
+            items[index] = .{ .path = source_path, .source_info = loaded_theme.source_info };
+            index += 1;
+        }
+    }
+    return items;
+}
+
+fn stringListFromSkillsAlloc(allocator: std.mem.Allocator, skills: []const LoadedSkillResource) ![][]const u8 {
+    var items = try allocator.alloc([]const u8, skills.len);
+    for (skills, 0..) |skill, index| items[index] = skill.name;
+    return items;
+}
+
+fn commandNamesFromPromptsAlloc(allocator: std.mem.Allocator, prompts: []const LoadedPromptResource) ![][]u8 {
+    var items = try allocator.alloc([]u8, prompts.len);
+    errdefer {
+        for (items[0..]) |item| if (item.len > 0) allocator.free(item);
+        allocator.free(items);
+    }
+    for (prompts, 0..) |prompt, index| {
+        items[index] = try std.fmt.allocPrint(allocator, "/{s}", .{prompt.name});
+    }
+    return items;
+}
+
+fn compactNamesFromThemesAlloc(
+    allocator: std.mem.Allocator,
+    themes: []const LoadedThemeResource,
+    options: LoadedResourcesOptions,
+) ![][]u8 {
+    var labels: std.ArrayList([]u8) = .empty;
+    errdefer freeOwnedStringList(allocator, &labels);
+    for (themes) |loaded_theme| {
+        const source_path = loaded_theme.source_path orelse continue;
+        if (loaded_theme.name) |name| {
+            try labels.append(allocator, try allocator.dupe(u8, name));
+        } else {
+            try labels.append(allocator, try getCompactPathLabelAlloc(allocator, source_path, loaded_theme.source_info, options));
+        }
+    }
+    return labels.toOwnedSlice(allocator);
+}
+
+fn npmPackageRemainder(path: []const u8) ?[]const u8 {
+    const normalized_start = std.mem.indexOf(u8, path, "node_modules/") orelse return null;
+    var rest = path[normalized_start + "node_modules/".len ..];
+    if (rest.len == 0) return null;
+    if (rest[0] == '@') {
+        const first_slash = std.mem.indexOfScalar(u8, rest, '/') orelse return null;
+        const second_slash = std.mem.indexOfScalarPos(u8, rest, first_slash + 1, '/') orelse return null;
+        return rest[second_slash + 1 ..];
+    }
+    const first_slash = std.mem.indexOfScalar(u8, rest, '/') orelse return null;
+    rest = rest[first_slash + 1 ..];
+    return if (rest.len > 0) rest else null;
+}
+
+fn gitPackageRemainder(path: []const u8) ?[]const u8 {
+    const git_index = std.mem.indexOf(u8, path, "git/") orelse return null;
+    var rest = path[git_index + "git/".len ..];
+    var slash = std.mem.indexOfScalar(u8, rest, '/') orelse return null;
+    rest = rest[slash + 1 ..];
+    slash = std.mem.indexOfScalar(u8, rest, '/') orelse return null;
+    rest = rest[slash + 1 ..];
+    return if (rest.len > 0) rest else null;
+}
+
+fn stripSuffix(value: []const u8, suffix: []const u8) ?[]const u8 {
+    if (!std.mem.endsWith(u8, value, suffix)) return null;
+    return value[0 .. value.len - suffix.len];
+}
+
+fn slashPathAlloc(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
+    const output = try allocator.dupe(u8, value);
+    for (output) |*byte| {
+        if (byte.* == '\\') byte.* = '/';
+    }
+    return output;
+}
+
+fn posixBasename(path: []const u8) []const u8 {
+    const slash = std.mem.lastIndexOfScalar(u8, path, '/') orelse return path;
+    return path[slash + 1 ..];
+}
+
+fn posixDirname(path: []const u8) []const u8 {
+    const slash = std.mem.lastIndexOfScalar(u8, path, '/') orelse return "";
+    if (slash == 0) return "/";
+    return path[0..slash];
+}
+
+fn pathStem(base: []const u8) []const u8 {
+    const dot = std.mem.lastIndexOfScalar(u8, base, '.') orelse return base;
+    if (dot == 0) return base;
+    return base[0..dot];
+}
+
+fn joinLinesAlloc(allocator: std.mem.Allocator, lines: []const []const u8) ![]u8 {
+    return joinWithSeparatorAlloc(allocator, lines, "\n");
+}
+
+fn joinWithSeparatorAlloc(allocator: std.mem.Allocator, items: []const []const u8, separator: []const u8) ![]u8 {
+    var total: usize = 0;
+    for (items, 0..) |item, index| {
+        if (index > 0) total += separator.len;
+        total += item.len;
+    }
+
+    var output = try allocator.alloc(u8, total);
+    var offset: usize = 0;
+    for (items, 0..) |item, index| {
+        if (index > 0) {
+            @memcpy(output[offset .. offset + separator.len], separator);
+            offset += separator.len;
+        }
+        @memcpy(output[offset .. offset + item.len], item);
+        offset += item.len;
+    }
+    return output;
+}
+
+fn freeOwnedStringList(allocator: std.mem.Allocator, list: *std.ArrayList([]u8)) void {
+    for (list.items) |item| allocator.free(item);
+    list.deinit(allocator);
+}
+
+fn freeOwnedStrings(allocator: std.mem.Allocator, items: []const []u8) void {
+    for (items) |item| allocator.free(item);
+    allocator.free(items);
+}
+
+fn loadedResourceLessThan(_: void, lhs: LoadedResource, rhs: LoadedResource) bool {
+    return std.mem.order(u8, lhs.path, rhs.path) == .lt;
+}
+
+fn packageGroupLessThan(_: void, lhs: ScopePackageGroup, rhs: ScopePackageGroup) bool {
+    return std.mem.order(u8, lhs.source, rhs.source) == .lt;
+}
+
+fn stringLessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
+    const min_len = @min(lhs.len, rhs.len);
+    var index: usize = 0;
+    while (index < min_len) : (index += 1) {
+        const left = std.ascii.toLower(lhs[index]);
+        const right = std.ascii.toLower(rhs[index]);
+        if (left < right) return true;
+        if (left > right) return false;
+    }
+    if (lhs.len != rhs.len) return lhs.len < rhs.len;
+    return std.mem.order(u8, lhs, rhs) == .lt;
 }
 
 pub const InteractiveEventUi = struct {
@@ -2319,7 +3531,355 @@ const TestImportRuntimeHost = struct {
     }
 };
 
+fn testSourceInfo(
+    file_path: []const u8,
+    source: []const u8,
+    scope: source_info.SourceScope,
+    origin: source_info.SourceOrigin,
+    base_dir: ?[]const u8,
+) LoadedResourceSourceInfo {
+    return .{
+        .path = file_path,
+        .source = source,
+        .scope = scope,
+        .origin = origin,
+        .base_dir = base_dir,
+    };
+}
+
+fn renderContainerNormalizedAlloc(allocator: std.mem.Allocator, container: *tui.Container) ![]u8 {
+    const lines = try container.render(allocator, 240);
+    defer {
+        for (lines) |line| allocator.free(line);
+        allocator.free(lines);
+    }
+
+    var filtered: std.ArrayList([]u8) = .empty;
+    defer freeOwnedStringList(allocator, &filtered);
+    for (lines) |line| {
+        if (std.mem.trim(u8, line, " \t\r\n").len == 0) continue;
+        try filtered.append(allocator, try allocator.dupe(u8, trimRightAscii(line, " \t\r\n")));
+    }
+    return joinLinesAlloc(allocator, filtered.items);
+}
+
+fn expectRenderedContains(container: *tui.Container, needle: []const u8) !void {
+    const allocator = std.testing.allocator;
+    const output = try renderContainerNormalizedAlloc(allocator, container);
+    defer allocator.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, needle) != null);
+}
+
+fn expectRenderedNotContains(container: *tui.Container, needle: []const u8) !void {
+    const allocator = std.testing.allocator;
+    const output = try renderContainerNormalizedAlloc(allocator, container);
+    defer allocator.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, needle) == null);
+}
+
+fn trimRightAscii(value: []const u8, values_to_strip: []const u8) []const u8 {
+    var end = value.len;
+    while (end > 0 and std.mem.indexOfScalar(u8, values_to_strip, value[end - 1]) != null) {
+        end -= 1;
+    }
+    return value[0..end];
+}
+
 // Ported from packages/coding-agent/test/interactive-mode-status.test.ts.
+test "InteractiveMode showLoadedResources shows a compact resource listing by default" {
+    const allocator = std.testing.allocator;
+    var chat_container = tui.Container.init(allocator);
+    defer chat_container.deinit();
+    var controller = LoadedResourcesController.init(allocator, &chat_container);
+    defer controller.deinit();
+
+    const skills = [_]LoadedSkillResource{.{ .file_path = "/tmp/skill/SKILL.md", .name = "commit" }};
+    try controller.showLoadedResources(.{ .skills = &skills }, .{
+        .quiet_startup = false,
+        .scope_groups_override = "resource-list",
+    });
+
+    try expectRenderedContains(&chat_container, "[Skills]");
+    try expectRenderedContains(&chat_container, "commit");
+    try expectRenderedNotContains(&chat_container, "resource-list");
+}
+
+test "InteractiveMode showLoadedResources shows full resource listing when expanded" {
+    const allocator = std.testing.allocator;
+    var chat_container = tui.Container.init(allocator);
+    defer chat_container.deinit();
+    var controller = LoadedResourcesController.init(allocator, &chat_container);
+    defer controller.deinit();
+
+    const skills = [_]LoadedSkillResource{.{ .file_path = "/tmp/skill/SKILL.md", .name = "commit" }};
+    try controller.showLoadedResources(.{ .skills = &skills }, .{
+        .quiet_startup = false,
+        .tool_output_expanded = true,
+        .scope_groups_override = "resource-list",
+    });
+
+    try expectRenderedContains(&chat_container, "[Skills]");
+    try expectRenderedContains(&chat_container, "resource-list");
+    try expectRenderedNotContains(&chat_container, "commit");
+}
+
+test "InteractiveMode showLoadedResources shows full resource listing on verbose startup even when tool output is collapsed" {
+    const allocator = std.testing.allocator;
+    var chat_container = tui.Container.init(allocator);
+    defer chat_container.deinit();
+    var controller = LoadedResourcesController.init(allocator, &chat_container);
+    defer controller.deinit();
+
+    const skills = [_]LoadedSkillResource{.{ .file_path = "/tmp/skill/SKILL.md", .name = "commit" }};
+    try controller.showLoadedResources(.{ .skills = &skills }, .{
+        .quiet_startup = true,
+        .verbose = true,
+        .tool_output_expanded = false,
+        .scope_groups_override = "resource-list",
+    });
+
+    try expectRenderedContains(&chat_container, "[Skills]");
+    try expectRenderedContains(&chat_container, "resource-list");
+    try expectRenderedNotContains(&chat_container, "commit");
+}
+
+test "InteractiveMode showLoadedResources abbreviates extensions in compact listing" {
+    const allocator = std.testing.allocator;
+    var chat_container = tui.Container.init(allocator);
+    defer chat_container.deinit();
+    var controller = LoadedResourcesController.init(allocator, &chat_container);
+    defer controller.deinit();
+
+    const extensions = [_]LoadedResource{
+        .{ .path = "/tmp/extensions/answer.ts" },
+        .{ .path = "/tmp/extensions/btw.ts" },
+    };
+    try controller.showLoadedResources(.{ .extensions = &extensions }, .{ .quiet_startup = false });
+
+    try expectRenderedContains(&chat_container, "[Extensions]");
+    try expectRenderedContains(&chat_container, "answer.ts, btw.ts");
+    try expectRenderedNotContains(&chat_container, "extensions/answer.ts");
+}
+
+test "InteractiveMode showLoadedResources captures mixed extension layouts in compact output" {
+    const allocator = std.testing.allocator;
+    var chat_container = tui.Container.init(allocator);
+    defer chat_container.deinit();
+    var controller = LoadedResourcesController.init(allocator, &chat_container);
+    defer controller.deinit();
+
+    const extensions = [_]LoadedResource{
+        .{ .path = "/tmp/project/.bulb/extensions/answer.ts", .source_info = testSourceInfo("/tmp/project/.bulb/extensions/answer.ts", "local", .project, .top_level, "/tmp/project/.bulb/extensions") },
+        .{ .path = "/tmp/project/.bulb/extensions/local-index/index.ts", .source_info = testSourceInfo("/tmp/project/.bulb/extensions/local-index/index.ts", "local", .project, .top_level, "/tmp/project/.bulb/extensions") },
+        .{ .path = "/tmp/agent/extensions/user-index/index.ts", .source_info = testSourceInfo("/tmp/agent/extensions/user-index/index.ts", "local", .user, .top_level, "/tmp/agent/extensions") },
+        .{ .path = "/tmp/project/.bulb/npm/node_modules/pi-markdown-preview/extensions/index.ts", .source_info = testSourceInfo("/tmp/project/.bulb/npm/node_modules/pi-markdown-preview/extensions/index.ts", "npm:pi-markdown-preview", .project, .package, "/tmp/project/.bulb/npm/node_modules/pi-markdown-preview") },
+        .{ .path = "/tmp/project/.bulb/npm/node_modules/@scope/pi-scoped/extensions/index.ts", .source_info = testSourceInfo("/tmp/project/.bulb/npm/node_modules/@scope/pi-scoped/extensions/index.ts", "npm:@scope/pi-scoped", .project, .package, "/tmp/project/.bulb/npm/node_modules/@scope/pi-scoped") },
+        .{ .path = "/tmp/project/.bulb/git/github.com/HazAT/pi-interactive-subagents/extensions/index.ts", .source_info = testSourceInfo("/tmp/project/.bulb/git/github.com/HazAT/pi-interactive-subagents/extensions/index.ts", "git:github.com/HazAT/pi-interactive-subagents", .project, .package, "/tmp/project/.bulb/git/github.com/HazAT/pi-interactive-subagents") },
+        .{ .path = "/tmp/project/.bulb/git/github.com/HazAT/pi-interactive-subagents/extensions/subagents/index.ts", .source_info = testSourceInfo("/tmp/project/.bulb/git/github.com/HazAT/pi-interactive-subagents/extensions/subagents/index.ts", "git:github.com/HazAT/pi-interactive-subagents", .project, .package, "/tmp/project/.bulb/git/github.com/HazAT/pi-interactive-subagents") },
+        .{ .path = "/tmp/temp/cli-extension.ts", .source_info = testSourceInfo("/tmp/temp/cli-extension.ts", "cli", .temporary, .top_level, "/tmp/temp") },
+    };
+    try controller.showLoadedResources(.{ .extensions = &extensions }, .{ .quiet_startup = false });
+
+    const output = try renderContainerNormalizedAlloc(allocator, &chat_container);
+    defer allocator.free(output);
+    try std.testing.expectEqualStrings(
+        "[Extensions]\n  @scope/pi-scoped, answer.ts, cli-extension.ts, HazAT/pi-interactive-subagents, HazAT/pi-interactive-subagents:subagents, local-index, pi-markdown-preview, user-index",
+        output,
+    );
+}
+
+test "InteractiveMode showLoadedResources adds more parent folders until local extension labels are unique" {
+    const allocator = std.testing.allocator;
+    var chat_container = tui.Container.init(allocator);
+    defer chat_container.deinit();
+    var controller = LoadedResourcesController.init(allocator, &chat_container);
+    defer controller.deinit();
+
+    const extensions = [_]LoadedResource{
+        .{ .path = "/tmp/alpha/one/index.ts", .source_info = testSourceInfo("/tmp/alpha/one/index.ts", "cli", .temporary, .top_level, "/tmp/alpha") },
+        .{ .path = "/tmp/beta/one/index.ts", .source_info = testSourceInfo("/tmp/beta/one/index.ts", "cli", .temporary, .top_level, "/tmp/beta") },
+        .{ .path = "/tmp/gamma/one/index.ts", .source_info = testSourceInfo("/tmp/gamma/one/index.ts", "cli", .temporary, .top_level, "/tmp/gamma") },
+    };
+    try controller.showLoadedResources(.{ .extensions = &extensions }, .{ .quiet_startup = false });
+
+    const output = try renderContainerNormalizedAlloc(allocator, &chat_container);
+    defer allocator.free(output);
+    try std.testing.expectEqualStrings("[Extensions]\n  alpha/one, beta/one, gamma/one", output);
+}
+
+test "InteractiveMode showLoadedResources strips index files from local extension labels" {
+    const allocator = std.testing.allocator;
+    var chat_container = tui.Container.init(allocator);
+    defer chat_container.deinit();
+    var controller = LoadedResourcesController.init(allocator, &chat_container);
+    defer controller.deinit();
+
+    const extensions = [_]LoadedResource{
+        .{ .path = "/tmp/extensions/plan-mode/index.ts", .source_info = testSourceInfo("/tmp/extensions/plan-mode/index.ts", "local", .project, .top_level, "/tmp/extensions") },
+        .{ .path = "/tmp/extensions/legacy-mode/index.js", .source_info = testSourceInfo("/tmp/extensions/legacy-mode/index.js", "local", .project, .top_level, "/tmp/extensions") },
+        .{ .path = "/tmp/extensions/webfetch.ts", .source_info = testSourceInfo("/tmp/extensions/webfetch.ts", "local", .project, .top_level, "/tmp/extensions") },
+    };
+    try controller.showLoadedResources(.{ .extensions = &extensions }, .{ .quiet_startup = false });
+
+    const output = try renderContainerNormalizedAlloc(allocator, &chat_container);
+    defer allocator.free(output);
+    try std.testing.expectEqualStrings("[Extensions]\n  legacy-mode, plan-mode, webfetch.ts", output);
+}
+
+test "InteractiveMode showLoadedResources disambiguates repeated index parent directories" {
+    const allocator = std.testing.allocator;
+    var chat_container = tui.Container.init(allocator);
+    defer chat_container.deinit();
+    var controller = LoadedResourcesController.init(allocator, &chat_container);
+    defer controller.deinit();
+
+    const extensions = [_]LoadedResource{
+        .{ .path = "/tmp/alpha/tools/index.ts", .source_info = testSourceInfo("/tmp/alpha/tools/index.ts", "cli", .temporary, .top_level, "/tmp/alpha") },
+        .{ .path = "/tmp/beta/tools/index.ts", .source_info = testSourceInfo("/tmp/beta/tools/index.ts", "cli", .temporary, .top_level, "/tmp/beta") },
+    };
+    try controller.showLoadedResources(.{ .extensions = &extensions }, .{ .quiet_startup = false });
+
+    const output = try renderContainerNormalizedAlloc(allocator, &chat_container);
+    defer allocator.free(output);
+    try std.testing.expectEqualStrings("[Extensions]\n  alpha/tools, beta/tools", output);
+}
+
+test "InteractiveMode showLoadedResources keeps non-index file names and package extension labels" {
+    const allocator = std.testing.allocator;
+    var chat_container = tui.Container.init(allocator);
+    defer chat_container.deinit();
+    var controller = LoadedResourcesController.init(allocator, &chat_container);
+    defer controller.deinit();
+
+    const extensions = [_]LoadedResource{
+        .{ .path = "/tmp/extensions/my-ext/main.ts", .source_info = testSourceInfo("/tmp/extensions/my-ext/main.ts", "local", .project, .top_level, "/tmp/extensions") },
+        .{ .path = "/tmp/project/.bulb/npm/node_modules/pi-markdown-preview/extensions/index.ts", .source_info = testSourceInfo("/tmp/project/.bulb/npm/node_modules/pi-markdown-preview/extensions/index.ts", "npm:pi-markdown-preview", .project, .package, "/tmp/project/.bulb/npm/node_modules/pi-markdown-preview") },
+    };
+    try controller.showLoadedResources(.{ .extensions = &extensions }, .{ .quiet_startup = false });
+
+    const output = try renderContainerNormalizedAlloc(allocator, &chat_container);
+    defer allocator.free(output);
+    try std.testing.expectEqualStrings("[Extensions]\n  main.ts, pi-markdown-preview", output);
+}
+
+test "InteractiveMode showLoadedResources captures mixed extension layouts in expanded output" {
+    const allocator = std.testing.allocator;
+    var chat_container = tui.Container.init(allocator);
+    defer chat_container.deinit();
+    var controller = LoadedResourcesController.init(allocator, &chat_container);
+    defer controller.deinit();
+
+    const extensions = [_]LoadedResource{
+        .{ .path = "/tmp/project/.bulb/extensions/answer.ts", .source_info = testSourceInfo("/tmp/project/.bulb/extensions/answer.ts", "local", .project, .top_level, "/tmp/project/.bulb/extensions") },
+        .{ .path = "/tmp/project/.bulb/extensions/local-index/index.ts", .source_info = testSourceInfo("/tmp/project/.bulb/extensions/local-index/index.ts", "local", .project, .top_level, "/tmp/project/.bulb/extensions") },
+        .{ .path = "/tmp/agent/extensions/user-index/index.ts", .source_info = testSourceInfo("/tmp/agent/extensions/user-index/index.ts", "local", .user, .top_level, "/tmp/agent/extensions") },
+        .{ .path = "/tmp/project/.bulb/npm/node_modules/pi-markdown-preview/extensions/index.ts", .source_info = testSourceInfo("/tmp/project/.bulb/npm/node_modules/pi-markdown-preview/extensions/index.ts", "npm:pi-markdown-preview", .project, .package, "/tmp/project/.bulb/npm/node_modules/pi-markdown-preview") },
+        .{ .path = "/tmp/project/.bulb/npm/node_modules/@scope/pi-scoped/extensions/index.ts", .source_info = testSourceInfo("/tmp/project/.bulb/npm/node_modules/@scope/pi-scoped/extensions/index.ts", "npm:@scope/pi-scoped", .project, .package, "/tmp/project/.bulb/npm/node_modules/@scope/pi-scoped") },
+        .{ .path = "/tmp/project/.bulb/git/github.com/HazAT/pi-interactive-subagents/extensions/index.ts", .source_info = testSourceInfo("/tmp/project/.bulb/git/github.com/HazAT/pi-interactive-subagents/extensions/index.ts", "git:github.com/HazAT/pi-interactive-subagents", .project, .package, "/tmp/project/.bulb/git/github.com/HazAT/pi-interactive-subagents") },
+        .{ .path = "/tmp/project/.bulb/git/github.com/HazAT/pi-interactive-subagents/extensions/subagents/index.ts", .source_info = testSourceInfo("/tmp/project/.bulb/git/github.com/HazAT/pi-interactive-subagents/extensions/subagents/index.ts", "git:github.com/HazAT/pi-interactive-subagents", .project, .package, "/tmp/project/.bulb/git/github.com/HazAT/pi-interactive-subagents") },
+        .{ .path = "/tmp/temp/cli-extension.ts", .source_info = testSourceInfo("/tmp/temp/cli-extension.ts", "cli", .temporary, .top_level, "/tmp/temp") },
+    };
+    try controller.showLoadedResources(.{ .extensions = &extensions }, .{
+        .quiet_startup = false,
+        .tool_output_expanded = true,
+    });
+
+    const output = try renderContainerNormalizedAlloc(allocator, &chat_container);
+    defer allocator.free(output);
+    try std.testing.expectEqualStrings(
+        "[Extensions]\n  project\n    /tmp/project/.bulb/extensions/answer.ts\n    /tmp/project/.bulb/extensions/local-index\n    git:github.com/HazAT/pi-interactive-subagents\n      extensions\n      extensions/subagents\n    npm:@scope/pi-scoped\n      extensions\n    npm:pi-markdown-preview\n      extensions\n  user\n    /tmp/agent/extensions/user-index\n  path\n    /tmp/temp/cli-extension.ts",
+        output,
+    );
+}
+
+test "InteractiveMode showLoadedResources formats context paths compactly and fully when expanded" {
+    const allocator = std.testing.allocator;
+    const home = "/Users/example";
+    const cwd = try std.fs.path.join(allocator, &.{ home, "Development", "bulb-mono" });
+    defer allocator.free(cwd);
+    const global_agents = try std.fs.path.join(allocator, &.{ home, ".bulb", "agent", "AGENTS.md" });
+    defer allocator.free(global_agents);
+    const project_agents = try std.fs.path.join(allocator, &.{ cwd, "AGENTS.md" });
+    defer allocator.free(project_agents);
+
+    const context_files = [_]LoadedContextFile{
+        .{ .path = global_agents },
+        .{ .path = project_agents },
+    };
+
+    {
+        var chat_container = tui.Container.init(allocator);
+        defer chat_container.deinit();
+        var controller = LoadedResourcesController.init(allocator, &chat_container);
+        defer controller.deinit();
+        try controller.showLoadedResources(.{ .context_files = &context_files }, .{
+            .quiet_startup = false,
+            .cwd = cwd,
+            .home_dir = home,
+        });
+        const output = try renderContainerNormalizedAlloc(allocator, &chat_container);
+        defer allocator.free(output);
+        try std.testing.expect(std.mem.indexOf(u8, output, "[Context]") != null);
+        try std.testing.expect(std.mem.indexOf(u8, output, "~/.bulb/agent/AGENTS.md, AGENTS.md") != null);
+        try std.testing.expect(std.mem.indexOf(u8, output, project_agents) == null);
+    }
+
+    {
+        var chat_container = tui.Container.init(allocator);
+        defer chat_container.deinit();
+        var controller = LoadedResourcesController.init(allocator, &chat_container);
+        defer controller.deinit();
+        try controller.showLoadedResources(.{ .context_files = &context_files }, .{
+            .quiet_startup = false,
+            .tool_output_expanded = true,
+            .cwd = cwd,
+            .home_dir = home,
+        });
+        const output = try renderContainerNormalizedAlloc(allocator, &chat_container);
+        defer allocator.free(output);
+        try std.testing.expect(std.mem.indexOf(u8, output, "~/.bulb/agent/AGENTS.md") != null);
+        try std.testing.expect(std.mem.indexOf(u8, output, "~/Development/bulb-mono/AGENTS.md") != null);
+        try std.testing.expect(std.mem.indexOf(u8, output, "~/.bulb/agent/AGENTS.md, AGENTS.md") == null);
+    }
+}
+
+test "InteractiveMode showLoadedResources honors quiet startup and diagnostics override" {
+    const allocator = std.testing.allocator;
+    const skills = [_]LoadedSkillResource{.{ .file_path = "/tmp/skill/SKILL.md", .name = "commit" }};
+
+    {
+        var chat_container = tui.Container.init(allocator);
+        defer chat_container.deinit();
+        var controller = LoadedResourcesController.init(allocator, &chat_container);
+        defer controller.deinit();
+        try controller.showLoadedResources(.{ .skills = &skills }, .{
+            .quiet_startup = true,
+            .show_diagnostics_when_quiet = true,
+        });
+        try std.testing.expectEqual(@as(usize, 0), chat_container.children.items.len);
+    }
+
+    {
+        var chat_container = tui.Container.init(allocator);
+        defer chat_container.deinit();
+        var controller = LoadedResourcesController.init(allocator, &chat_container);
+        defer controller.deinit();
+        var diagnostic = try resource_loader.ResourceDiagnostic.initAlloc(allocator, .warning, "duplicate skill name", "", null);
+        defer diagnostic.deinit();
+        const diagnostics = [_]resource_loader.ResourceDiagnostic{diagnostic};
+        try controller.showLoadedResources(.{
+            .skills = &skills,
+            .skill_diagnostics = &diagnostics,
+        }, .{
+            .quiet_startup = true,
+            .show_diagnostics_when_quiet = true,
+        });
+        try expectRenderedContains(&chat_container, "[Skill conflicts]");
+        try expectRenderedContains(&chat_container, "duplicate skill name");
+        try expectRenderedNotContains(&chat_container, "[Skills]");
+    }
+}
+
 test "InteractiveMode showStatus coalesces immediately-sequential status messages" {
     const allocator = std.testing.allocator;
     var chat_container = tui.Container.init(allocator);
