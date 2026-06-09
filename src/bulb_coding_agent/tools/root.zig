@@ -9,6 +9,7 @@ pub const output_accumulator = @import("output_accumulator.zig");
 pub const read = @import("read.zig");
 pub const render_utils = @import("render_utils.zig");
 pub const tool_registry = @import("tool_registry.zig");
+pub const tool_selection = @import("tool_selection.zig");
 pub const truncate = @import("truncate.zig");
 pub const write = @import("write.zig");
 
@@ -24,6 +25,7 @@ test {
     _ = @import("read.zig");
     _ = @import("render_utils.zig");
     _ = @import("tool_registry.zig");
+    _ = @import("tool_selection.zig");
     _ = @import("truncate.zig");
     _ = @import("write.zig");
 }
