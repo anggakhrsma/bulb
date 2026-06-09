@@ -3707,7 +3707,7 @@ test "InteractiveMode showLoadedResources adds more parent folders until local e
     try std.testing.expectEqualStrings("[Extensions]\n  alpha/one, beta/one, gamma/one", output);
 }
 
-test "InteractiveMode showLoadedResources strips index files from local extension labels" {
+test "InteractiveMode showLoadedResources strips index.ts from local extension label, showing parent dir" {
     const allocator = std.testing.allocator;
     var chat_container = tui.Container.init(allocator);
     defer chat_container.deinit();
@@ -3716,17 +3716,68 @@ test "InteractiveMode showLoadedResources strips index files from local extensio
 
     const extensions = [_]LoadedResource{
         .{ .path = "/tmp/extensions/plan-mode/index.ts", .source_info = testSourceInfo("/tmp/extensions/plan-mode/index.ts", "local", .project, .top_level, "/tmp/extensions") },
-        .{ .path = "/tmp/extensions/legacy-mode/index.js", .source_info = testSourceInfo("/tmp/extensions/legacy-mode/index.js", "local", .project, .top_level, "/tmp/extensions") },
-        .{ .path = "/tmp/extensions/webfetch.ts", .source_info = testSourceInfo("/tmp/extensions/webfetch.ts", "local", .project, .top_level, "/tmp/extensions") },
     };
     try controller.showLoadedResources(.{ .extensions = &extensions }, .{ .quiet_startup = false });
 
     const output = try renderContainerNormalizedAlloc(allocator, &chat_container);
     defer allocator.free(output);
-    try std.testing.expectEqualStrings("[Extensions]\n  legacy-mode, plan-mode, webfetch.ts", output);
+    try std.testing.expectEqualStrings("[Extensions]\n  plan-mode", output);
 }
 
-test "InteractiveMode showLoadedResources disambiguates repeated index parent directories" {
+test "InteractiveMode showLoadedResources strips index.js from local extension label, showing parent dir" {
+    const allocator = std.testing.allocator;
+    var chat_container = tui.Container.init(allocator);
+    defer chat_container.deinit();
+    var controller = LoadedResourcesController.init(allocator, &chat_container);
+    defer controller.deinit();
+
+    const extensions = [_]LoadedResource{
+        .{ .path = "/tmp/extensions/plan-mode/index.js", .source_info = testSourceInfo("/tmp/extensions/plan-mode/index.js", "local", .project, .top_level, "/tmp/extensions") },
+    };
+    try controller.showLoadedResources(.{ .extensions = &extensions }, .{ .quiet_startup = false });
+
+    const output = try renderContainerNormalizedAlloc(allocator, &chat_container);
+    defer allocator.free(output);
+    try std.testing.expectEqualStrings("[Extensions]\n  plan-mode", output);
+}
+
+test "InteractiveMode showLoadedResources mixed single-file and subdirectory index.ts extensions strip index.ts" {
+    const allocator = std.testing.allocator;
+    var chat_container = tui.Container.init(allocator);
+    defer chat_container.deinit();
+    var controller = LoadedResourcesController.init(allocator, &chat_container);
+    defer controller.deinit();
+
+    const extensions = [_]LoadedResource{
+        .{ .path = "/tmp/extensions/webfetch.ts", .source_info = testSourceInfo("/tmp/extensions/webfetch.ts", "local", .project, .top_level, "/tmp/extensions") },
+        .{ .path = "/tmp/extensions/plan-mode/index.ts", .source_info = testSourceInfo("/tmp/extensions/plan-mode/index.ts", "local", .project, .top_level, "/tmp/extensions") },
+    };
+    try controller.showLoadedResources(.{ .extensions = &extensions }, .{ .quiet_startup = false });
+
+    const output = try renderContainerNormalizedAlloc(allocator, &chat_container);
+    defer allocator.free(output);
+    try std.testing.expectEqualStrings("[Extensions]\n  plan-mode, webfetch.ts", output);
+}
+
+test "InteractiveMode showLoadedResources multiple index.ts with unique parent dirs need no disambiguation" {
+    const allocator = std.testing.allocator;
+    var chat_container = tui.Container.init(allocator);
+    defer chat_container.deinit();
+    var controller = LoadedResourcesController.init(allocator, &chat_container);
+    defer controller.deinit();
+
+    const extensions = [_]LoadedResource{
+        .{ .path = "/tmp/extensions/foo/index.ts", .source_info = testSourceInfo("/tmp/extensions/foo/index.ts", "local", .project, .top_level, "/tmp/extensions") },
+        .{ .path = "/tmp/extensions/bar/index.ts", .source_info = testSourceInfo("/tmp/extensions/bar/index.ts", "local", .project, .top_level, "/tmp/extensions") },
+    };
+    try controller.showLoadedResources(.{ .extensions = &extensions }, .{ .quiet_startup = false });
+
+    const output = try renderContainerNormalizedAlloc(allocator, &chat_container);
+    defer allocator.free(output);
+    try std.testing.expectEqualStrings("[Extensions]\n  bar, foo", output);
+}
+
+test "InteractiveMode showLoadedResources multiple index.ts with same parent dir name disambiguated with grandparent" {
     const allocator = std.testing.allocator;
     var chat_container = tui.Container.init(allocator);
     defer chat_container.deinit();
@@ -3744,7 +3795,7 @@ test "InteractiveMode showLoadedResources disambiguates repeated index parent di
     try std.testing.expectEqualStrings("[Extensions]\n  alpha/tools, beta/tools", output);
 }
 
-test "InteractiveMode showLoadedResources keeps non-index file names and package extension labels" {
+test "InteractiveMode showLoadedResources non-index file in subdirectory stays as filename" {
     const allocator = std.testing.allocator;
     var chat_container = tui.Container.init(allocator);
     defer chat_container.deinit();
@@ -3753,13 +3804,29 @@ test "InteractiveMode showLoadedResources keeps non-index file names and package
 
     const extensions = [_]LoadedResource{
         .{ .path = "/tmp/extensions/my-ext/main.ts", .source_info = testSourceInfo("/tmp/extensions/my-ext/main.ts", "local", .project, .top_level, "/tmp/extensions") },
+    };
+    try controller.showLoadedResources(.{ .extensions = &extensions }, .{ .quiet_startup = false });
+
+    const output = try renderContainerNormalizedAlloc(allocator, &chat_container);
+    defer allocator.free(output);
+    try std.testing.expectEqualStrings("[Extensions]\n  main.ts", output);
+}
+
+test "InteractiveMode showLoadedResources package extensions still strip index.ts correctly (regression guard)" {
+    const allocator = std.testing.allocator;
+    var chat_container = tui.Container.init(allocator);
+    defer chat_container.deinit();
+    var controller = LoadedResourcesController.init(allocator, &chat_container);
+    defer controller.deinit();
+
+    const extensions = [_]LoadedResource{
         .{ .path = "/tmp/project/.bulb/npm/node_modules/pi-markdown-preview/extensions/index.ts", .source_info = testSourceInfo("/tmp/project/.bulb/npm/node_modules/pi-markdown-preview/extensions/index.ts", "npm:pi-markdown-preview", .project, .package, "/tmp/project/.bulb/npm/node_modules/pi-markdown-preview") },
     };
     try controller.showLoadedResources(.{ .extensions = &extensions }, .{ .quiet_startup = false });
 
     const output = try renderContainerNormalizedAlloc(allocator, &chat_container);
     defer allocator.free(output);
-    try std.testing.expectEqualStrings("[Extensions]\n  main.ts, pi-markdown-preview", output);
+    try std.testing.expectEqualStrings("[Extensions]\n  pi-markdown-preview", output);
 }
 
 test "InteractiveMode showLoadedResources captures mixed extension layouts in expanded output" {
@@ -3792,7 +3859,7 @@ test "InteractiveMode showLoadedResources captures mixed extension layouts in ex
     );
 }
 
-test "InteractiveMode showLoadedResources formats context paths compactly and fully when expanded" {
+test "InteractiveMode showLoadedResources shows context paths relative to cwd while preserving full external paths" {
     const allocator = std.testing.allocator;
     const home = "/Users/example";
     const cwd = try std.fs.path.join(allocator, &.{ home, "Development", "bulb-mono" });
@@ -3823,61 +3890,77 @@ test "InteractiveMode showLoadedResources formats context paths compactly and fu
         try std.testing.expect(std.mem.indexOf(u8, output, "~/.bulb/agent/AGENTS.md, AGENTS.md") != null);
         try std.testing.expect(std.mem.indexOf(u8, output, project_agents) == null);
     }
-
-    {
-        var chat_container = tui.Container.init(allocator);
-        defer chat_container.deinit();
-        var controller = LoadedResourcesController.init(allocator, &chat_container);
-        defer controller.deinit();
-        try controller.showLoadedResources(.{ .context_files = &context_files }, .{
-            .quiet_startup = false,
-            .tool_output_expanded = true,
-            .cwd = cwd,
-            .home_dir = home,
-        });
-        const output = try renderContainerNormalizedAlloc(allocator, &chat_container);
-        defer allocator.free(output);
-        try std.testing.expect(std.mem.indexOf(u8, output, "~/.bulb/agent/AGENTS.md") != null);
-        try std.testing.expect(std.mem.indexOf(u8, output, "~/Development/bulb-mono/AGENTS.md") != null);
-        try std.testing.expect(std.mem.indexOf(u8, output, "~/.bulb/agent/AGENTS.md, AGENTS.md") == null);
-    }
 }
 
-test "InteractiveMode showLoadedResources honors quiet startup and diagnostics override" {
+test "InteractiveMode showLoadedResources shows full context paths when expanded" {
+    const allocator = std.testing.allocator;
+    const home = "/Users/example";
+    const cwd = try std.fs.path.join(allocator, &.{ home, "Development", "bulb-mono" });
+    defer allocator.free(cwd);
+    const global_agents = try std.fs.path.join(allocator, &.{ home, ".bulb", "agent", "AGENTS.md" });
+    defer allocator.free(global_agents);
+    const project_agents = try std.fs.path.join(allocator, &.{ cwd, "AGENTS.md" });
+    defer allocator.free(project_agents);
+
+    const context_files = [_]LoadedContextFile{
+        .{ .path = global_agents },
+        .{ .path = project_agents },
+    };
+
+    var chat_container = tui.Container.init(allocator);
+    defer chat_container.deinit();
+    var controller = LoadedResourcesController.init(allocator, &chat_container);
+    defer controller.deinit();
+    try controller.showLoadedResources(.{ .context_files = &context_files }, .{
+        .quiet_startup = false,
+        .tool_output_expanded = true,
+        .cwd = cwd,
+        .home_dir = home,
+    });
+
+    const output = try renderContainerNormalizedAlloc(allocator, &chat_container);
+    defer allocator.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, "~/.bulb/agent/AGENTS.md") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "~/Development/bulb-mono/AGENTS.md") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "~/.bulb/agent/AGENTS.md, AGENTS.md") == null);
+}
+
+test "InteractiveMode showLoadedResources does not show verbose listing on quiet startup during reload" {
     const allocator = std.testing.allocator;
     const skills = [_]LoadedSkillResource{.{ .file_path = "/tmp/skill/SKILL.md", .name = "commit" }};
 
-    {
-        var chat_container = tui.Container.init(allocator);
-        defer chat_container.deinit();
-        var controller = LoadedResourcesController.init(allocator, &chat_container);
-        defer controller.deinit();
-        try controller.showLoadedResources(.{ .skills = &skills }, .{
-            .quiet_startup = true,
-            .show_diagnostics_when_quiet = true,
-        });
-        try std.testing.expectEqual(@as(usize, 0), chat_container.children.items.len);
-    }
+    var chat_container = tui.Container.init(allocator);
+    defer chat_container.deinit();
+    var controller = LoadedResourcesController.init(allocator, &chat_container);
+    defer controller.deinit();
+    try controller.showLoadedResources(.{ .skills = &skills }, .{
+        .quiet_startup = true,
+        .show_diagnostics_when_quiet = true,
+    });
+    try std.testing.expectEqual(@as(usize, 0), chat_container.children.items.len);
+}
 
-    {
-        var chat_container = tui.Container.init(allocator);
-        defer chat_container.deinit();
-        var controller = LoadedResourcesController.init(allocator, &chat_container);
-        defer controller.deinit();
-        var diagnostic = try resource_loader.ResourceDiagnostic.initAlloc(allocator, .warning, "duplicate skill name", "", null);
-        defer diagnostic.deinit();
-        const diagnostics = [_]resource_loader.ResourceDiagnostic{diagnostic};
-        try controller.showLoadedResources(.{
-            .skills = &skills,
-            .skill_diagnostics = &diagnostics,
-        }, .{
-            .quiet_startup = true,
-            .show_diagnostics_when_quiet = true,
-        });
-        try expectRenderedContains(&chat_container, "[Skill conflicts]");
-        try expectRenderedContains(&chat_container, "duplicate skill name");
-        try expectRenderedNotContains(&chat_container, "[Skills]");
-    }
+test "InteractiveMode showLoadedResources still shows diagnostics on quiet startup when requested" {
+    const allocator = std.testing.allocator;
+    const skills = [_]LoadedSkillResource{.{ .file_path = "/tmp/skill/SKILL.md", .name = "commit" }};
+
+    var chat_container = tui.Container.init(allocator);
+    defer chat_container.deinit();
+    var controller = LoadedResourcesController.init(allocator, &chat_container);
+    defer controller.deinit();
+    var diagnostic = try resource_loader.ResourceDiagnostic.initAlloc(allocator, .warning, "duplicate skill name", "", null);
+    defer diagnostic.deinit();
+    const diagnostics = [_]resource_loader.ResourceDiagnostic{diagnostic};
+    try controller.showLoadedResources(.{
+        .skills = &skills,
+        .skill_diagnostics = &diagnostics,
+    }, .{
+        .quiet_startup = true,
+        .show_diagnostics_when_quiet = true,
+    });
+    try expectRenderedContains(&chat_container, "[Skill conflicts]");
+    try expectRenderedContains(&chat_container, "duplicate skill name");
+    try expectRenderedNotContains(&chat_container, "[Skills]");
 }
 
 test "InteractiveMode showStatus coalesces immediately-sequential status messages" {
