@@ -32,6 +32,7 @@ pub const interactive_mode = @import("interactive_mode.zig");
 pub const json = @import("json.zig");
 pub const keybindings = @import("keybindings.zig");
 pub const mime = @import("mime.zig");
+pub const migrations = @import("migrations.zig");
 pub const model_registry = @import("model_registry.zig");
 pub const model_resolver = @import("model_resolver.zig");
 pub const messages = @import("messages.zig");
@@ -235,6 +236,7 @@ test {
     _ = @import("json.zig");
     _ = @import("keybindings.zig");
     _ = @import("mime.zig");
+    _ = @import("migrations.zig");
     _ = @import("model_registry.zig");
     _ = @import("model_resolver.zig");
     _ = @import("messages.zig");
