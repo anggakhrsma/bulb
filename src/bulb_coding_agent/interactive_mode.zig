@@ -490,6 +490,123 @@ pub fn setExtensionTheme(context: ExtensionThemeContext, theme_name: []const u8)
     return result;
 }
 
+pub const ExtensionCustomEditorText = struct {
+    ptr: ?*anyopaque = null,
+    get_text_fn: *const fn (?*anyopaque, std.mem.Allocator) anyerror![]u8,
+    set_text_fn: *const fn (?*anyopaque, []const u8) anyerror!void,
+
+    fn getTextAlloc(self: ExtensionCustomEditorText, allocator: std.mem.Allocator) ![]u8 {
+        return self.get_text_fn(self.ptr, allocator);
+    }
+
+    fn setText(self: ExtensionCustomEditorText, text: []const u8) !void {
+        try self.set_text_fn(self.ptr, text);
+    }
+};
+
+pub const ExtensionCustomDispose = struct {
+    ptr: ?*anyopaque = null,
+    call_fn: *const fn (?*anyopaque) anyerror!void,
+
+    fn call(self: ExtensionCustomDispose) !void {
+        try self.call_fn(self.ptr);
+    }
+};
+
+pub const ExtensionCustomOverlayHandleCallback = struct {
+    ptr: ?*anyopaque = null,
+    call_fn: *const fn (?*anyopaque, tui.OverlayHandle) anyerror!void,
+
+    fn call(self: ExtensionCustomOverlayHandleCallback, handle: tui.OverlayHandle) !void {
+        try self.call_fn(self.ptr, handle);
+    }
+};
+
+pub const ExtensionCustomContext = struct {
+    ui: *tui.TUI,
+    editor_container: *tui.Container,
+    editor: tui.Component,
+    editor_text: ExtensionCustomEditorText,
+};
+
+pub const ExtensionCustomSpec = struct {
+    component: tui.Component,
+    dispose: ?ExtensionCustomDispose = null,
+};
+
+pub const ExtensionCustomOptions = struct {
+    overlay: bool = false,
+    overlay_options: tui.OverlayOptions = .{},
+    on_handle: ?ExtensionCustomOverlayHandleCallback = null,
+};
+
+pub const ExtensionCustomHandle = struct {
+    allocator: std.mem.Allocator,
+    context: ExtensionCustomContext,
+    component: tui.Component,
+    dispose: ?ExtensionCustomDispose,
+    saved_text: []u8,
+    overlay: bool,
+    overlay_handle: ?tui.OverlayHandle = null,
+    closed: bool = false,
+
+    pub fn deinit(self: *ExtensionCustomHandle) void {
+        self.allocator.free(self.saved_text);
+        self.saved_text = &.{};
+    }
+
+    pub fn close(self: *ExtensionCustomHandle) !void {
+        if (self.closed) return;
+        self.closed = true;
+        if (self.overlay) {
+            if (self.overlay_handle) |handle| handle.hide();
+        } else {
+            try self.restoreEditor();
+        }
+        if (self.dispose) |dispose| dispose.call() catch {};
+    }
+
+    fn restoreEditor(self: *ExtensionCustomHandle) !void {
+        self.context.editor_container.clear();
+        try self.context.editor_container.addChild(self.context.editor);
+        try self.context.editor_text.setText(self.saved_text);
+        self.context.ui.setFocus(self.context.editor);
+        try self.context.ui.requestRender(false);
+    }
+};
+
+pub fn showExtensionCustom(
+    allocator: std.mem.Allocator,
+    context: ExtensionCustomContext,
+    spec: ExtensionCustomSpec,
+    options: ExtensionCustomOptions,
+) !ExtensionCustomHandle {
+    const saved_text = try context.editor_text.getTextAlloc(allocator);
+    errdefer allocator.free(saved_text);
+
+    var overlay_handle: ?tui.OverlayHandle = null;
+    if (options.overlay) {
+        const handle = try context.ui.showOverlay(spec.component, options.overlay_options);
+        overlay_handle = handle;
+        if (options.on_handle) |callback| try callback.call(handle);
+    } else {
+        context.editor_container.clear();
+        try context.editor_container.addChild(spec.component);
+        context.ui.setFocus(spec.component);
+        try context.ui.requestRender(false);
+    }
+
+    return .{
+        .allocator = allocator,
+        .context = context,
+        .component = spec.component,
+        .dispose = spec.dispose,
+        .saved_text = saved_text,
+        .overlay = options.overlay,
+        .overlay_handle = overlay_handle,
+    };
+}
+
 pub const InteractiveEventUi = struct {
     ptr: ?*anyopaque = null,
     clear_chat_fn: *const fn (?*anyopaque) anyerror!void,
@@ -1846,6 +1963,67 @@ const TestExtensionThemeUi = struct {
     }
 };
 
+const TestExtensionCustomComponent = struct {
+    allocator: std.mem.Allocator,
+    label: []const u8,
+    focused: bool = false,
+    inputs: std.ArrayList(u8) = .empty,
+    text: std.ArrayList(u8) = .empty,
+
+    fn init(allocator: std.mem.Allocator, label: []const u8) TestExtensionCustomComponent {
+        return .{
+            .allocator = allocator,
+            .label = label,
+        };
+    }
+
+    fn deinit(self: *TestExtensionCustomComponent) void {
+        self.inputs.deinit(self.allocator);
+        self.text.deinit(self.allocator);
+    }
+
+    fn component(self: *TestExtensionCustomComponent) tui.Component {
+        return tui.Component.from(TestExtensionCustomComponent, self);
+    }
+
+    fn editorTextCallbacks(self: *TestExtensionCustomComponent) ExtensionCustomEditorText {
+        return .{
+            .ptr = self,
+            .get_text_fn = getTextAlloc,
+            .set_text_fn = setText,
+        };
+    }
+
+    fn setTextForTest(self: *TestExtensionCustomComponent, value: []const u8) !void {
+        self.text.clearRetainingCapacity();
+        try self.text.appendSlice(self.allocator, value);
+    }
+
+    pub fn render(self: *TestExtensionCustomComponent, allocator: std.mem.Allocator, width: usize) ![][]u8 {
+        _ = width;
+        var lines = try allocator.alloc([]u8, 1);
+        errdefer allocator.free(lines);
+        lines[0] = try allocator.dupe(u8, self.label);
+        return lines;
+    }
+
+    pub fn handleInput(self: *TestExtensionCustomComponent, _: std.mem.Allocator, data: []const u8) !void {
+        try self.inputs.appendSlice(self.allocator, data);
+    }
+
+    pub fn invalidate(_: *TestExtensionCustomComponent) void {}
+
+    fn getTextAlloc(ptr: ?*anyopaque, allocator: std.mem.Allocator) ![]u8 {
+        const self: *TestExtensionCustomComponent = @ptrCast(@alignCast(ptr.?));
+        return allocator.dupe(u8, self.text.items);
+    }
+
+    fn setText(ptr: ?*anyopaque, text: []const u8) !void {
+        const self: *TestExtensionCustomComponent = @ptrCast(@alignCast(ptr.?));
+        try self.setTextForTest(text);
+    }
+};
+
 const TestCloneSessionManager = struct {
     leaf_id: ?[]const u8 = null,
 
@@ -2279,6 +2457,71 @@ test "InteractiveMode createExtensionUIContext setTheme does not persist invalid
     try std.testing.expectEqual(@as(usize, 0), settings.set_count);
     try std.testing.expectEqualStrings("dark", settings.current_theme);
     try std.testing.expectEqual(@as(usize, 0), ui.request_render_count);
+}
+
+test "InteractiveMode showExtensionCustom overlay custom UI reclaims input after non-overlay custom UI closes" {
+    const allocator = std.testing.allocator;
+    var virtual_terminal = tui.VirtualTerminal.init(allocator, 80, 24);
+    defer virtual_terminal.deinit();
+    var ui = tui.TUI.init(allocator, virtual_terminal.asTerminal());
+    defer ui.deinit();
+    var editor_container = tui.Container.init(allocator);
+    defer editor_container.deinit();
+    var editor = TestExtensionCustomComponent.init(allocator, "EDITOR");
+    defer editor.deinit();
+    var palette = TestExtensionCustomComponent.init(allocator, "PALETTE");
+    defer palette.deinit();
+    var overlay = TestExtensionCustomComponent.init(allocator, "OVERLAY");
+    defer overlay.deinit();
+    var replacement = TestExtensionCustomComponent.init(allocator, "REPLACEMENT");
+    defer replacement.deinit();
+
+    try editor.setTextForTest("draft prompt");
+    try editor_container.addChild(editor.component());
+    try ui.addChild(tui.Component.from(tui.Container, &editor_container));
+    try ui.addChild(palette.component());
+    ui.setFocus(palette.component());
+    try ui.start();
+    defer ui.stop() catch {};
+
+    const context = ExtensionCustomContext{
+        .ui = &ui,
+        .editor_container = &editor_container,
+        .editor = editor.component(),
+        .editor_text = editor.editorTextCallbacks(),
+    };
+
+    var overlay_handle = try showExtensionCustom(
+        allocator,
+        context,
+        .{ .component = overlay.component() },
+        .{ .overlay = true },
+    );
+    defer overlay_handle.deinit();
+    try ui.requestRender(true);
+    try std.testing.expect(overlay.focused);
+
+    var replacement_handle = try showExtensionCustom(
+        allocator,
+        context,
+        .{ .component = replacement.component() },
+        .{},
+    );
+    defer replacement_handle.deinit();
+    try ui.requestRender(true);
+    try std.testing.expect(replacement.focused);
+
+    try replacement_handle.close();
+    try ui.requestRender(true);
+    virtual_terminal.sendInput("x");
+    try ui.requestRender(true);
+
+    try std.testing.expectEqualStrings("x", overlay.inputs.items);
+    try std.testing.expectEqualStrings("", editor.inputs.items);
+    try std.testing.expect(overlay.focused);
+    try std.testing.expectEqualStrings("draft prompt", editor.text.items);
+
+    try overlay_handle.close();
 }
 
 // Ported from packages/coding-agent/test/interactive-mode-suspend.test.ts.
