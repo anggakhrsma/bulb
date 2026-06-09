@@ -53,6 +53,34 @@ pub const Theme = struct {
     }
 };
 
+pub const ThemeSetResult = struct {
+    success: bool,
+    error_message: ?[]const u8 = null,
+};
+
+pub fn isBuiltinThemeName(name: []const u8) bool {
+    return std.mem.eql(u8, name, "dark") or std.mem.eql(u8, name, "light");
+}
+
+pub fn findThemeByName(themes: []const Theme, name: []const u8) ?*const Theme {
+    for (themes) |*registered_theme| {
+        if (std.mem.eql(u8, registered_theme.name, name)) return registered_theme;
+    }
+    return null;
+}
+
+pub fn canLoadThemeName(registered_themes: []const Theme, name: []const u8) bool {
+    return isBuiltinThemeName(name) or findThemeByName(registered_themes, name) != null;
+}
+
+pub fn setThemeName(registered_themes: []const Theme, name: []const u8) ThemeSetResult {
+    if (canLoadThemeName(registered_themes, name)) return .{ .success = true };
+    return .{
+        .success = false,
+        .error_message = "Theme not found",
+    };
+}
+
 pub fn deinitThemes(allocator: std.mem.Allocator, themes: []Theme) void {
     for (themes) |*loaded_theme| loaded_theme.deinit();
     allocator.free(themes);
@@ -111,4 +139,23 @@ test "loadThemeFromPath ports JSON validation and source metadata" {
     try std.testing.expectEqualStrings("ocean", loaded.name);
     try std.testing.expectEqualStrings(theme_path, loaded.source_path);
     try std.testing.expectEqual(source_info.SourceScope.project, loaded.source_info.scope);
+}
+
+test "setThemeName accepts built-in and registered themes but rejects missing names" {
+    const allocator = std.testing.allocator;
+
+    var themes = [_]Theme{try Theme.initAlloc(allocator, "ocean", "/themes/ocean.json", source_info.createSyntheticSourceInfo("/themes/ocean.json", .{
+        .source = "test",
+        .scope = .project,
+        .base_dir = "/themes",
+    }))};
+    defer themes[0].deinit();
+
+    try std.testing.expect(setThemeName(&.{}, "dark").success);
+    try std.testing.expect(setThemeName(&.{}, "light").success);
+    try std.testing.expect(setThemeName(&themes, "ocean").success);
+
+    const missing = setThemeName(&themes, "__missing_theme__");
+    try std.testing.expect(!missing.success);
+    try std.testing.expectEqualStrings("Theme not found", missing.error_message.?);
 }

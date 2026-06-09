@@ -5,6 +5,7 @@ const extension_types = @import("extensions/types.zig");
 const messages_mod = @import("messages.zig");
 const session_events = @import("session_events.zig");
 const session_manager_mod = @import("session_manager.zig");
+const theme_mod = @import("theme.zig");
 const tui = @import("bulb_tui");
 
 pub const anthropic_subscription_auth_warning =
@@ -446,6 +447,47 @@ pub fn setupAutocompleteProvider(context: AutocompleteSetupContext) !void {
     if (!context.editor.eql(context.default_editor)) {
         try context.editor.setAutocompleteProvider(provider);
     }
+}
+
+pub const ExtensionThemeSettings = struct {
+    ptr: ?*anyopaque = null,
+    get_theme_fn: *const fn (?*anyopaque) ?[]const u8,
+    set_theme_fn: *const fn (?*anyopaque, []const u8) anyerror!void,
+
+    fn getTheme(self: ExtensionThemeSettings) ?[]const u8 {
+        return self.get_theme_fn(self.ptr);
+    }
+
+    fn setTheme(self: ExtensionThemeSettings, theme_name: []const u8) !void {
+        try self.set_theme_fn(self.ptr, theme_name);
+    }
+};
+
+pub const ExtensionThemeUi = struct {
+    ptr: ?*anyopaque = null,
+    request_render_fn: *const fn (?*anyopaque) anyerror!void,
+
+    fn requestRender(self: ExtensionThemeUi) !void {
+        try self.request_render_fn(self.ptr);
+    }
+};
+
+pub const ExtensionThemeContext = struct {
+    settings: ExtensionThemeSettings,
+    ui: ExtensionThemeUi,
+    registered_themes: []const theme_mod.Theme = &.{},
+};
+
+pub fn setExtensionTheme(context: ExtensionThemeContext, theme_name: []const u8) !theme_mod.ThemeSetResult {
+    const result = theme_mod.setThemeName(context.registered_themes, theme_name);
+    if (!result.success) return result;
+
+    const current_theme = context.settings.getTheme();
+    if (current_theme == null or !std.mem.eql(u8, current_theme.?, theme_name)) {
+        try context.settings.setTheme(theme_name);
+    }
+    try context.ui.requestRender();
+    return result;
 }
 
 pub const InteractiveEventUi = struct {
@@ -1762,6 +1804,48 @@ fn expectSameAutocompleteProvider(expected: tui.AutocompleteProvider, actual: tu
     try std.testing.expect(expected.should_trigger_file_completion_fn == actual.should_trigger_file_completion_fn);
 }
 
+const TestThemeSettings = struct {
+    current_theme: []const u8 = "dark",
+    set_count: usize = 0,
+    last_set_theme: ?[]const u8 = null,
+
+    fn callbacks(self: *TestThemeSettings) ExtensionThemeSettings {
+        return .{
+            .ptr = self,
+            .get_theme_fn = getTheme,
+            .set_theme_fn = setTheme,
+        };
+    }
+
+    fn getTheme(ptr: ?*anyopaque) ?[]const u8 {
+        const self: *TestThemeSettings = @ptrCast(@alignCast(ptr.?));
+        return self.current_theme;
+    }
+
+    fn setTheme(ptr: ?*anyopaque, theme_name: []const u8) !void {
+        const self: *TestThemeSettings = @ptrCast(@alignCast(ptr.?));
+        self.current_theme = theme_name;
+        self.last_set_theme = theme_name;
+        self.set_count += 1;
+    }
+};
+
+const TestExtensionThemeUi = struct {
+    request_render_count: usize = 0,
+
+    fn callbacks(self: *TestExtensionThemeUi) ExtensionThemeUi {
+        return .{
+            .ptr = self,
+            .request_render_fn = requestRender,
+        };
+    }
+
+    fn requestRender(ptr: ?*anyopaque) !void {
+        const self: *TestExtensionThemeUi = @ptrCast(@alignCast(ptr.?));
+        self.request_render_count += 1;
+    }
+};
+
 const TestCloneSessionManager = struct {
     leaf_id: ?[]const u8 = null,
 
@@ -2164,6 +2248,37 @@ test "InteractiveMode setupAutocompleteProvider stacks wrapper factories over a 
     try std.testing.expectEqual(@as(usize, 2), trace.len);
     try std.testing.expectEqualStrings("shouldTrigger:wrap2", trace.entries[0]);
     try std.testing.expectEqualStrings("shouldTrigger:wrap1", trace.entries[1]);
+}
+
+test "InteractiveMode createExtensionUIContext setTheme persists theme changes to settings manager" {
+    var settings = TestThemeSettings{ .current_theme = "dark" };
+    var ui = TestExtensionThemeUi{};
+
+    const result = try setExtensionTheme(.{
+        .settings = settings.callbacks(),
+        .ui = ui.callbacks(),
+    }, "light");
+
+    try std.testing.expect(result.success);
+    try std.testing.expectEqual(@as(usize, 1), settings.set_count);
+    try std.testing.expectEqualStrings("light", settings.last_set_theme.?);
+    try std.testing.expectEqualStrings("light", settings.current_theme);
+    try std.testing.expectEqual(@as(usize, 1), ui.request_render_count);
+}
+
+test "InteractiveMode createExtensionUIContext setTheme does not persist invalid theme names" {
+    var settings = TestThemeSettings{ .current_theme = "dark" };
+    var ui = TestExtensionThemeUi{};
+
+    const result = try setExtensionTheme(.{
+        .settings = settings.callbacks(),
+        .ui = ui.callbacks(),
+    }, "__missing_theme__");
+
+    try std.testing.expect(!result.success);
+    try std.testing.expectEqual(@as(usize, 0), settings.set_count);
+    try std.testing.expectEqualStrings("dark", settings.current_theme);
+    try std.testing.expectEqual(@as(usize, 0), ui.request_render_count);
 }
 
 // Ported from packages/coding-agent/test/interactive-mode-suspend.test.ts.
