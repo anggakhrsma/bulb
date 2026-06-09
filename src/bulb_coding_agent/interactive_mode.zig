@@ -5,6 +5,7 @@ const extension_types = @import("extensions/types.zig");
 const messages_mod = @import("messages.zig");
 const session_events = @import("session_events.zig");
 const session_manager_mod = @import("session_manager.zig");
+const tui = @import("bulb_tui");
 
 pub const anthropic_subscription_auth_warning =
     "Anthropic subscription auth is active. Third-party harness usage draws from extra usage and is billed per token, not your Claude plan limits. Manage extra usage at https://claude.ai/settings/usage.";
@@ -270,6 +271,181 @@ fn resumeAfterSuspend(ptr: ?*anyopaque) !void {
     try state.cleanup();
     try state.ui.start();
     try state.ui.requestRender(true);
+}
+
+pub const InteractiveStatusUi = struct {
+    ptr: ?*anyopaque = null,
+    request_render_fn: *const fn (?*anyopaque) anyerror!void,
+
+    fn requestRender(self: InteractiveStatusUi) !void {
+        try self.request_render_fn(self.ptr);
+    }
+};
+
+pub const InteractiveStatusController = struct {
+    allocator: std.mem.Allocator,
+    chat_container: *tui.Container,
+    ui: InteractiveStatusUi,
+    last_status_spacer: ?*tui.Spacer = null,
+    last_status_text: ?*tui.Text = null,
+    owned_spacers: std.ArrayList(*tui.Spacer) = .empty,
+    owned_texts: std.ArrayList(*tui.Text) = .empty,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        chat_container: *tui.Container,
+        ui: InteractiveStatusUi,
+    ) InteractiveStatusController {
+        return .{
+            .allocator = allocator,
+            .chat_container = chat_container,
+            .ui = ui,
+        };
+    }
+
+    pub fn deinit(self: *InteractiveStatusController) void {
+        for (self.owned_texts.items) |text| {
+            text.deinit();
+            self.allocator.destroy(text);
+        }
+        for (self.owned_spacers.items) |spacer| self.allocator.destroy(spacer);
+        self.owned_texts.deinit(self.allocator);
+        self.owned_spacers.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    pub fn showStatus(self: *InteractiveStatusController, message: []const u8) !void {
+        if (self.isLastStatusPair()) {
+            try self.last_status_text.?.setText(message);
+            try self.ui.requestRender();
+            return;
+        }
+
+        const spacer = try self.allocator.create(tui.Spacer);
+        errdefer self.allocator.destroy(spacer);
+        spacer.* = tui.Spacer.init(1);
+        try self.owned_spacers.append(self.allocator, spacer);
+
+        const text = try self.allocator.create(tui.Text);
+        errdefer self.allocator.destroy(text);
+        text.* = try tui.Text.init(self.allocator, message, 1, 0, null);
+        errdefer text.deinit();
+        try self.owned_texts.append(self.allocator, text);
+
+        try self.chat_container.addChild(tui.Component.from(tui.Spacer, spacer));
+        try self.chat_container.addChild(tui.Component.from(tui.Text, text));
+        self.last_status_spacer = spacer;
+        self.last_status_text = text;
+        try self.ui.requestRender();
+    }
+
+    fn isLastStatusPair(self: *const InteractiveStatusController) bool {
+        const spacer = self.last_status_spacer orelse return false;
+        const text = self.last_status_text orelse return false;
+        const children = self.chat_container.children.items;
+        if (children.len < 2) return false;
+
+        const second_last = children[children.len - 2];
+        const last = children[children.len - 1];
+        return second_last.ptr == @as(*anyopaque, @ptrCast(spacer)) and
+            last.ptr == @as(*anyopaque, @ptrCast(text));
+    }
+};
+
+pub const ToolExpansionTarget = struct {
+    ptr: ?*anyopaque = null,
+    set_expanded_fn: ?*const fn (?*anyopaque, bool) anyerror!void = null,
+
+    fn setExpanded(self: ToolExpansionTarget, expanded: bool) !void {
+        if (self.set_expanded_fn) |set_expanded| try set_expanded(self.ptr, expanded);
+    }
+};
+
+pub const ToolExpansionUi = struct {
+    ptr: ?*anyopaque = null,
+    request_render_fn: *const fn (?*anyopaque) anyerror!void,
+
+    fn requestRender(self: ToolExpansionUi) !void {
+        try self.request_render_fn(self.ptr);
+    }
+};
+
+pub const ToolExpansionContext = struct {
+    tool_output_expanded: *bool,
+    custom_header: ?ToolExpansionTarget = null,
+    built_in_header: ?ToolExpansionTarget = null,
+    chat_children: []const ToolExpansionTarget = &.{},
+    ui: ToolExpansionUi,
+};
+
+pub fn setToolsExpanded(context: ToolExpansionContext, expanded: bool) !void {
+    context.tool_output_expanded.* = expanded;
+    const active_header = context.custom_header orelse context.built_in_header;
+    if (active_header) |header| try header.setExpanded(expanded);
+    for (context.chat_children) |child| try child.setExpanded(expanded);
+    try context.ui.requestRender();
+}
+
+pub const AutocompleteRebuildCallback = struct {
+    ptr: ?*anyopaque = null,
+    call_fn: *const fn (?*anyopaque) anyerror!void,
+
+    fn call(self: AutocompleteRebuildCallback) !void {
+        try self.call_fn(self.ptr);
+    }
+};
+
+pub fn addAutocompleteProviderWrapper(
+    allocator: std.mem.Allocator,
+    wrappers: *std.ArrayList(extension_types.AutocompleteProviderFactory),
+    wrapper: extension_types.AutocompleteProviderFactory,
+    rebuild: AutocompleteRebuildCallback,
+) !void {
+    try wrappers.append(allocator, wrapper);
+    try rebuild.call();
+}
+
+pub const BaseAutocompleteProviderFactory = struct {
+    ptr: ?*anyopaque = null,
+    create_fn: *const fn (?*anyopaque) anyerror!tui.AutocompleteProvider,
+
+    fn create(self: BaseAutocompleteProviderFactory) !tui.AutocompleteProvider {
+        return self.create_fn(self.ptr);
+    }
+};
+
+pub const AutocompleteEditorTarget = struct {
+    ptr: ?*anyopaque = null,
+    set_autocomplete_provider_fn: *const fn (?*anyopaque, tui.AutocompleteProvider) anyerror!void,
+
+    fn setAutocompleteProvider(self: AutocompleteEditorTarget, provider: tui.AutocompleteProvider) !void {
+        try self.set_autocomplete_provider_fn(self.ptr, provider);
+    }
+
+    fn eql(self: AutocompleteEditorTarget, other: AutocompleteEditorTarget) bool {
+        return self.ptr == other.ptr and self.set_autocomplete_provider_fn == other.set_autocomplete_provider_fn;
+    }
+};
+
+pub const AutocompleteSetupContext = struct {
+    autocomplete_provider: *?tui.AutocompleteProvider,
+    create_base_provider: BaseAutocompleteProviderFactory,
+    default_editor: AutocompleteEditorTarget,
+    editor: AutocompleteEditorTarget,
+    wrappers: []const extension_types.AutocompleteProviderFactory = &.{},
+};
+
+pub fn setupAutocompleteProvider(context: AutocompleteSetupContext) !void {
+    var provider = try context.create_base_provider.create();
+    for (context.wrappers) |wrap_provider| {
+        provider = try wrap_provider.wrap(provider);
+    }
+
+    context.autocomplete_provider.* = provider;
+    try context.default_editor.setAutocompleteProvider(provider);
+    if (!context.editor.eql(context.default_editor)) {
+        try context.editor.setAutocompleteProvider(provider);
+    }
 }
 
 pub const InteractiveEventUi = struct {
@@ -1352,6 +1528,240 @@ fn expectSameSuspendCallback(expected: SuspendSignalCallback, actual: SuspendSig
     try std.testing.expect(expected.call_fn == actual.call_fn);
 }
 
+const TestStatusUi = struct {
+    request_render_count: usize = 0,
+
+    fn callbacks(self: *TestStatusUi) InteractiveStatusUi {
+        return .{
+            .ptr = self,
+            .request_render_fn = requestRender,
+        };
+    }
+
+    fn requestRender(ptr: ?*anyopaque) !void {
+        const self: *TestStatusUi = @ptrCast(@alignCast(ptr.?));
+        self.request_render_count += 1;
+    }
+};
+
+const TestChatComponent = struct {
+    label: []const u8,
+
+    pub fn render(self: *TestChatComponent, allocator: std.mem.Allocator, _: usize) ![][]u8 {
+        const lines = try allocator.alloc([]u8, 1);
+        errdefer allocator.free(lines);
+        lines[0] = try allocator.dupe(u8, self.label);
+        return lines;
+    }
+
+    pub fn invalidate(_: *TestChatComponent) void {}
+};
+
+const TestToolExpansionUi = struct {
+    request_render_count: usize = 0,
+
+    fn callbacks(self: *TestToolExpansionUi) ToolExpansionUi {
+        return .{
+            .ptr = self,
+            .request_render_fn = requestRender,
+        };
+    }
+
+    fn requestRender(ptr: ?*anyopaque) !void {
+        const self: *TestToolExpansionUi = @ptrCast(@alignCast(ptr.?));
+        self.request_render_count += 1;
+    }
+};
+
+const TestExpandableTarget = struct {
+    set_count: usize = 0,
+    last_expanded: ?bool = null,
+
+    fn callbacks(self: *TestExpandableTarget) ToolExpansionTarget {
+        return .{
+            .ptr = self,
+            .set_expanded_fn = setExpanded,
+        };
+    }
+
+    fn setExpanded(ptr: ?*anyopaque, expanded: bool) !void {
+        const self: *TestExpandableTarget = @ptrCast(@alignCast(ptr.?));
+        self.set_count += 1;
+        self.last_expanded = expanded;
+    }
+};
+
+const TestAutocompleteRebuild = struct {
+    count: usize = 0,
+
+    fn callbacks(self: *TestAutocompleteRebuild) AutocompleteRebuildCallback {
+        return .{
+            .ptr = self,
+            .call_fn = call,
+        };
+    }
+
+    fn call(ptr: ?*anyopaque) !void {
+        const self: *TestAutocompleteRebuild = @ptrCast(@alignCast(ptr.?));
+        self.count += 1;
+    }
+};
+
+const TestAutocompleteIdentityFactory = struct {
+    fn factory() extension_types.AutocompleteProviderFactory {
+        return .{ .wrap_fn = wrap };
+    }
+
+    fn wrap(_: ?*anyopaque, current: tui.AutocompleteProvider) !tui.AutocompleteProvider {
+        return current;
+    }
+};
+
+const TestBaseAutocompleteProviderFactory = struct {
+    fn callbacks() BaseAutocompleteProviderFactory {
+        return .{ .create_fn = create };
+    }
+
+    fn create(_: ?*anyopaque) !tui.AutocompleteProvider {
+        return .{
+            .get_suggestions_fn = getSuggestions,
+            .apply_completion_fn = applyCompletion,
+        };
+    }
+
+    fn getSuggestions(
+        _: ?*anyopaque,
+        _: std.mem.Allocator,
+        _: []const []const u8,
+        _: usize,
+        _: usize,
+        _: tui.autocomplete.SuggestionOptions,
+    ) !?tui.AutocompleteSuggestions {
+        return null;
+    }
+
+    fn applyCompletion(
+        _: ?*anyopaque,
+        allocator: std.mem.Allocator,
+        lines: []const []const u8,
+        cursor_line: usize,
+        cursor_col: usize,
+        _: tui.AutocompleteItem,
+        _: []const u8,
+    ) !tui.autocomplete.CompletionApplication {
+        const cloned = try allocator.alloc([]u8, lines.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (cloned[0..initialized]) |line| allocator.free(line);
+            allocator.free(cloned);
+        }
+        for (lines, 0..) |line, index| {
+            cloned[index] = try allocator.dupe(u8, line);
+            initialized += 1;
+        }
+        return .{
+            .lines = cloned,
+            .cursor_line = cursor_line,
+            .cursor_col = cursor_col,
+        };
+    }
+};
+
+const TestAutocompleteEditor = struct {
+    set_count: usize = 0,
+    provider: ?tui.AutocompleteProvider = null,
+
+    fn callbacks(self: *TestAutocompleteEditor) AutocompleteEditorTarget {
+        return .{
+            .ptr = self,
+            .set_autocomplete_provider_fn = setAutocompleteProvider,
+        };
+    }
+
+    fn setAutocompleteProvider(ptr: ?*anyopaque, provider: tui.AutocompleteProvider) !void {
+        const self: *TestAutocompleteEditor = @ptrCast(@alignCast(ptr.?));
+        self.set_count += 1;
+        self.provider = provider;
+    }
+};
+
+const TestAutocompleteTrace = struct {
+    entries: [8][]const u8 = undefined,
+    len: usize = 0,
+
+    fn append(self: *TestAutocompleteTrace, entry: []const u8) void {
+        self.entries[self.len] = entry;
+        self.len += 1;
+    }
+};
+
+const TestAutocompleteWrapper = struct {
+    label: []const u8,
+    trace: *TestAutocompleteTrace,
+    current: ?tui.AutocompleteProvider = null,
+
+    fn factory(self: *TestAutocompleteWrapper) extension_types.AutocompleteProviderFactory {
+        return .{
+            .ptr = self,
+            .wrap_fn = wrap,
+        };
+    }
+
+    fn wrap(ptr: ?*anyopaque, current: tui.AutocompleteProvider) !tui.AutocompleteProvider {
+        const self: *TestAutocompleteWrapper = @ptrCast(@alignCast(ptr.?));
+        self.current = current;
+        return .{
+            .context = self,
+            .get_suggestions_fn = getSuggestions,
+            .apply_completion_fn = applyCompletion,
+            .should_trigger_file_completion_fn = shouldTriggerFileCompletion,
+        };
+    }
+
+    fn getSuggestions(
+        ptr: ?*anyopaque,
+        allocator: std.mem.Allocator,
+        lines: []const []const u8,
+        cursor_line: usize,
+        cursor_col: usize,
+        options: tui.autocomplete.SuggestionOptions,
+    ) !?tui.AutocompleteSuggestions {
+        const self: *TestAutocompleteWrapper = @ptrCast(@alignCast(ptr.?));
+        return try self.current.?.getSuggestions(allocator, lines, cursor_line, cursor_col, options);
+    }
+
+    fn applyCompletion(
+        ptr: ?*anyopaque,
+        allocator: std.mem.Allocator,
+        lines: []const []const u8,
+        cursor_line: usize,
+        cursor_col: usize,
+        item: tui.AutocompleteItem,
+        prefix: []const u8,
+    ) !tui.autocomplete.CompletionApplication {
+        const self: *TestAutocompleteWrapper = @ptrCast(@alignCast(ptr.?));
+        return try self.current.?.applyCompletion(allocator, lines, cursor_line, cursor_col, item, prefix);
+    }
+
+    fn shouldTriggerFileCompletion(
+        ptr: ?*anyopaque,
+        lines: []const []const u8,
+        cursor_line: usize,
+        cursor_col: usize,
+    ) bool {
+        const self: *TestAutocompleteWrapper = @ptrCast(@alignCast(ptr.?));
+        self.trace.append(self.label);
+        return self.current.?.shouldTriggerFileCompletion(lines, cursor_line, cursor_col);
+    }
+};
+
+fn expectSameAutocompleteProvider(expected: tui.AutocompleteProvider, actual: tui.AutocompleteProvider) !void {
+    try std.testing.expectEqual(expected.context, actual.context);
+    try std.testing.expect(expected.get_suggestions_fn == actual.get_suggestions_fn);
+    try std.testing.expect(expected.apply_completion_fn == actual.apply_completion_fn);
+    try std.testing.expect(expected.should_trigger_file_completion_fn == actual.should_trigger_file_completion_fn);
+}
+
 const TestCloneSessionManager = struct {
     leaf_id: ?[]const u8 = null,
 
@@ -1646,6 +2056,115 @@ const TestImportRuntimeHost = struct {
         }
     }
 };
+
+// Ported from packages/coding-agent/test/interactive-mode-status.test.ts.
+test "InteractiveMode showStatus coalesces immediately-sequential status messages" {
+    const allocator = std.testing.allocator;
+    var chat_container = tui.Container.init(allocator);
+    defer chat_container.deinit();
+    var ui = TestStatusUi{};
+    var controller = InteractiveStatusController.init(allocator, &chat_container, ui.callbacks());
+    defer controller.deinit();
+
+    try controller.showStatus("STATUS_ONE");
+    try std.testing.expectEqual(@as(usize, 2), chat_container.children.items.len);
+    try std.testing.expectEqualStrings("STATUS_ONE", controller.last_status_text.?.text);
+
+    try controller.showStatus("STATUS_TWO");
+    try std.testing.expectEqual(@as(usize, 2), chat_container.children.items.len);
+    try std.testing.expectEqualStrings("STATUS_TWO", controller.last_status_text.?.text);
+    try std.testing.expect(std.mem.indexOf(u8, controller.last_status_text.?.text, "STATUS_ONE") == null);
+    try std.testing.expectEqual(@as(usize, 2), ui.request_render_count);
+}
+
+test "InteractiveMode showStatus appends a new status line if something else was added in between" {
+    const allocator = std.testing.allocator;
+    var chat_container = tui.Container.init(allocator);
+    defer chat_container.deinit();
+    var ui = TestStatusUi{};
+    var controller = InteractiveStatusController.init(allocator, &chat_container, ui.callbacks());
+    defer controller.deinit();
+
+    try controller.showStatus("STATUS_ONE");
+    try std.testing.expectEqual(@as(usize, 2), chat_container.children.items.len);
+
+    var other = TestChatComponent{ .label = "OTHER" };
+    try chat_container.addChild(tui.Component.from(TestChatComponent, &other));
+    try std.testing.expectEqual(@as(usize, 3), chat_container.children.items.len);
+
+    try controller.showStatus("STATUS_TWO");
+    try std.testing.expectEqual(@as(usize, 5), chat_container.children.items.len);
+    try std.testing.expectEqualStrings("STATUS_TWO", controller.last_status_text.?.text);
+}
+
+test "InteractiveMode setToolsExpanded applies expansion state to the active header and chat entries" {
+    var tool_output_expanded = false;
+    var header = TestExpandableTarget{};
+    var chat_child = TestExpandableTarget{};
+    var ui = TestToolExpansionUi{};
+    const chat_children = [_]ToolExpansionTarget{chat_child.callbacks()};
+
+    try setToolsExpanded(.{
+        .tool_output_expanded = &tool_output_expanded,
+        .built_in_header = header.callbacks(),
+        .chat_children = &chat_children,
+        .ui = ui.callbacks(),
+    }, true);
+
+    try std.testing.expectEqual(true, tool_output_expanded);
+    try std.testing.expectEqual(@as(usize, 1), header.set_count);
+    try std.testing.expectEqual(true, header.last_expanded.?);
+    try std.testing.expectEqual(@as(usize, 1), chat_child.set_count);
+    try std.testing.expectEqual(true, chat_child.last_expanded.?);
+    try std.testing.expectEqual(@as(usize, 1), ui.request_render_count);
+}
+
+test "InteractiveMode addAutocompleteProvider stores wrapper factories and rebuilds autocomplete immediately" {
+    const allocator = std.testing.allocator;
+    var wrappers: std.ArrayList(extension_types.AutocompleteProviderFactory) = .empty;
+    defer wrappers.deinit(allocator);
+    var rebuild = TestAutocompleteRebuild{};
+    const wrapper = TestAutocompleteIdentityFactory.factory();
+
+    try addAutocompleteProviderWrapper(allocator, &wrappers, wrapper, rebuild.callbacks());
+
+    try std.testing.expectEqual(@as(usize, 1), wrappers.items.len);
+    try std.testing.expect(wrappers.items[0].wrap_fn == wrapper.wrap_fn);
+    try std.testing.expectEqual(@as(usize, 1), rebuild.count);
+}
+
+test "InteractiveMode setupAutocompleteProvider stacks wrapper factories over a fresh base provider" {
+    var default_editor = TestAutocompleteEditor{};
+    var custom_editor = TestAutocompleteEditor{};
+    var trace = TestAutocompleteTrace{};
+    var wrap1 = TestAutocompleteWrapper{ .label = "shouldTrigger:wrap1", .trace = &trace };
+    var wrap2 = TestAutocompleteWrapper{ .label = "shouldTrigger:wrap2", .trace = &trace };
+    const wrappers = [_]extension_types.AutocompleteProviderFactory{
+        wrap1.factory(),
+        wrap2.factory(),
+    };
+    var current_provider: ?tui.AutocompleteProvider = null;
+
+    try setupAutocompleteProvider(.{
+        .autocomplete_provider = &current_provider,
+        .create_base_provider = TestBaseAutocompleteProviderFactory.callbacks(),
+        .default_editor = default_editor.callbacks(),
+        .editor = custom_editor.callbacks(),
+        .wrappers = &wrappers,
+    });
+
+    try std.testing.expect(current_provider != null);
+    try std.testing.expectEqual(@as(usize, 1), default_editor.set_count);
+    try std.testing.expectEqual(@as(usize, 1), custom_editor.set_count);
+    try expectSameAutocompleteProvider(default_editor.provider.?, custom_editor.provider.?);
+    try expectSameAutocompleteProvider(current_provider.?, default_editor.provider.?);
+
+    const lines = [_][]const u8{"foo"};
+    try std.testing.expect(default_editor.provider.?.shouldTriggerFileCompletion(&lines, 0, 3));
+    try std.testing.expectEqual(@as(usize, 2), trace.len);
+    try std.testing.expectEqualStrings("shouldTrigger:wrap2", trace.entries[0]);
+    try std.testing.expectEqualStrings("shouldTrigger:wrap1", trace.entries[1]);
+}
 
 // Ported from packages/coding-agent/test/interactive-mode-suspend.test.ts.
 test "InteractiveMode handleCtrlZ shows a status message and skips suspend on Windows" {
