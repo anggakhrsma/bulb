@@ -19,6 +19,7 @@ pub const system_prompt = @import("system_prompt.zig");
 pub const extensions = @import("extensions/root.zig");
 pub const tools = @import("tools/root.zig");
 pub const auth_storage = @import("auth_storage.zig");
+pub const assistant_message = @import("assistant_message.zig");
 pub const ansi = @import("ansi.zig");
 pub const bash_executor = @import("bash_executor.zig");
 pub const cli_args = @import("cli_args.zig");
@@ -217,6 +218,7 @@ test {
     _ = @import("extensions/root.zig");
     _ = @import("tools/root.zig");
     _ = @import("auth_storage.zig");
+    _ = @import("assistant_message.zig");
     _ = @import("ansi.zig");
     _ = @import("bash_executor.zig");
     _ = @import("cli_args.zig");
