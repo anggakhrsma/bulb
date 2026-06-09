@@ -96,6 +96,182 @@ pub fn maybeWarnAboutAnthropicSubscriptionAuth(
     try context.ui.showWarning(anthropic_subscription_auth_warning);
 }
 
+pub const SuspendPlatform = enum {
+    windows,
+    posix,
+};
+
+pub const SuspendSignal = enum {
+    sigint,
+    sigcont,
+    sigtstp,
+};
+
+pub const SuspendTimerHandle = struct {
+    id: usize,
+};
+
+pub const SuspendTimerCallback = struct {
+    ptr: ?*anyopaque = null,
+    call_fn: *const fn (?*anyopaque) anyerror!void,
+
+    fn call(self: SuspendTimerCallback) !void {
+        try self.call_fn(self.ptr);
+    }
+};
+
+pub const SuspendSignalCallback = struct {
+    ptr: ?*anyopaque = null,
+    call_fn: *const fn (?*anyopaque) anyerror!void,
+
+    fn call(self: SuspendSignalCallback) !void {
+        try self.call_fn(self.ptr);
+    }
+};
+
+pub const SuspendUi = struct {
+    ptr: ?*anyopaque = null,
+    start_fn: *const fn (?*anyopaque) anyerror!void,
+    stop_fn: *const fn (?*anyopaque) anyerror!void,
+    request_render_fn: *const fn (?*anyopaque, bool) anyerror!void,
+    show_status_fn: *const fn (?*anyopaque, []const u8) anyerror!void,
+
+    fn start(self: SuspendUi) !void {
+        try self.start_fn(self.ptr);
+    }
+
+    fn stop(self: SuspendUi) !void {
+        try self.stop_fn(self.ptr);
+    }
+
+    fn requestRender(self: SuspendUi, force: bool) !void {
+        try self.request_render_fn(self.ptr, force);
+    }
+
+    fn showStatus(self: SuspendUi, message: []const u8) !void {
+        try self.show_status_fn(self.ptr, message);
+    }
+};
+
+pub const SuspendProcess = struct {
+    ptr: ?*anyopaque = null,
+    platform_fn: *const fn (?*anyopaque) SuspendPlatform,
+    set_interval_fn: *const fn (?*anyopaque, SuspendTimerCallback, u64) anyerror!SuspendTimerHandle,
+    clear_interval_fn: *const fn (?*anyopaque, SuspendTimerHandle) anyerror!void,
+    on_signal_fn: *const fn (?*anyopaque, SuspendSignal, SuspendSignalCallback) anyerror!void,
+    once_signal_fn: *const fn (?*anyopaque, SuspendSignal, SuspendSignalCallback) anyerror!void,
+    remove_listener_fn: *const fn (?*anyopaque, SuspendSignal, SuspendSignalCallback) anyerror!void,
+    kill_process_group_fn: *const fn (?*anyopaque, SuspendSignal) anyerror!void,
+
+    fn platform(self: SuspendProcess) SuspendPlatform {
+        return self.platform_fn(self.ptr);
+    }
+
+    fn setInterval(self: SuspendProcess, callback: SuspendTimerCallback, interval_ms: u64) !SuspendTimerHandle {
+        return self.set_interval_fn(self.ptr, callback, interval_ms);
+    }
+
+    fn clearInterval(self: SuspendProcess, handle: SuspendTimerHandle) !void {
+        try self.clear_interval_fn(self.ptr, handle);
+    }
+
+    fn onSignal(self: SuspendProcess, signal: SuspendSignal, callback: SuspendSignalCallback) !void {
+        try self.on_signal_fn(self.ptr, signal, callback);
+    }
+
+    fn onceSignal(self: SuspendProcess, signal: SuspendSignal, callback: SuspendSignalCallback) !void {
+        try self.once_signal_fn(self.ptr, signal, callback);
+    }
+
+    fn removeListener(self: SuspendProcess, signal: SuspendSignal, callback: SuspendSignalCallback) !void {
+        try self.remove_listener_fn(self.ptr, signal, callback);
+    }
+
+    fn killProcessGroup(self: SuspendProcess, signal: SuspendSignal) !void {
+        try self.kill_process_group_fn(self.ptr, signal);
+    }
+};
+
+pub const SuspendContext = struct {
+    ui: SuspendUi,
+    process: SuspendProcess,
+};
+
+const suspend_keep_alive_interval_ms: u64 = 1 << 30;
+
+const SuspendResumeState = struct {
+    allocator: std.mem.Allocator,
+    ui: SuspendUi,
+    process: SuspendProcess,
+    keep_alive: SuspendTimerHandle,
+    sigint_callback: SuspendSignalCallback,
+
+    fn cleanup(self: *SuspendResumeState) !void {
+        try self.process.clearInterval(self.keep_alive);
+        try self.process.removeListener(.sigint, self.sigint_callback);
+    }
+};
+
+pub fn handleCtrlZ(allocator: std.mem.Allocator, context: SuspendContext) !void {
+    if (context.process.platform() == .windows) {
+        try context.ui.showStatus("Suspend to background is not supported on Windows");
+        return;
+    }
+
+    const keep_alive = try context.process.setInterval(.{ .call_fn = suspendKeepAliveTick }, suspend_keep_alive_interval_ms);
+    var keep_alive_registered = true;
+    errdefer if (keep_alive_registered) context.process.clearInterval(keep_alive) catch {};
+
+    const ignore_sigint = SuspendSignalCallback{ .call_fn = ignoreSuspendSigint };
+    try context.process.onSignal(.sigint, ignore_sigint);
+    var sigint_registered = true;
+    errdefer if (sigint_registered) context.process.removeListener(.sigint, ignore_sigint) catch {};
+
+    const resume_state = try allocator.create(SuspendResumeState);
+    var resume_state_owned_by_function = true;
+    errdefer if (resume_state_owned_by_function) allocator.destroy(resume_state);
+    resume_state.* = .{
+        .allocator = allocator,
+        .ui = context.ui,
+        .process = context.process,
+        .keep_alive = keep_alive,
+        .sigint_callback = ignore_sigint,
+    };
+
+    try context.process.onceSignal(.sigcont, .{
+        .ptr = resume_state,
+        .call_fn = resumeAfterSuspend,
+    });
+
+    try context.ui.stop();
+    context.process.killProcessGroup(.sigtstp) catch |err| {
+        try resume_state.cleanup();
+        keep_alive_registered = false;
+        sigint_registered = false;
+        resume_state_owned_by_function = false;
+        allocator.destroy(resume_state);
+        return err;
+    };
+
+    keep_alive_registered = false;
+    sigint_registered = false;
+    resume_state_owned_by_function = false;
+}
+
+fn suspendKeepAliveTick(_: ?*anyopaque) !void {}
+
+fn ignoreSuspendSigint(_: ?*anyopaque) !void {}
+
+fn resumeAfterSuspend(ptr: ?*anyopaque) !void {
+    const state: *SuspendResumeState = @ptrCast(@alignCast(ptr.?));
+    const allocator = state.allocator;
+    defer allocator.destroy(state);
+
+    try state.cleanup();
+    try state.ui.start();
+    try state.ui.requestRender(true);
+}
+
 pub const InteractiveEventUi = struct {
     ptr: ?*anyopaque = null,
     clear_chat_fn: *const fn (?*anyopaque) anyerror!void,
@@ -1036,6 +1212,146 @@ const TestAnthropicWarningUi = struct {
     }
 };
 
+const TestSuspendUi = struct {
+    allocator: std.mem.Allocator,
+    start_count: usize = 0,
+    stop_count: usize = 0,
+    request_render_count: usize = 0,
+    last_request_render_force: ?bool = null,
+    statuses: std.ArrayList([]u8) = .empty,
+
+    fn init(allocator: std.mem.Allocator) TestSuspendUi {
+        return .{ .allocator = allocator };
+    }
+
+    fn deinit(self: *TestSuspendUi) void {
+        freeMessageList(self.allocator, &self.statuses);
+        self.* = undefined;
+    }
+
+    fn callbacks(self: *TestSuspendUi) SuspendUi {
+        return .{
+            .ptr = self,
+            .start_fn = start,
+            .stop_fn = stop,
+            .request_render_fn = requestRender,
+            .show_status_fn = showStatus,
+        };
+    }
+
+    fn start(ptr: ?*anyopaque) !void {
+        const self: *TestSuspendUi = @ptrCast(@alignCast(ptr.?));
+        self.start_count += 1;
+    }
+
+    fn stop(ptr: ?*anyopaque) !void {
+        const self: *TestSuspendUi = @ptrCast(@alignCast(ptr.?));
+        self.stop_count += 1;
+    }
+
+    fn requestRender(ptr: ?*anyopaque, force: bool) !void {
+        const self: *TestSuspendUi = @ptrCast(@alignCast(ptr.?));
+        self.request_render_count += 1;
+        self.last_request_render_force = force;
+    }
+
+    fn showStatus(ptr: ?*anyopaque, message: []const u8) !void {
+        const self: *TestSuspendUi = @ptrCast(@alignCast(ptr.?));
+        const copy = try self.allocator.dupe(u8, message);
+        errdefer self.allocator.free(copy);
+        try self.statuses.append(self.allocator, copy);
+    }
+};
+
+const TestSuspendProcess = struct {
+    platform_value: SuspendPlatform = .posix,
+    fail_kill: bool = false,
+    set_interval_count: usize = 0,
+    last_interval_ms: ?u64 = null,
+    clear_interval_count: usize = 0,
+    last_clear_handle: ?SuspendTimerHandle = null,
+    on_sigint_count: usize = 0,
+    once_sigcont_count: usize = 0,
+    remove_sigint_count: usize = 0,
+    kill_count: usize = 0,
+    last_kill_signal: ?SuspendSignal = null,
+    sigint_callback: ?SuspendSignalCallback = null,
+    sigcont_callback: ?SuspendSignalCallback = null,
+    removed_sigint_callback: ?SuspendSignalCallback = null,
+
+    fn callbacks(self: *TestSuspendProcess) SuspendProcess {
+        return .{
+            .ptr = self,
+            .platform_fn = platform,
+            .set_interval_fn = setInterval,
+            .clear_interval_fn = clearInterval,
+            .on_signal_fn = onSignal,
+            .once_signal_fn = onceSignal,
+            .remove_listener_fn = removeListener,
+            .kill_process_group_fn = killProcessGroup,
+        };
+    }
+
+    fn platform(ptr: ?*anyopaque) SuspendPlatform {
+        const self: *TestSuspendProcess = @ptrCast(@alignCast(ptr.?));
+        return self.platform_value;
+    }
+
+    fn setInterval(
+        ptr: ?*anyopaque,
+        callback: SuspendTimerCallback,
+        interval_ms: u64,
+    ) !SuspendTimerHandle {
+        _ = callback;
+        const self: *TestSuspendProcess = @ptrCast(@alignCast(ptr.?));
+        self.set_interval_count += 1;
+        self.last_interval_ms = interval_ms;
+        return .{ .id = 42 };
+    }
+
+    fn clearInterval(ptr: ?*anyopaque, handle: SuspendTimerHandle) !void {
+        const self: *TestSuspendProcess = @ptrCast(@alignCast(ptr.?));
+        self.clear_interval_count += 1;
+        self.last_clear_handle = handle;
+    }
+
+    fn onSignal(ptr: ?*anyopaque, signal: SuspendSignal, callback: SuspendSignalCallback) !void {
+        const self: *TestSuspendProcess = @ptrCast(@alignCast(ptr.?));
+        if (signal == .sigint) {
+            self.on_sigint_count += 1;
+            self.sigint_callback = callback;
+        }
+    }
+
+    fn onceSignal(ptr: ?*anyopaque, signal: SuspendSignal, callback: SuspendSignalCallback) !void {
+        const self: *TestSuspendProcess = @ptrCast(@alignCast(ptr.?));
+        if (signal == .sigcont) {
+            self.once_sigcont_count += 1;
+            self.sigcont_callback = callback;
+        }
+    }
+
+    fn removeListener(ptr: ?*anyopaque, signal: SuspendSignal, callback: SuspendSignalCallback) !void {
+        const self: *TestSuspendProcess = @ptrCast(@alignCast(ptr.?));
+        if (signal == .sigint) {
+            self.remove_sigint_count += 1;
+            self.removed_sigint_callback = callback;
+        }
+    }
+
+    fn killProcessGroup(ptr: ?*anyopaque, signal: SuspendSignal) !void {
+        const self: *TestSuspendProcess = @ptrCast(@alignCast(ptr.?));
+        self.kill_count += 1;
+        self.last_kill_signal = signal;
+        if (self.fail_kill) return error.SuspendFailed;
+    }
+};
+
+fn expectSameSuspendCallback(expected: SuspendSignalCallback, actual: SuspendSignalCallback) !void {
+    try std.testing.expectEqual(expected.ptr, actual.ptr);
+    try std.testing.expect(expected.call_fn == actual.call_fn);
+}
+
 const TestCloneSessionManager = struct {
     leaf_id: ?[]const u8 = null,
 
@@ -1330,6 +1646,83 @@ const TestImportRuntimeHost = struct {
         }
     }
 };
+
+// Ported from packages/coding-agent/test/interactive-mode-suspend.test.ts.
+test "InteractiveMode handleCtrlZ shows a status message and skips suspend on Windows" {
+    const allocator = std.testing.allocator;
+    var ui = TestSuspendUi.init(allocator);
+    defer ui.deinit();
+    var process = TestSuspendProcess{ .platform_value = .windows };
+
+    try handleCtrlZ(allocator, .{
+        .ui = ui.callbacks(),
+        .process = process.callbacks(),
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), ui.statuses.items.len);
+    try std.testing.expectEqualStrings("Suspend to background is not supported on Windows", ui.statuses.items[0]);
+    try std.testing.expectEqual(@as(usize, 0), ui.stop_count);
+    try std.testing.expectEqual(@as(usize, 0), process.set_interval_count);
+    try std.testing.expectEqual(@as(usize, 0), process.on_sigint_count);
+    try std.testing.expectEqual(@as(usize, 0), process.once_sigcont_count);
+    try std.testing.expectEqual(@as(usize, 0), process.kill_count);
+}
+
+test "InteractiveMode handleCtrlZ keeps the process alive while suspended and restores the TUI on SIGCONT" {
+    const allocator = std.testing.allocator;
+    var ui = TestSuspendUi.init(allocator);
+    defer ui.deinit();
+    var process = TestSuspendProcess{ .platform_value = .posix };
+
+    try handleCtrlZ(allocator, .{
+        .ui = ui.callbacks(),
+        .process = process.callbacks(),
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), process.set_interval_count);
+    try std.testing.expectEqual(suspend_keep_alive_interval_ms, process.last_interval_ms.?);
+    try std.testing.expectEqual(@as(usize, 1), process.on_sigint_count);
+    try std.testing.expectEqual(@as(usize, 1), process.once_sigcont_count);
+    try std.testing.expectEqual(@as(usize, 1), ui.stop_count);
+    try std.testing.expectEqual(@as(usize, 1), process.kill_count);
+    try std.testing.expectEqual(SuspendSignal.sigtstp, process.last_kill_signal.?);
+    try std.testing.expect(process.sigint_callback != null);
+    try std.testing.expect(process.sigcont_callback != null);
+
+    try process.sigcont_callback.?.call();
+
+    try std.testing.expectEqual(@as(usize, 1), process.clear_interval_count);
+    try std.testing.expectEqual(@as(usize, 42), process.last_clear_handle.?.id);
+    try std.testing.expectEqual(@as(usize, 1), process.remove_sigint_count);
+    try expectSameSuspendCallback(process.sigint_callback.?, process.removed_sigint_callback.?);
+    try std.testing.expectEqual(@as(usize, 1), ui.start_count);
+    try std.testing.expectEqual(@as(usize, 1), ui.request_render_count);
+    try std.testing.expectEqual(true, ui.last_request_render_force.?);
+}
+
+test "InteractiveMode handleCtrlZ cleans up temporary handlers if suspension fails" {
+    const allocator = std.testing.allocator;
+    var ui = TestSuspendUi.init(allocator);
+    defer ui.deinit();
+    var process = TestSuspendProcess{
+        .platform_value = .posix,
+        .fail_kill = true,
+    };
+
+    try std.testing.expectError(error.SuspendFailed, handleCtrlZ(allocator, .{
+        .ui = ui.callbacks(),
+        .process = process.callbacks(),
+    }));
+
+    try std.testing.expectEqual(@as(usize, 1), ui.stop_count);
+    try std.testing.expectEqual(@as(usize, 1), process.set_interval_count);
+    try std.testing.expectEqual(@as(usize, 1), process.clear_interval_count);
+    try std.testing.expectEqual(@as(usize, 42), process.last_clear_handle.?.id);
+    try std.testing.expectEqual(@as(usize, 1), process.remove_sigint_count);
+    try expectSameSuspendCallback(process.sigint_callback.?, process.removed_sigint_callback.?);
+    try std.testing.expectEqual(@as(usize, 0), ui.start_count);
+    try std.testing.expectEqual(@as(usize, 0), ui.request_render_count);
+}
 
 // Ported from packages/coding-agent/test/interactive-mode-compaction.test.ts.
 test "InteractiveMode compaction events rebuilds chat and appends a synthetic summary at the bottom" {
