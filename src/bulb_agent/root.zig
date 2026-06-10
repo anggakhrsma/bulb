@@ -2,6 +2,7 @@ const std = @import("std");
 const ai = @import("bulb_ai");
 
 pub const uuid = @import("uuid.zig");
+pub const truncate = @import("truncate.zig");
 
 pub const AgentStatus = enum {
     idle,
@@ -57,4 +58,5 @@ test "agent lifecycle guards streaming state" {
 
 test {
     _ = @import("uuid.zig");
+    _ = @import("truncate.zig");
 }

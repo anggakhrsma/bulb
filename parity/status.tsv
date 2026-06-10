@@ -2,7 +2,9 @@ upstream_path	status	bulb_path	notes
 LICENSE	implemented	LICENSE	Preserved upstream MIT notice
 packages/agent/src/agent.ts	in_progress	src/bulb_agent/root.zig	Initial streaming lifecycle state
 packages/agent/src/harness/session/uuid.ts	implemented	src/bulb_agent/uuid.zig	Native RFC 9562 UUIDv7 layout, monotonic sequence rollover, thread-safe process generator, and reusable deterministic generator ported
+packages/agent/src/harness/utils/truncate.ts	implemented	src/bulb_agent/truncate.zig	Native head/tail byte and line truncation, size formatting, and grep line truncation ported
 packages/agent/test/agent.test.ts	in_progress	src/bulb_agent/root.zig	Streaming-state guard cases started
+packages/agent/test/harness/truncate.test.ts	implemented	src/bulb_agent/truncate.zig	Upstream UTF-8 head/tail truncation, oversized line, byte-boundary, and deterministic fuzz coverage ported
 packages/agent/test/harness/session-uuid.test.ts	implemented	src/bulb_agent/uuid.zig	Exact RFC layout, sequence increment and rollover, timestamp carry, and lexical monotonicity regression ported
 packages/ai/src/api-registry.ts	in_progress	src/bulb_ai/api_registry.zig	Native provider registration, complete/stream/simple-stream dispatch, source-aware override removal, and prior-provider restoration ported; built-in provider registration remains
 packages/ai/src/env-api-keys.ts	in_progress	src/bulb_ai/utils/env_api_keys.zig	Provider key map, precedence, explicit Vertex API keys, and Bedrock ambient credential markers ported; filesystem-backed gcloud ADC remains

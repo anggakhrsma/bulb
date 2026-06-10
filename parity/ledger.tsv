@@ -59,7 +59,7 @@ packages/agent/src/harness/skills.ts	bulb_agent	source	pending
 packages/agent/src/harness/system-prompt.ts	bulb_agent	source	pending		
 packages/agent/src/harness/types.ts	bulb_agent	source	pending		
 packages/agent/src/harness/utils/shell-output.ts	bulb_agent	source	pending		
-packages/agent/src/harness/utils/truncate.ts	bulb_agent	source	pending		
+packages/agent/src/harness/utils/truncate.ts	bulb_agent	source	implemented	src/bulb_agent/truncate.zig	Native head/tail byte and line truncation, size formatting, and grep line truncation ported
 packages/agent/src/index.ts	bulb_agent	source	pending		
 packages/agent/src/node.ts	bulb_agent	source	pending		
 packages/agent/src/proxy.ts	bulb_agent	source	pending		
@@ -80,7 +80,7 @@ packages/agent/test/harness/session.test.ts	bulb_agent	test	pending
 packages/agent/test/harness/skills.test.ts	bulb_agent	test	pending		
 packages/agent/test/harness/storage.test.ts	bulb_agent	test	pending		
 packages/agent/test/harness/system-prompt.test.ts	bulb_agent	test	pending		
-packages/agent/test/harness/truncate.test.ts	bulb_agent	test	pending		
+packages/agent/test/harness/truncate.test.ts	bulb_agent	test	implemented	src/bulb_agent/truncate.zig	Upstream UTF-8 head/tail truncation, oversized line, byte-boundary, and deterministic fuzz coverage ported
 packages/agent/test/scratch/simple.ts	bulb_agent	test	pending		
 packages/agent/test/utils/calculate.ts	bulb_agent	test	pending		
 packages/agent/test/utils/get-current-time.ts	bulb_agent	test	pending		
