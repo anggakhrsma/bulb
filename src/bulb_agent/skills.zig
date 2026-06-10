@@ -7,6 +7,7 @@ pub const SkillDiagnosticCode = types.SkillDiagnosticCode;
 
 const max_name_length = 64;
 const max_description_length = 1024;
+const ignore_file_names = [_][]const u8{ ".gitignore", ".ignore", ".fdignore" };
 
 pub const SkillDiagnostic = struct {
     allocator: std.mem.Allocator,
@@ -166,11 +167,15 @@ pub fn loadSkillsAlloc(
         defer allocator.free(resolved_path);
         const stat = statPath(io, resolved_path) catch continue;
         if (stat.kind != .directory) continue;
+        var ignore_matcher = IgnoreMatcher.init(allocator);
+        defer ignore_matcher.deinit();
         try loadSkillsFromDirInternal(
             allocator,
             io,
             resolved_path,
             true,
+            &ignore_matcher,
+            resolved_path,
             &skills,
             &diagnostics,
         );
@@ -241,6 +246,8 @@ fn loadSkillsFromDirInternal(
     io: std.Io,
     dir_path: []const u8,
     include_root_files: bool,
+    ignore_matcher: *IgnoreMatcher,
+    root_dir: []const u8,
     skills: *std.ArrayList(Skill),
     diagnostics: *std.ArrayList(SkillDiagnostic),
 ) !void {
@@ -250,9 +257,12 @@ fn loadSkillsFromDirInternal(
     };
     defer directory.close(io);
 
+    try ignore_matcher.addRulesFromDir(io, dir_path, root_dir, diagnostics);
+
     const skill_file_path = try std.fs.path.join(allocator, &.{ dir_path, "SKILL.md" });
     defer allocator.free(skill_file_path);
     if (isFile(io, skill_file_path)) {
+        if (try ignore_matcher.ignoresPathAlloc(skill_file_path, root_dir)) return;
         if (try loadSkillFromFileAlloc(allocator, io, skill_file_path, diagnostics)) |skill| {
             try skills.append(allocator, skill);
         }
@@ -267,10 +277,12 @@ fn loadSkillsFromDirInternal(
         defer allocator.free(path);
         const stat = statPath(io, path) catch continue;
         if (stat.kind == .directory) {
-            try loadSkillsFromDirInternal(allocator, io, path, false, skills, diagnostics);
+            if (try ignore_matcher.ignoresDirectoryAlloc(path, root_dir)) continue;
+            try loadSkillsFromDirInternal(allocator, io, path, false, ignore_matcher, root_dir, skills, diagnostics);
             continue;
         }
         if (stat.kind != .file or !include_root_files or !std.ascii.endsWithIgnoreCase(name, ".md")) continue;
+        if (try ignore_matcher.ignoresPathAlloc(path, root_dir)) continue;
         if (try loadSkillFromFileAlloc(allocator, io, path, diagnostics)) |skill| {
             try skills.append(allocator, skill);
         }
@@ -391,9 +403,202 @@ fn isValidNameCharacters(name: []const u8) bool {
     return true;
 }
 
+const IgnoreMatcher = struct {
+    allocator: std.mem.Allocator,
+    rules: std.ArrayList(IgnoreRule) = .empty,
+
+    fn init(allocator: std.mem.Allocator) IgnoreMatcher {
+        return .{ .allocator = allocator };
+    }
+
+    fn deinit(self: *IgnoreMatcher) void {
+        for (self.rules.items) |*rule| rule.deinit(self.allocator);
+        self.rules.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    fn addRulesFromDir(
+        self: *IgnoreMatcher,
+        io: std.Io,
+        dir: []const u8,
+        root_dir: []const u8,
+        diagnostics: *std.ArrayList(SkillDiagnostic),
+    ) !void {
+        const relative_dir = try relativePathAlloc(self.allocator, dir, root_dir);
+        defer self.allocator.free(relative_dir);
+        const posix_relative_dir = try toPosixPathAlloc(self.allocator, relative_dir);
+        defer self.allocator.free(posix_relative_dir);
+        const prefix = if (posix_relative_dir.len == 0)
+            try self.allocator.dupe(u8, "")
+        else
+            try std.mem.concat(self.allocator, u8, &.{ posix_relative_dir, "/" });
+        defer self.allocator.free(prefix);
+
+        for (ignore_file_names) |name| {
+            const ignore_path = try std.fs.path.join(self.allocator, &.{ dir, name });
+            defer self.allocator.free(ignore_path);
+            const stat = statPath(io, ignore_path) catch continue;
+            if (stat.kind != .file) continue;
+            const content = std.Io.Dir.cwd().readFileAlloc(io, ignore_path, self.allocator, .limited(1024 * 1024)) catch |err| {
+                try appendDiagnosticFmt(self.allocator, diagnostics, .read_failed, ignore_path, "{s}", .{@errorName(err)});
+                continue;
+            };
+            defer self.allocator.free(content);
+
+            var lines = std.mem.splitScalar(u8, content, '\n');
+            while (lines.next()) |line| {
+                const normalized_line = if (std.mem.endsWith(u8, line, "\r"))
+                    line[0 .. line.len - 1]
+                else
+                    line;
+                var rule = (try prefixIgnorePatternAlloc(self.allocator, normalized_line, prefix)) orelse continue;
+                errdefer rule.deinit(self.allocator);
+                try self.rules.append(self.allocator, rule);
+            }
+        }
+    }
+
+    fn ignoresPathAlloc(self: *IgnoreMatcher, target_path: []const u8, root_dir: []const u8) !bool {
+        const relative = try relativePathAlloc(self.allocator, target_path, root_dir);
+        defer self.allocator.free(relative);
+        const posix = try toPosixPathAlloc(self.allocator, relative);
+        defer self.allocator.free(posix);
+        return self.ignores(posix);
+    }
+
+    fn ignoresDirectoryAlloc(self: *IgnoreMatcher, target_path: []const u8, root_dir: []const u8) !bool {
+        const relative = try relativePathAlloc(self.allocator, target_path, root_dir);
+        defer self.allocator.free(relative);
+        const posix = try toPosixPathAlloc(self.allocator, relative);
+        defer self.allocator.free(posix);
+        const with_slash = try std.mem.concat(self.allocator, u8, &.{ posix, "/" });
+        defer self.allocator.free(with_slash);
+        return self.ignores(with_slash) or self.ignores(posix);
+    }
+
+    fn ignores(self: *const IgnoreMatcher, relative_path: []const u8) bool {
+        var ignored = false;
+        for (self.rules.items) |rule| {
+            if (rule.matches(relative_path)) ignored = !rule.negated;
+        }
+        return ignored;
+    }
+};
+
+const IgnoreRule = struct {
+    pattern: []u8,
+    negated: bool,
+
+    fn deinit(self: *IgnoreRule, allocator: std.mem.Allocator) void {
+        allocator.free(self.pattern);
+        self.* = undefined;
+    }
+
+    fn matches(self: IgnoreRule, relative_path: []const u8) bool {
+        const pattern = self.pattern;
+        if (pattern.len == 0) return false;
+        if (std.mem.endsWith(u8, pattern, "/")) {
+            return std.mem.startsWith(u8, relative_path, pattern) or
+                pathContainsSegment(relative_path, pattern[0 .. pattern.len - 1]);
+        }
+        if (std.mem.indexOfScalar(u8, pattern, '/') != null) {
+            return globMatch(pattern, relative_path);
+        }
+        return basenameOrSegmentGlobMatch(pattern, relative_path);
+    }
+};
+
+fn prefixIgnorePatternAlloc(allocator: std.mem.Allocator, line: []const u8, prefix: []const u8) !?IgnoreRule {
+    const trimmed = std.mem.trim(u8, line, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    if (std.mem.startsWith(u8, trimmed, "#") and !std.mem.startsWith(u8, trimmed, "\\#")) return null;
+
+    var pattern = line;
+    var negated = false;
+    if (std.mem.startsWith(u8, pattern, "!")) {
+        negated = true;
+        pattern = pattern[1..];
+    } else if (std.mem.startsWith(u8, pattern, "\\!")) {
+        pattern = pattern[1..];
+    } else if (std.mem.startsWith(u8, pattern, "\\#")) {
+        pattern = pattern[1..];
+    }
+    if (std.mem.startsWith(u8, pattern, "/")) pattern = pattern[1..];
+    const trimmed_pattern = std.mem.trim(u8, pattern, " \t\r\n");
+    if (trimmed_pattern.len == 0) return null;
+    const owned_pattern = try std.mem.concat(allocator, u8, &.{ prefix, trimmed_pattern });
+    return .{ .pattern = owned_pattern, .negated = negated };
+}
+
+fn basenameOrSegmentGlobMatch(pattern: []const u8, relative_path: []const u8) bool {
+    var segments = std.mem.splitScalar(u8, relative_path, '/');
+    while (segments.next()) |segment| {
+        if (globMatch(pattern, segment)) return true;
+    }
+    return false;
+}
+
+fn pathContainsSegment(relative_path: []const u8, segment: []const u8) bool {
+    var segments = std.mem.splitScalar(u8, relative_path, '/');
+    while (segments.next()) |part| {
+        if (std.mem.eql(u8, part, segment)) return true;
+    }
+    return false;
+}
+
+fn globMatch(pattern: []const u8, text: []const u8) bool {
+    var pattern_index: usize = 0;
+    var text_index: usize = 0;
+    var star_index: ?usize = null;
+    var match_index: usize = 0;
+
+    while (text_index < text.len) {
+        if (pattern_index < pattern.len and
+            (pattern[pattern_index] == '?' or pattern[pattern_index] == text[text_index]))
+        {
+            pattern_index += 1;
+            text_index += 1;
+        } else if (pattern_index < pattern.len and pattern[pattern_index] == '*') {
+            star_index = pattern_index;
+            match_index = text_index;
+            pattern_index += 1;
+        } else if (star_index) |star| {
+            pattern_index = star + 1;
+            match_index += 1;
+            text_index = match_index;
+        } else {
+            return false;
+        }
+    }
+
+    while (pattern_index < pattern.len and pattern[pattern_index] == '*') pattern_index += 1;
+    return pattern_index == pattern.len;
+}
+
 fn resolvePathAlloc(allocator: std.mem.Allocator, cwd: []const u8, path: []const u8) ![]u8 {
     if (std.fs.path.isAbsolute(path)) return allocator.dupe(u8, path);
     return std.fs.path.resolve(allocator, &.{ cwd, path });
+}
+
+fn relativePathAlloc(allocator: std.mem.Allocator, target_path: []const u8, root_dir: []const u8) ![]u8 {
+    if (std.mem.eql(u8, target_path, root_dir)) return allocator.dupe(u8, "");
+    if (std.mem.startsWith(u8, target_path, root_dir) and
+        target_path.len > root_dir.len and
+        (target_path[root_dir.len] == std.fs.path.sep or target_path[root_dir.len] == '/'))
+    {
+        return allocator.dupe(u8, target_path[root_dir.len + 1 ..]);
+    }
+    return std.fs.path.relative(allocator, ".", null, root_dir, target_path) catch allocator.dupe(u8, target_path);
+}
+
+fn toPosixPathAlloc(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    const output = try allocator.dupe(u8, input);
+    if (std.fs.path.sep != '/') {
+        for (output) |*byte| {
+            if (byte.* == std.fs.path.sep) byte.* = '/';
+        }
+    }
+    return output;
 }
 
 fn statPath(io: std.Io, path: []const u8) !std.Io.File.Stat {
@@ -557,6 +762,89 @@ test "loadSkills loads SKILL.md files and direct root markdown children" {
     try std.testing.expectEqual(@as(usize, 1), root_loaded.skills.len);
     try std.testing.expectEqualStrings("plain-skills", root_loaded.skills[0].name);
     try std.testing.expectEqualStrings("Root content", root_loaded.skills[0].content);
+}
+
+test "loadSkills honors git ignore files during recursive discovery" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tempDirPathAlloc(allocator, &tmp);
+    defer allocator.free(root);
+
+    const ignore_file = try std.fs.path.join(allocator, &.{ root, "skills", ".gitignore" });
+    defer allocator.free(ignore_file);
+    try writeFile(ignore_file,
+        \\# comments are ignored
+        \\bad-skill/SKILL.md
+        \\fd-root/SKILL.md
+        \\ignored-root.md
+        \\*.tmp.md
+        \\!keep.tmp.md
+        \\\#literal.md
+    );
+    const nested_ignore_file = try std.fs.path.join(allocator, &.{ root, "skills", "nested", ".ignore" });
+    defer allocator.free(nested_ignore_file);
+    try writeFile(nested_ignore_file, "skip-me\n");
+    const nested_fdignore_file = try std.fs.path.join(allocator, &.{ root, "skills", "nested", ".fdignore" });
+    defer allocator.free(nested_fdignore_file);
+    try writeFile(nested_fdignore_file, "fd-skip/SKILL.md\n");
+
+    const good_skill = try std.fs.path.join(allocator, &.{ root, "skills", "good-skill", "SKILL.md" });
+    defer allocator.free(good_skill);
+    try writeFile(good_skill, "---\nname: good-skill\ndescription: Good skill\n---\nGood content");
+    const bad_skill = try std.fs.path.join(allocator, &.{ root, "skills", "bad-skill", "SKILL.md" });
+    defer allocator.free(bad_skill);
+    try writeFile(bad_skill, "---\nname: bad-skill\ndescription: Bad skill\n---\nBad content");
+    const fd_root_skill = try std.fs.path.join(allocator, &.{ root, "skills", "fd-root", "SKILL.md" });
+    defer allocator.free(fd_root_skill);
+    try writeFile(fd_root_skill, "---\nname: fd-root\ndescription: Fd root\n---\nFd root content");
+    const nested_keep_skill = try std.fs.path.join(allocator, &.{ root, "skills", "nested", "keep", "SKILL.md" });
+    defer allocator.free(nested_keep_skill);
+    try writeFile(nested_keep_skill, "---\nname: keep\ndescription: Kept nested\n---\nKept nested content");
+    const nested_skip_skill = try std.fs.path.join(allocator, &.{ root, "skills", "nested", "skip-me", "SKILL.md" });
+    defer allocator.free(nested_skip_skill);
+    try writeFile(nested_skip_skill, "---\nname: skip-me\ndescription: Skipped nested\n---\nSkipped nested content");
+    const nested_fd_skip_skill = try std.fs.path.join(allocator, &.{ root, "skills", "nested", "fd-skip", "SKILL.md" });
+    defer allocator.free(nested_fd_skip_skill);
+    try writeFile(nested_fd_skip_skill, "---\nname: fd-skip\ndescription: Skipped fd\n---\nSkipped fd content");
+
+    const ignored_root = try std.fs.path.join(allocator, &.{ root, "skills", "ignored-root.md" });
+    defer allocator.free(ignored_root);
+    try writeFile(ignored_root, "---\ndescription: Ignored root\n---\nIgnored root content");
+    const escaped_comment_root = try std.fs.path.join(allocator, &.{ root, "skills", "#literal.md" });
+    defer allocator.free(escaped_comment_root);
+    try writeFile(escaped_comment_root, "---\ndescription: Escaped comment\n---\nEscaped comment content");
+    const skipped_tmp_root = try std.fs.path.join(allocator, &.{ root, "skills", "skip.tmp.md" });
+    defer allocator.free(skipped_tmp_root);
+    try writeFile(skipped_tmp_root, "---\ndescription: Skipped tmp\n---\nSkipped tmp content");
+    const kept_tmp_root = try std.fs.path.join(allocator, &.{ root, "skills", "keep.tmp.md" });
+    defer allocator.free(kept_tmp_root);
+    try writeFile(kept_tmp_root, "---\ndescription: Kept root\n---\nKept root content");
+
+    var loaded = try loadSkillsAlloc(allocator, io, .{ .cwd = root, .paths = &.{"skills"} });
+    defer loaded.deinit();
+    try std.testing.expectEqual(@as(usize, 0), loaded.diagnostics.len);
+    try std.testing.expectEqual(@as(usize, 3), loaded.skills.len);
+
+    var saw_good = false;
+    var saw_root = false;
+    var saw_nested = false;
+    for (loaded.skills) |skill| {
+        if (std.mem.eql(u8, skill.name, "good-skill")) saw_good = true;
+        if (std.mem.eql(u8, skill.name, "skills") and std.mem.eql(u8, skill.description, "Kept root")) saw_root = true;
+        if (std.mem.eql(u8, skill.name, "keep")) saw_nested = true;
+        try std.testing.expect(!std.mem.eql(u8, skill.name, "bad-skill"));
+        try std.testing.expect(!std.mem.eql(u8, skill.name, "fd-root"));
+        try std.testing.expect(!std.mem.eql(u8, skill.name, "skip-me"));
+        try std.testing.expect(!std.mem.eql(u8, skill.name, "fd-skip"));
+        try std.testing.expect(!std.mem.eql(u8, skill.description, "Ignored root"));
+        try std.testing.expect(!std.mem.eql(u8, skill.description, "Escaped comment"));
+        try std.testing.expect(!std.mem.eql(u8, skill.description, "Skipped tmp"));
+    }
+    try std.testing.expect(saw_good);
+    try std.testing.expect(saw_root);
+    try std.testing.expect(saw_nested);
 }
 
 test "loadSkills handles symlinked directories and sourced diagnostics" {
