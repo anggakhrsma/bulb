@@ -7,9 +7,11 @@ pub const types = @import("types.zig");
 pub const prompt_templates = @import("prompt_templates.zig");
 pub const skills = @import("skills.zig");
 pub const system_prompt = @import("system_prompt.zig");
+pub const messages = @import("messages.zig");
 
 pub const PromptTemplate = types.PromptTemplate;
 pub const Skill = types.Skill;
+pub const AgentMessage = types.AgentMessage;
 
 pub const AgentStatus = enum {
     idle,
@@ -69,6 +71,7 @@ test {
     _ = @import("prompt_templates.zig");
     _ = @import("skills.zig");
     _ = @import("system_prompt.zig");
+    _ = @import("messages.zig");
     _ = @import("uuid.zig");
     _ = @import("truncate.zig");
 }

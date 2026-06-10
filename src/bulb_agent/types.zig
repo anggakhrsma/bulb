@@ -1,4 +1,5 @@
 const std = @import("std");
+const ai = @import("bulb_ai");
 
 pub const PromptTemplate = struct {
     allocator: std.mem.Allocator,
@@ -90,6 +91,52 @@ pub const SkillDiagnosticCode = enum {
     read_failed,
     parse_failed,
     invalid_metadata,
+};
+
+pub const BashExecutionMessage = struct {
+    command: []const u8,
+    output: []const u8,
+    exit_code: ?i64 = null,
+    cancelled: bool = false,
+    truncated: bool = false,
+    full_output_path: ?[]const u8 = null,
+    timestamp_ms: i64,
+    exclude_from_context: bool = false,
+};
+
+pub const CustomMessageContent = union(enum) {
+    text: []const u8,
+    parts: []const ai.UserContent,
+};
+
+pub const CustomMessage = struct {
+    custom_type: []const u8,
+    content: CustomMessageContent,
+    display: bool,
+    details_json: ?[]const u8 = null,
+    timestamp_ms: i64,
+};
+
+pub const BranchSummaryMessage = struct {
+    summary: []const u8,
+    from_id: []const u8,
+    timestamp_ms: i64,
+};
+
+pub const CompactionSummaryMessage = struct {
+    summary: []const u8,
+    tokens_before: u64,
+    timestamp_ms: i64,
+};
+
+pub const AgentMessage = union(enum) {
+    user: ai.UserMessage,
+    assistant: ai.AssistantMessage,
+    tool_result: ai.ToolResultMessage,
+    bash_execution: BashExecutionMessage,
+    custom: CustomMessage,
+    branch_summary: BranchSummaryMessage,
+    compaction_summary: CompactionSummaryMessage,
 };
 
 pub fn appendEscapedXml(
