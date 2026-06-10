@@ -3,6 +3,13 @@ const ai = @import("bulb_ai");
 
 pub const uuid = @import("uuid.zig");
 pub const truncate = @import("truncate.zig");
+pub const types = @import("types.zig");
+pub const prompt_templates = @import("prompt_templates.zig");
+pub const skills = @import("skills.zig");
+pub const system_prompt = @import("system_prompt.zig");
+
+pub const PromptTemplate = types.PromptTemplate;
+pub const Skill = types.Skill;
 
 pub const AgentStatus = enum {
     idle,
@@ -57,6 +64,11 @@ test "agent lifecycle guards streaming state" {
 }
 
 test {
+    _ = @import("frontmatter.zig");
+    _ = @import("types.zig");
+    _ = @import("prompt_templates.zig");
+    _ = @import("skills.zig");
+    _ = @import("system_prompt.zig");
     _ = @import("uuid.zig");
     _ = @import("truncate.zig");
 }

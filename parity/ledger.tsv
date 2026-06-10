@@ -47,7 +47,7 @@ packages/agent/src/harness/compaction/compaction.ts	bulb_agent	source	pending
 packages/agent/src/harness/compaction/utils.ts	bulb_agent	source	pending		
 packages/agent/src/harness/env/nodejs.ts	bulb_agent	source	pending		
 packages/agent/src/harness/messages.ts	bulb_agent	source	pending		
-packages/agent/src/harness/prompt-templates.ts	bulb_agent	source	pending		
+packages/agent/src/harness/prompt-templates.ts	bulb_agent	source	implemented	src/bulb_agent/prompt_templates.zig	Native direct-filesystem prompt template loading, sourced provenance wrappers, frontmatter diagnostics, shell-style argument parsing, placeholder substitution, and invocation formatting ported
 packages/agent/src/harness/session/jsonl-repo.ts	bulb_agent	source	pending		
 packages/agent/src/harness/session/jsonl-storage.ts	bulb_agent	source	pending		
 packages/agent/src/harness/session/memory-repo.ts	bulb_agent	source	pending		
@@ -55,9 +55,9 @@ packages/agent/src/harness/session/memory-storage.ts	bulb_agent	source	pending
 packages/agent/src/harness/session/repo-utils.ts	bulb_agent	source	pending		
 packages/agent/src/harness/session/session.ts	bulb_agent	source	pending		
 packages/agent/src/harness/session/uuid.ts	bulb_agent	source	implemented	src/bulb_agent/uuid.zig	Native RFC 9562 UUIDv7 layout, monotonic sequence rollover, thread-safe process generator, and reusable deterministic generator ported
-packages/agent/src/harness/skills.ts	bulb_agent	source	pending		
-packages/agent/src/harness/system-prompt.ts	bulb_agent	source	pending		
-packages/agent/src/harness/types.ts	bulb_agent	source	pending		
+packages/agent/src/harness/skills.ts	bulb_agent	source	in_progress	src/bulb_agent/skills.zig	Native skill structs, invocation formatting, recursive SKILL.md/root Markdown discovery, symlink traversal, metadata validation, sourced diagnostics, and upstream loader regressions ported; ignore-file matching and full ExecutionEnv diagnostics remain
+packages/agent/src/harness/system-prompt.ts	bulb_agent	source	implemented	src/bulb_agent/system_prompt.zig	Native model-visible skill prompt formatting, disabled-skill filtering, ordering, and XML escaping ported
+packages/agent/src/harness/types.ts	bulb_agent	source	in_progress	src/bulb_agent/types.zig	PromptTemplate, Skill, and resource diagnostic contract types started; broader ExecutionEnv, shell, session, and harness error contracts remain
 packages/agent/src/harness/utils/shell-output.ts	bulb_agent	source	pending		
 packages/agent/src/harness/utils/truncate.ts	bulb_agent	source	implemented	src/bulb_agent/truncate.zig	Native head/tail byte and line truncation, size formatting, and grep line truncation ported
 packages/agent/src/index.ts	bulb_agent	source	pending		
@@ -71,15 +71,15 @@ packages/agent/test/harness/agent-harness-stream.test.ts	bulb_agent	test	pending
 packages/agent/test/harness/agent-harness.test.ts	bulb_agent	test	pending		
 packages/agent/test/harness/compaction.test.ts	bulb_agent	test	pending		
 packages/agent/test/harness/nodejs-env.test.ts	bulb_agent	test	pending		
-packages/agent/test/harness/prompt-templates.test.ts	bulb_agent	test	pending		
+packages/agent/test/harness/prompt-templates.test.ts	bulb_agent	test	implemented	src/bulb_agent/prompt_templates.zig	Upstream non-recursive loading, sourced provenance, diagnostic provenance, explicit file/symlink loading, and argument substitution regressions ported
 packages/agent/test/harness/repo.test.ts	bulb_agent	test	pending		
-packages/agent/test/harness/resource-formatting.test.ts	bulb_agent	test	pending		
+packages/agent/test/harness/resource-formatting.test.ts	bulb_agent	test	implemented	src/bulb_agent/skills.zig;src/bulb_agent/prompt_templates.zig	Upstream skill invocation and prompt template invocation formatting regressions ported with Bulb .bulb path translation
 packages/agent/test/harness/session-test-utils.ts	bulb_agent	test	pending		
 packages/agent/test/harness/session-uuid.test.ts	bulb_agent	test	implemented	src/bulb_agent/uuid.zig	Exact RFC layout, sequence increment and rollover, timestamp carry, and lexical monotonicity regression ported
 packages/agent/test/harness/session.test.ts	bulb_agent	test	pending		
-packages/agent/test/harness/skills.test.ts	bulb_agent	test	pending		
+packages/agent/test/harness/skills.test.ts	bulb_agent	test	implemented	src/bulb_agent/skills.zig	Upstream SKILL.md loading, symlink directory traversal, sourced skills, diagnostic source attachment, and root Markdown child behavior ported
 packages/agent/test/harness/storage.test.ts	bulb_agent	test	pending		
-packages/agent/test/harness/system-prompt.test.ts	bulb_agent	test	pending		
+packages/agent/test/harness/system-prompt.test.ts	bulb_agent	test	implemented	src/bulb_agent/system_prompt.zig	Upstream visible-skill ordering, disabled-skill filtering, empty output, and XML escaping regressions ported
 packages/agent/test/harness/truncate.test.ts	bulb_agent	test	implemented	src/bulb_agent/truncate.zig	Upstream UTF-8 head/tail truncation, oversized line, byte-boundary, and deterministic fuzz coverage ported
 packages/agent/test/scratch/simple.ts	bulb_agent	test	pending		
 packages/agent/test/utils/calculate.ts	bulb_agent	test	pending		
