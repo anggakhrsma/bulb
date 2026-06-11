@@ -45,7 +45,7 @@ packages/agent/src/harness/agent-harness.ts	bulb_agent	source	pending
 packages/agent/src/harness/compaction/branch-summarization.ts	bulb_agent	source	pending		
 packages/agent/src/harness/compaction/compaction.ts	bulb_agent	source	pending		
 packages/agent/src/harness/compaction/utils.ts	bulb_agent	source	pending		
-packages/agent/src/harness/env/nodejs.ts	bulb_agent	source	pending		
+packages/agent/src/harness/env/nodejs.ts	bulb_agent	source	implemented	src/bulb_agent/node_env.zig	Native LocalExecutionEnv ports path resolution, shell exec, file IO, directory listing, canonical paths, temp files, cleanup, error mapping, timeout/callback handling, and shell-output capture integration
 packages/agent/src/harness/messages.ts	bulb_agent	source	implemented	src/bulb_agent/messages.zig	Bash execution, custom messages, branch summaries, compaction summaries, ISO timestamp factories, and convertToLlm transformer ported with owned generated text/content and borrowed pass-through AI messages
 packages/agent/src/harness/prompt-templates.ts	bulb_agent	source	implemented	src/bulb_agent/prompt_templates.zig	Native direct-filesystem prompt template loading, sourced provenance wrappers, frontmatter diagnostics, shell-style argument parsing, placeholder substitution, and invocation formatting ported
 packages/agent/src/harness/session/jsonl-repo.ts	bulb_agent	source	pending		
@@ -57,7 +57,7 @@ packages/agent/src/harness/session/session.ts	bulb_agent	source	pending
 packages/agent/src/harness/session/uuid.ts	bulb_agent	source	implemented	src/bulb_agent/uuid.zig	Native RFC 9562 UUIDv7 layout, monotonic sequence rollover, thread-safe process generator, and reusable deterministic generator ported
 packages/agent/src/harness/skills.ts	bulb_agent	source	in_progress	src/bulb_agent/skills.zig	Native skill structs, invocation formatting, recursive SKILL.md/root Markdown discovery, symlink traversal, metadata validation, sourced diagnostics, ignore-file matching, and upstream loader regressions ported; full ExecutionEnv diagnostics remain
 packages/agent/src/harness/system-prompt.ts	bulb_agent	source	implemented	src/bulb_agent/system_prompt.zig	Native model-visible skill prompt formatting, disabled-skill filtering, ordering, and XML escaping ported
-packages/agent/src/harness/types.ts	bulb_agent	source	in_progress	src/bulb_agent/types.zig	PromptTemplate, Skill, resource diagnostic, Result, file/execution error, abort signal, and minimal ExecutionEnv callback contracts started; broader filesystem, shell, session, and harness error contracts remain
+packages/agent/src/harness/types.ts	bulb_agent	source	in_progress	src/bulb_agent/types.zig	PromptTemplate, Skill, resource diagnostic, Result, file/execution error, abort signal, and expanded ExecutionEnv filesystem/shell/temp-file contracts started; session and harness error contracts remain
 packages/agent/src/harness/utils/shell-output.ts	bulb_agent	source	implemented	src/bulb_agent/shell_output.zig	Native shell capture, stdout/stderr chunk merging, binary-output sanitization, CR stripping, tail truncation, full-output temp spill, cancellation mapping, callback errors, and execution-error propagation ported
 packages/agent/src/harness/utils/truncate.ts	bulb_agent	source	implemented	src/bulb_agent/truncate.zig	Native head/tail byte and line truncation, size formatting, and grep line truncation ported
 packages/agent/src/index.ts	bulb_agent	source	pending		
@@ -70,7 +70,7 @@ packages/agent/test/e2e.test.ts	bulb_agent	test	pending
 packages/agent/test/harness/agent-harness-stream.test.ts	bulb_agent	test	pending		
 packages/agent/test/harness/agent-harness.test.ts	bulb_agent	test	pending		
 packages/agent/test/harness/compaction.test.ts	bulb_agent	test	pending		
-packages/agent/test/harness/nodejs-env.test.ts	bulb_agent	test	in_progress	src/bulb_agent/shell_output.zig	Shell-output full-output spill regression and capture edge cases ported through a deterministic native ExecutionEnv harness; full NodeExecutionEnv filesystem/process coverage remains
+packages/agent/test/harness/nodejs-env.test.ts	bulb_agent	test	implemented	src/bulb_agent/node_env.zig	Pi no-credential filesystem, symlink, text-line, temp-file, recursive remove, pre-abort, exec cwd/env, stream callback, non-zero exit, timeout, callback-error, shell-unavailable/spawn-error, and large shell capture cases ported to native Zig
 packages/agent/test/harness/prompt-templates.test.ts	bulb_agent	test	implemented	src/bulb_agent/prompt_templates.zig	Upstream non-recursive loading, sourced provenance, diagnostic provenance, explicit file/symlink loading, and argument substitution regressions ported
 packages/agent/test/harness/repo.test.ts	bulb_agent	test	pending		
 packages/agent/test/harness/resource-formatting.test.ts	bulb_agent	test	implemented	src/bulb_agent/skills.zig;src/bulb_agent/prompt_templates.zig	Upstream skill invocation and prompt template invocation formatting regressions ported with Bulb .bulb path translation

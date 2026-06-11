@@ -9,6 +9,7 @@ pub const skills = @import("skills.zig");
 pub const system_prompt = @import("system_prompt.zig");
 pub const messages = @import("messages.zig");
 pub const shell_output = @import("shell_output.zig");
+pub const node_env = @import("node_env.zig");
 
 pub const PromptTemplate = types.PromptTemplate;
 pub const Skill = types.Skill;
@@ -76,4 +77,5 @@ test {
     _ = @import("uuid.zig");
     _ = @import("truncate.zig");
     _ = @import("shell_output.zig");
+    _ = @import("node_env.zig");
 }

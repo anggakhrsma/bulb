@@ -85,7 +85,7 @@ pub fn executeShellWithCaptureAlloc(
         .callback_fn = CaptureContext.onExecutionChunk,
     };
 
-    const exec_result = env.exec(command, .{
+    var exec_result = env.exec(command, .{
         .cwd = options.cwd,
         .env = options.env,
         .timeout_seconds = options.timeout_seconds,
@@ -94,6 +94,10 @@ pub fn executeShellWithCaptureAlloc(
         .on_stderr = capture_callback,
     }) catch |exec_error| {
         return .{ .err = executionErrorFromError(exec_error) };
+    };
+    defer switch (exec_result) {
+        .ok => |*value| value.deinit(allocator),
+        .err => {},
     };
 
     const tail_output = try context.joinOutputChunksAlloc();
