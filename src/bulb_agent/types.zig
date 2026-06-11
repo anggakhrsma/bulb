@@ -93,6 +93,141 @@ pub const SkillDiagnosticCode = enum {
     invalid_metadata,
 };
 
+pub fn Result(comptime Value: type, comptime Failure: type) type {
+    return union(enum) {
+        ok: Value,
+        err: Failure,
+
+        pub fn isOk(self: @This()) bool {
+            return switch (self) {
+                .ok => true,
+                .err => false,
+            };
+        }
+    };
+}
+
+pub const FileKind = enum {
+    file,
+    directory,
+    symlink,
+};
+
+pub const FileErrorCode = enum {
+    aborted,
+    not_found,
+    permission_denied,
+    not_directory,
+    is_directory,
+    invalid,
+    not_supported,
+    unknown,
+};
+
+pub const FileError = struct {
+    code: FileErrorCode,
+    message: []const u8,
+    path: ?[]const u8 = null,
+};
+
+pub const ExecutionErrorCode = enum {
+    aborted,
+    timeout,
+    shell_unavailable,
+    spawn_error,
+    callback_error,
+    unknown,
+};
+
+pub const ExecutionError = struct {
+    code: ExecutionErrorCode,
+    message: []const u8,
+};
+
+pub const FileInfo = struct {
+    name: []const u8,
+    path: []const u8,
+    kind: FileKind,
+    size: u64,
+    mtime_ms: i64,
+};
+
+pub const AbortSignal = struct {
+    aborted: bool = false,
+
+    pub fn isAborted(self: *const AbortSignal) bool {
+        return self.aborted;
+    }
+};
+
+pub const ExecutionChunkCallback = struct {
+    ptr: ?*anyopaque = null,
+    callback_fn: *const fn (?*anyopaque, []const u8) anyerror!void = noopChunkCallback,
+
+    pub fn call(self: ExecutionChunkCallback, chunk: []const u8) !void {
+        try self.callback_fn(self.ptr, chunk);
+    }
+};
+
+pub const EnvVar = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
+pub const ExecutionEnvExecOptions = struct {
+    cwd: ?[]const u8 = null,
+    env: []const EnvVar = &.{},
+    timeout_seconds: ?u64 = null,
+    abort_signal: ?*const AbortSignal = null,
+    on_stdout: ?ExecutionChunkCallback = null,
+    on_stderr: ?ExecutionChunkCallback = null,
+};
+
+pub const ExecutionEnvExecResult = struct {
+    stdout: []const u8 = "",
+    stderr: []const u8 = "",
+    exit_code: i32,
+};
+
+pub const CreateTempFileOptions = struct {
+    prefix: []const u8 = "",
+    suffix: []const u8 = "",
+    abort_signal: ?*const AbortSignal = null,
+};
+
+pub const ExecutionEnv = struct {
+    ptr: ?*anyopaque = null,
+    cwd: []const u8,
+    exec_fn: *const fn (?*anyopaque, []const u8, ExecutionEnvExecOptions) anyerror!Result(ExecutionEnvExecResult, ExecutionError),
+    append_file_fn: *const fn (?*anyopaque, []const u8, []const u8, ?*const AbortSignal) anyerror!Result(void, FileError),
+    create_temp_file_fn: *const fn (?*anyopaque, std.mem.Allocator, CreateTempFileOptions) anyerror!Result([]u8, FileError),
+
+    pub fn exec(
+        self: ExecutionEnv,
+        command: []const u8,
+        options: ExecutionEnvExecOptions,
+    ) !Result(ExecutionEnvExecResult, ExecutionError) {
+        return try self.exec_fn(self.ptr, command, options);
+    }
+
+    pub fn appendFile(
+        self: ExecutionEnv,
+        path: []const u8,
+        content: []const u8,
+        abort_signal: ?*const AbortSignal,
+    ) !Result(void, FileError) {
+        return try self.append_file_fn(self.ptr, path, content, abort_signal);
+    }
+
+    pub fn createTempFile(
+        self: ExecutionEnv,
+        allocator: std.mem.Allocator,
+        options: CreateTempFileOptions,
+    ) !Result([]u8, FileError) {
+        return try self.create_temp_file_fn(self.ptr, allocator, options);
+    }
+};
+
 pub const BashExecutionMessage = struct {
     command: []const u8,
     output: []const u8,
@@ -155,3 +290,5 @@ pub fn appendEscapedXml(
         }
     }
 }
+
+fn noopChunkCallback(_: ?*anyopaque, _: []const u8) !void {}
