@@ -10,10 +10,13 @@ pub const system_prompt = @import("system_prompt.zig");
 pub const messages = @import("messages.zig");
 pub const shell_output = @import("shell_output.zig");
 pub const node_env = @import("node_env.zig");
+pub const session_storage = @import("session_storage.zig");
 
 pub const PromptTemplate = types.PromptTemplate;
 pub const Skill = types.Skill;
 pub const AgentMessage = types.AgentMessage;
+pub const InMemorySessionStorage = session_storage.InMemorySessionStorage;
+pub const JsonlSessionStorage = session_storage.JsonlSessionStorage;
 
 pub const AgentStatus = enum {
     idle,
@@ -78,4 +81,5 @@ test {
     _ = @import("truncate.zig");
     _ = @import("shell_output.zig");
     _ = @import("node_env.zig");
+    _ = @import("session_storage.zig");
 }

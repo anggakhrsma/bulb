@@ -387,6 +387,60 @@ pub const ExecutionEnv = struct {
     }
 };
 
+pub const SessionErrorCode = enum {
+    not_found,
+    invalid_session,
+    invalid_entry,
+    invalid_fork_target,
+    storage,
+    unknown,
+};
+
+pub const SessionError = struct {
+    code: SessionErrorCode,
+    message: []const u8,
+};
+
+pub const AgentHarnessErrorCode = enum {
+    busy,
+    invalid_state,
+    invalid_argument,
+    session,
+    hook,
+    auth,
+    compaction,
+    branch_summary,
+    unknown,
+};
+
+pub const AgentHarnessError = struct {
+    code: AgentHarnessErrorCode,
+    message: []const u8,
+};
+
+pub const CompactionErrorCode = enum {
+    aborted,
+    summarization_failed,
+    invalid_session,
+    unknown,
+};
+
+pub const CompactionError = struct {
+    code: CompactionErrorCode,
+    message: []const u8,
+};
+
+pub const BranchSummaryErrorCode = enum {
+    aborted,
+    summarization_failed,
+    invalid_session,
+};
+
+pub const BranchSummaryError = struct {
+    code: BranchSummaryErrorCode,
+    message: []const u8,
+};
+
 pub const BashExecutionMessage = struct {
     command: []const u8,
     output: []const u8,
@@ -431,6 +485,66 @@ pub const AgentMessage = union(enum) {
     custom: CustomMessage,
     branch_summary: BranchSummaryMessage,
     compaction_summary: CompactionSummaryMessage,
+};
+
+pub const SessionEntryKind = enum {
+    message,
+    thinking_level_change,
+    model_change,
+    active_tools_change,
+    compaction,
+    branch_summary,
+    custom,
+    custom_message,
+    label,
+    session_info,
+    leaf,
+    unknown,
+};
+
+pub const SessionTreeEntry = struct {
+    kind: SessionEntryKind,
+    type_name: []const u8,
+    id: []const u8,
+    parent_id: ?[]const u8,
+    timestamp: []const u8,
+
+    message_json: ?[]const u8 = null,
+    thinking_level: ?[]const u8 = null,
+    provider: ?[]const u8 = null,
+    model_id: ?[]const u8 = null,
+    active_tool_names: []const []const u8 = &.{},
+
+    summary: ?[]const u8 = null,
+    first_kept_entry_id: ?[]const u8 = null,
+    tokens_before: ?u64 = null,
+    details_json: ?[]const u8 = null,
+    from_hook: ?bool = null,
+    from_id: ?[]const u8 = null,
+
+    custom_type: ?[]const u8 = null,
+    data_json: ?[]const u8 = null,
+    content_json: ?[]const u8 = null,
+    display: ?bool = null,
+
+    target_id: ?[]const u8 = null,
+    label: ?[]const u8 = null,
+    name: ?[]const u8 = null,
+
+    raw_json: ?[]const u8 = null,
+};
+
+pub const SessionMetadata = struct {
+    id: []const u8,
+    created_at: []const u8,
+};
+
+pub const JsonlSessionMetadata = struct {
+    id: []const u8,
+    created_at: []const u8,
+    cwd: []const u8,
+    path: []const u8,
+    parent_session_path: ?[]const u8 = null,
 };
 
 pub fn appendEscapedXml(
