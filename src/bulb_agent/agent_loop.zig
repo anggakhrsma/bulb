@@ -1365,6 +1365,11 @@ const CaptureConvertState = struct {
     converted_len: usize = 0,
 };
 
+const ContinueCustomState = struct {
+    call_count: usize = 0,
+    saw_custom_as_user: bool = false,
+};
+
 fn keepLastTwo(
     ptr: ?*anyopaque,
     allocator: std.mem.Allocator,
@@ -1387,6 +1392,26 @@ fn captureConvert(
     state.converted_len = source.len;
     const converted = try agent_messages.convertToLlmAlloc(allocator, source);
     return converted.messages;
+}
+
+fn captureCustomContinueStream(
+    ptr: ?*anyopaque,
+    allocator: std.mem.Allocator,
+    model: ai.Model,
+    context: ai.Context,
+    _: ai.StreamOptions,
+) !ai.StreamResult {
+    const state: *ContinueCustomState = @ptrCast(@alignCast(ptr.?));
+    state.call_count += 1;
+    if (context.messages.len == 1 and context.messages[0] == .user) {
+        const user = context.messages[0].user;
+        if (user.content.len == 1 and user.content[0] == .text and
+            std.mem.eql(u8, user.content[0].text.text, "Hook content"))
+        {
+            state.saw_custom_as_user = true;
+        }
+    }
+    return try doneStreamResult(allocator, try assistantTextAlloc(allocator, model, "Response to custom message", .stop));
 }
 
 const ToolStreamState = struct {
@@ -1761,6 +1786,31 @@ test "agent loop continue rejects invalid context and returns only new messages"
         if (event == .message_end) message_end_count += 1;
     }
     try std.testing.expectEqual(@as(usize, 1), message_end_count);
+}
+
+// Ported from packages/agent/test/agent-loop.test.ts custom last-message continue behavior.
+test "agent loop continue accepts custom last message converted for llm" {
+    const allocator = std.testing.allocator;
+    const custom_message: AgentMessage = .{ .custom = .{
+        .custom_type = "custom",
+        .content = .{ .text = "Hook content" },
+        .display = true,
+        .timestamp_ms = 1,
+    } };
+
+    var state: ContinueCustomState = .{};
+    const config: AgentLoopConfig = .{
+        .model = createModel(),
+        .stream = .{ .ptr = &state, .call_fn = captureCustomContinueStream },
+    };
+
+    var result = try runAgentLoopContinueAlloc(allocator, .{ .messages = &.{custom_message} }, config, null);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), state.call_count);
+    try std.testing.expect(state.saw_custom_as_user);
+    try std.testing.expectEqual(@as(usize, 1), result.messages.len);
+    try std.testing.expect(result.messages[0] == .assistant);
 }
 
 // Ported from packages/agent/test/agent-loop.test.ts prepareNextTurn snapshot behavior.
