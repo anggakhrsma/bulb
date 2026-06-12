@@ -16,6 +16,7 @@ pub const session_repo = @import("session_repo.zig");
 pub const compaction = @import("compaction.zig");
 pub const harness = @import("harness.zig");
 pub const agent_loop = @import("agent_loop.zig");
+pub const agent = @import("agent.zig");
 
 pub const PromptTemplate = types.PromptTemplate;
 pub const Skill = types.Skill;
@@ -35,11 +36,11 @@ pub const AgentLoopTool = agent_loop.AgentLoopTool;
 pub const AgentLoopResult = agent_loop.AgentLoopResult;
 pub const AgentEvent = agent_loop.AgentEvent;
 pub const QueueMode = harness.QueueMode;
-
-pub const AgentStatus = enum {
-    idle,
-    streaming,
-};
+pub const Agent = agent.Agent;
+pub const AgentOptions = agent.AgentOptions;
+pub const AgentState = agent.AgentState;
+pub const AgentInitialState = agent.AgentInitialState;
+pub const PendingMessageQueue = agent.PendingMessageQueue;
 
 pub const AgentEventTag = enum {
     agent_start,
@@ -54,39 +55,7 @@ pub const AgentEventTag = enum {
     tool_execution_end,
 };
 
-pub const AgentError = error{
-    AlreadyStreaming,
-    NotStreaming,
-};
-
-pub const AgentState = struct {
-    status: AgentStatus = .idle,
-    thinking_level: ai.ThinkingLevel = .off,
-    turn_count: usize = 0,
-
-    pub fn beginTurn(self: *AgentState) AgentError!void {
-        if (self.status == .streaming) return error.AlreadyStreaming;
-        self.status = .streaming;
-        self.turn_count += 1;
-    }
-
-    pub fn endTurn(self: *AgentState) AgentError!void {
-        if (self.status != .streaming) return error.NotStreaming;
-        self.status = .idle;
-    }
-};
-
-// Ported subset of packages/agent/test/agent.test.ts streaming guard cases.
-test "agent lifecycle guards streaming state" {
-    var state: AgentState = .{};
-
-    try state.beginTurn();
-    try std.testing.expectEqual(AgentStatus.streaming, state.status);
-    try std.testing.expectError(error.AlreadyStreaming, state.beginTurn());
-    try state.endTurn();
-    try std.testing.expectEqual(@as(usize, 1), state.turn_count);
-    try std.testing.expectError(error.NotStreaming, state.endTurn());
-}
+pub const AgentError = agent.AgentError;
 
 test {
     _ = @import("frontmatter.zig");
@@ -105,4 +74,5 @@ test {
     _ = @import("compaction.zig");
     _ = @import("harness.zig");
     _ = @import("agent_loop.zig");
+    _ = @import("agent.zig");
 }
