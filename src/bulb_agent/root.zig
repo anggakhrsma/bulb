@@ -15,6 +15,7 @@ pub const session = @import("session.zig");
 pub const session_repo = @import("session_repo.zig");
 pub const compaction = @import("compaction.zig");
 pub const harness = @import("harness.zig");
+pub const agent_loop = @import("agent_loop.zig");
 
 pub const PromptTemplate = types.PromptTemplate;
 pub const Skill = types.Skill;
@@ -29,6 +30,10 @@ pub const AgentHarnessOptions = harness.AgentHarnessOptions;
 pub const AgentHarnessStreamOptions = harness.AgentHarnessStreamOptions;
 pub const AgentHarnessStreamOptionsPatch = harness.AgentHarnessStreamOptionsPatch;
 pub const AgentTool = harness.AgentTool;
+pub const AgentLoopConfig = agent_loop.AgentLoopConfig;
+pub const AgentLoopTool = agent_loop.AgentLoopTool;
+pub const AgentLoopResult = agent_loop.AgentLoopResult;
+pub const AgentEvent = agent_loop.AgentEvent;
 pub const QueueMode = harness.QueueMode;
 
 pub const AgentStatus = enum {
@@ -99,4 +104,5 @@ test {
     _ = @import("session_repo.zig");
     _ = @import("compaction.zig");
     _ = @import("harness.zig");
+    _ = @import("agent_loop.zig");
 }
