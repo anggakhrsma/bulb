@@ -28,6 +28,8 @@ pub const default_model: ai.Model = .{
 
 pub const AgentError = error{
     AlreadyProcessing,
+    CannotContinueNoMessages,
+    CannotContinueFromAssistant,
 };
 
 pub const AgentInitialState = struct {
@@ -40,10 +42,44 @@ pub const AgentInitialState = struct {
 
 pub const AgentOptions = struct {
     initial_state: AgentInitialState = .{},
+    stream: ?agent_loop.StreamHandler = null,
+    stream_options: ai.StreamOptions = .{},
+    api_key: ?[]const u8 = null,
+    convert_to_llm: agent_loop.ConvertToLlmHandler = .{},
+    transform_context: ?agent_loop.TransformContextHandler = null,
+    get_api_key: ?agent_loop.GetApiKeyHandler = null,
+    before_tool_call: ?agent_loop.BeforeToolCallHandler = null,
+    after_tool_call: ?agent_loop.AfterToolCallHandler = null,
+    should_stop_after_turn: ?agent_loop.ShouldStopAfterTurnHandler = null,
+    prepare_next_turn: ?agent_loop.PrepareNextTurnHandler = null,
     steering_mode: QueueMode = .one_at_a_time,
     follow_up_mode: QueueMode = .one_at_a_time,
     session_id: ?[]const u8 = null,
     tool_execution: ToolExecutionMode = .parallel,
+};
+
+pub const AgentListener = struct {
+    ptr: ?*anyopaque = null,
+    call_fn: *const fn (?*anyopaque, AgentEvent, *ai.AbortSignal) anyerror!void = noopAgentListener,
+
+    pub fn call(self: AgentListener, event: AgentEvent, signal: *ai.AbortSignal) !void {
+        try self.call_fn(self.ptr, event, signal);
+    }
+};
+
+const AgentListenerRegistration = struct {
+    id: usize,
+    listener: AgentListener,
+    active: bool = true,
+};
+
+const RunPromptOptions = struct {
+    skip_initial_steering_poll: bool = false,
+};
+
+const QueueDrainContext = struct {
+    agent: *Agent,
+    skip_initial_steering_poll: bool = false,
 };
 
 pub const AgentState = struct {
@@ -229,6 +265,18 @@ pub const Agent = struct {
     state: AgentState,
     steering_queue: PendingMessageQueue,
     follow_up_queue: PendingMessageQueue,
+    listeners: []AgentListenerRegistration = &.{},
+    next_listener_id: usize = 1,
+    stream: ?agent_loop.StreamHandler = null,
+    stream_options: ai.StreamOptions = .{},
+    api_key: ?[]u8 = null,
+    convert_to_llm: agent_loop.ConvertToLlmHandler = .{},
+    transform_context: ?agent_loop.TransformContextHandler = null,
+    get_api_key: ?agent_loop.GetApiKeyHandler = null,
+    before_tool_call: ?agent_loop.BeforeToolCallHandler = null,
+    after_tool_call: ?agent_loop.AfterToolCallHandler = null,
+    should_stop_after_turn: ?agent_loop.ShouldStopAfterTurnHandler = null,
+    prepare_next_turn: ?agent_loop.PrepareNextTurnHandler = null,
     session_id: ?[]u8 = null,
     tool_execution: ToolExecutionMode = .parallel,
     active: bool = false,
@@ -240,6 +288,16 @@ pub const Agent = struct {
             .state = try AgentState.initAlloc(allocator, options.initial_state),
             .steering_queue = PendingMessageQueue.init(allocator, options.steering_mode),
             .follow_up_queue = PendingMessageQueue.init(allocator, options.follow_up_mode),
+            .stream = options.stream,
+            .stream_options = options.stream_options,
+            .api_key = if (options.api_key) |value| try allocator.dupe(u8, value) else null,
+            .convert_to_llm = options.convert_to_llm,
+            .transform_context = options.transform_context,
+            .get_api_key = options.get_api_key,
+            .before_tool_call = options.before_tool_call,
+            .after_tool_call = options.after_tool_call,
+            .should_stop_after_turn = options.should_stop_after_turn,
+            .prepare_next_turn = options.prepare_next_turn,
             .session_id = if (options.session_id) |value| try allocator.dupe(u8, value) else null,
             .tool_execution = options.tool_execution,
         };
@@ -251,6 +309,8 @@ pub const Agent = struct {
         self.state.deinit();
         self.steering_queue.deinit();
         self.follow_up_queue.deinit();
+        self.allocator.free(self.listeners);
+        if (self.api_key) |value| self.allocator.free(value);
         if (self.session_id) |value| self.allocator.free(value);
         self.* = undefined;
     }
@@ -258,6 +318,32 @@ pub const Agent = struct {
     pub fn setSessionId(self: *Agent, session_id: ?[]const u8) !void {
         if (self.session_id) |value| self.allocator.free(value);
         self.session_id = if (session_id) |value| try self.allocator.dupe(u8, value) else null;
+    }
+
+    pub fn setApiKey(self: *Agent, api_key: ?[]const u8) !void {
+        if (self.api_key) |value| self.allocator.free(value);
+        self.api_key = if (api_key) |value| try self.allocator.dupe(u8, value) else null;
+    }
+
+    pub fn subscribe(self: *Agent, listener: AgentListener) !usize {
+        const id = self.next_listener_id;
+        self.next_listener_id += 1;
+        const next = try self.allocator.realloc(self.listeners, self.listeners.len + 1);
+        self.listeners = next;
+        self.listeners[self.listeners.len - 1] = .{
+            .id = id,
+            .listener = listener,
+        };
+        return id;
+    }
+
+    pub fn unsubscribe(self: *Agent, id: usize) void {
+        for (self.listeners) |*registration| {
+            if (registration.id == id) {
+                registration.active = false;
+                return;
+            }
+        }
     }
 
     pub fn steeringMode(self: *const Agent) QueueMode {
@@ -305,6 +391,10 @@ pub const Agent = struct {
         return if (self.active) &self.abort_signal else null;
     }
 
+    pub fn waitForIdle(self: *const Agent) bool {
+        return !self.active;
+    }
+
     pub fn abort(self: *Agent) void {
         if (self.active) self.abort_signal.abort();
     }
@@ -331,6 +421,52 @@ pub const Agent = struct {
         self.clearAllQueues();
         self.active = false;
         self.abort_signal = .{};
+    }
+
+    pub fn promptTextAlloc(
+        self: *Agent,
+        text: []const u8,
+        images: []const ai.ImageContent,
+    ) !void {
+        const messages = try self.normalizePromptTextAlloc(self.allocator, text, images, ai.diagnostics.currentTimestampMs());
+        defer deinitOwnedMessages(self.allocator, messages);
+        try self.promptMessagesAlloc(messages);
+    }
+
+    pub fn promptMessageAlloc(self: *Agent, message: AgentMessage) !void {
+        const messages = [_]AgentMessage{message};
+        try self.promptMessagesAlloc(&messages);
+    }
+
+    pub fn promptMessagesAlloc(self: *Agent, messages: []const AgentMessage) !void {
+        if (self.active) return error.AlreadyProcessing;
+        try self.runPromptMessagesAlloc(messages, .{});
+    }
+
+    pub fn continueRunAlloc(self: *Agent) !void {
+        if (self.active) return error.AlreadyProcessing;
+        if (self.state.messages.len == 0) return error.CannotContinueNoMessages;
+
+        const last_message = self.state.messages[self.state.messages.len - 1];
+        if (last_message == .assistant) {
+            const queued_steering = try self.steering_queue.drainAlloc(self.allocator);
+            defer deinitOwnedMessages(self.allocator, queued_steering);
+            if (queued_steering.len > 0) {
+                try self.runPromptMessagesAlloc(queued_steering, .{ .skip_initial_steering_poll = true });
+                return;
+            }
+
+            const queued_follow_ups = try self.follow_up_queue.drainAlloc(self.allocator);
+            defer deinitOwnedMessages(self.allocator, queued_follow_ups);
+            if (queued_follow_ups.len > 0) {
+                try self.runPromptMessagesAlloc(queued_follow_ups, .{});
+                return;
+            }
+
+            return error.CannotContinueFromAssistant;
+        }
+
+        try self.runContinuationAlloc();
     }
 
     pub fn normalizePromptTextAlloc(
@@ -381,7 +517,159 @@ pub const Agent = struct {
             else => {},
         }
     }
+
+    fn runPromptMessagesAlloc(
+        self: *Agent,
+        messages: []const AgentMessage,
+        options: RunPromptOptions,
+    ) !void {
+        const signal_ref = try self.beginRun();
+        defer self.finishRun();
+
+        var queue_context: QueueDrainContext = .{
+            .agent = self,
+            .skip_initial_steering_poll = options.skip_initial_steering_poll,
+        };
+        const config = self.createLoopConfig(&queue_context);
+        var result = agent_loop.runAgentLoopAlloc(
+            self.allocator,
+            messages,
+            self.createContextSnapshot(),
+            config,
+            signal_ref,
+        ) catch |err| {
+            try self.handleRunFailure(err, signal_ref.isAborted(), messages);
+            return;
+        };
+        defer result.deinit();
+        try self.processEvents(result.events);
+    }
+
+    fn runContinuationAlloc(self: *Agent) !void {
+        const signal_ref = try self.beginRun();
+        defer self.finishRun();
+
+        var queue_context: QueueDrainContext = .{ .agent = self };
+        const config = self.createLoopConfig(&queue_context);
+        var result = agent_loop.runAgentLoopContinueAlloc(
+            self.allocator,
+            self.createContextSnapshot(),
+            config,
+            signal_ref,
+        ) catch |err| {
+            try self.handleRunFailure(err, signal_ref.isAborted(), &.{});
+            return;
+        };
+        defer result.deinit();
+        try self.processEvents(result.events);
+    }
+
+    fn createContextSnapshot(self: *Agent) agent_loop.AgentContext {
+        return .{
+            .system_prompt = self.state.system_prompt,
+            .messages = self.state.messages,
+            .tools = self.state.tools,
+        };
+    }
+
+    fn createLoopConfig(self: *Agent, queue_context: *QueueDrainContext) agent_loop.AgentLoopConfig {
+        var stream_options = self.stream_options;
+        stream_options.session_id = self.session_id;
+        return .{
+            .model = self.state.model,
+            .thinking_level = self.state.thinking_level,
+            .api_key = self.api_key,
+            .stream_options = stream_options,
+            .stream = self.stream,
+            .convert_to_llm = self.convert_to_llm,
+            .transform_context = self.transform_context,
+            .get_api_key = self.get_api_key,
+            .get_steering_messages = .{
+                .ptr = queue_context,
+                .call_fn = drainSteeringMessages,
+            },
+            .get_follow_up_messages = .{
+                .ptr = queue_context,
+                .call_fn = drainFollowUpMessages,
+            },
+            .before_tool_call = self.before_tool_call,
+            .after_tool_call = self.after_tool_call,
+            .should_stop_after_turn = self.should_stop_after_turn,
+            .prepare_next_turn = self.prepare_next_turn,
+            .tool_execution = self.tool_execution,
+        };
+    }
+
+    fn processEvents(self: *Agent, events: []const AgentEvent) !void {
+        for (events) |event| try self.processEventAndNotify(event);
+    }
+
+    fn processEventAndNotify(self: *Agent, event: AgentEvent) !void {
+        try self.processEvent(event);
+        const signal_ref = self.signal() orelse return error.AgentListenerOutsideActiveRun;
+        for (self.listeners) |registration| {
+            if (!registration.active) continue;
+            try registration.listener.call(event, signal_ref);
+        }
+    }
+
+    fn handleRunFailure(
+        self: *Agent,
+        err: anyerror,
+        aborted: bool,
+        initial_messages: []const AgentMessage,
+    ) !void {
+        try self.processEventAndNotify(.{ .agent_start = {} });
+        try self.processEventAndNotify(.{ .turn_start = {} });
+        for (initial_messages) |message| {
+            try self.processEventAndNotify(.{ .message_start = .{ .message = message } });
+            try self.processEventAndNotify(.{ .message_end = .{ .message = message } });
+        }
+
+        var failure = try self.failureMessageAlloc(err, aborted);
+        defer deinitAgentMessage(self.allocator, &failure);
+        try self.processEventAndNotify(.{ .message_start = .{ .message = failure } });
+        try self.processEventAndNotify(.{ .message_end = .{ .message = failure } });
+        try self.processEventAndNotify(.{ .turn_end = .{
+            .message = failure,
+            .tool_results = &.{},
+        } });
+        try self.processEventAndNotify(.{ .agent_end = .{ .messages = &.{failure} } });
+    }
+
+    fn failureMessageAlloc(self: *Agent, err: anyerror, aborted: bool) !AgentMessage {
+        const content = try self.allocator.alloc(ai.AssistantContent, 1);
+        errdefer self.allocator.free(content);
+        content[0] = .{ .text = .{ .text = try self.allocator.dupe(u8, "") } };
+        errdefer deinitAssistantContentSlice(self.allocator, content);
+
+        return .{ .assistant = .{
+            .content = content,
+            .api = try self.allocator.dupe(u8, self.state.model.api),
+            .provider = try self.allocator.dupe(u8, self.state.model.provider),
+            .model = try self.allocator.dupe(u8, self.state.model.id),
+            .stop_reason = if (aborted) .aborted else .@"error",
+            .error_message = try self.allocator.dupe(u8, @errorName(err)),
+            .timestamp_ms = ai.diagnostics.currentTimestampMs(),
+        } };
+    }
 };
+
+fn noopAgentListener(_: ?*anyopaque, _: AgentEvent, _: *ai.AbortSignal) !void {}
+
+fn drainSteeringMessages(ptr: ?*anyopaque, allocator: std.mem.Allocator) ![]const AgentMessage {
+    const context: *QueueDrainContext = @ptrCast(@alignCast(ptr.?));
+    if (context.skip_initial_steering_poll) {
+        context.skip_initial_steering_poll = false;
+        return &.{};
+    }
+    return try context.agent.steering_queue.drainAlloc(allocator);
+}
+
+fn drainFollowUpMessages(ptr: ?*anyopaque, allocator: std.mem.Allocator) ![]const AgentMessage {
+    const context: *QueueDrainContext = @ptrCast(@alignCast(ptr.?));
+    return try context.agent.follow_up_queue.drainAlloc(allocator);
+}
 
 fn appendOwnedMessage(
     allocator: std.mem.Allocator,
@@ -748,6 +1036,89 @@ fn testTool(name: []const u8) AgentLoopTool {
     };
 }
 
+const TestStreamContext = struct {
+    response_count: usize = 0,
+    received_session_id: ?[]const u8 = null,
+    received_signal: ?*ai.AbortSignal = null,
+};
+
+fn testOkStream(
+    ptr: ?*anyopaque,
+    allocator: std.mem.Allocator,
+    model: ai.Model,
+    _: ai.Context,
+    options: ai.StreamOptions,
+) !ai.StreamResult {
+    const context: *TestStreamContext = @ptrCast(@alignCast(ptr.?));
+    context.response_count += 1;
+    context.received_session_id = options.session_id;
+    context.received_signal = options.signal;
+
+    const content = try allocator.alloc(ai.AssistantContent, 1);
+    content[0] = .{ .text = .{
+        .text = try std.fmt.allocPrint(allocator, "Processed {d}", .{context.response_count}),
+    } };
+
+    var result: ai.StreamResult = .{
+        .allocator = allocator,
+        .message = .{
+            .content = content,
+            .api = model.api,
+            .provider = model.provider,
+            .model = model.id,
+            .stop_reason = .stop,
+            .timestamp_ms = @intCast(context.response_count),
+        },
+    };
+    errdefer result.deinit();
+    try result.events.append(allocator, .{ .start = {} });
+    try result.events.append(allocator, .{ .done = .stop });
+    return result;
+}
+
+fn testThrowingStream(
+    _: ?*anyopaque,
+    _: std.mem.Allocator,
+    _: ai.Model,
+    _: ai.Context,
+    _: ai.StreamOptions,
+) !ai.StreamResult {
+    return error.ProviderExploded;
+}
+
+const ListenerCapture = struct {
+    agent: *Agent,
+    tags: std.ArrayList(std.meta.Tag(AgentEvent)) = .empty,
+    saw_agent_end_while_active: bool = false,
+    saw_agent_start_unaborted: bool = false,
+
+    fn deinit(self: *ListenerCapture, allocator: std.mem.Allocator) void {
+        self.tags.deinit(allocator);
+    }
+};
+
+fn captureListener(ptr: ?*anyopaque, event: AgentEvent, signal: *ai.AbortSignal) !void {
+    const capture: *ListenerCapture = @ptrCast(@alignCast(ptr.?));
+    const tag = std.meta.activeTag(event);
+    try capture.tags.append(std.testing.allocator, tag);
+    if (tag == .agent_start) {
+        capture.saw_agent_start_unaborted = !signal.isAborted();
+    }
+    if (tag == .agent_end) {
+        capture.saw_agent_end_while_active = capture.agent.active and capture.agent.state.is_streaming;
+    }
+}
+
+fn hasUserText(messages: []const AgentMessage, text: []const u8) bool {
+    for (messages) |message| {
+        if (message != .user) continue;
+        for (message.user.content) |content| {
+            if (content == .text and std.mem.eql(u8, content.text.text, text)) return true;
+        }
+    }
+    return false;
+}
+
 // Ported from packages/agent/test/agent.test.ts default construction.
 test "agent creates default state" {
     var agent = try Agent.initAlloc(std.testing.allocator, .{});
@@ -960,4 +1331,186 @@ test "agent normalizes text prompt input with images" {
     try std.testing.expectEqual(@as(usize, 2), messages[0].user.content.len);
     try std.testing.expectEqualStrings("hello", messages[0].user.content[0].text.text);
     try std.testing.expectEqualStrings("image/png", messages[0].user.content[1].image.mime_type);
+}
+
+// Ported from packages/agent/test/agent.test.ts subscribe and prompt lifecycle coverage.
+test "agent prompt replays lifecycle events to subscribers before becoming idle" {
+    var stream_context: TestStreamContext = .{};
+    var agent = try Agent.initAlloc(std.testing.allocator, .{
+        .stream = .{ .ptr = &stream_context, .call_fn = testOkStream },
+    });
+    defer agent.deinit();
+
+    var capture: ListenerCapture = .{ .agent = &agent };
+    defer capture.deinit(std.testing.allocator);
+    const listener_id = try agent.subscribe(.{ .ptr = &capture, .call_fn = captureListener });
+
+    try agent.promptTextAlloc("hello", &.{});
+
+    const expected = [_]std.meta.Tag(AgentEvent){
+        .agent_start,
+        .turn_start,
+        .message_start,
+        .message_end,
+        .message_start,
+        .message_end,
+        .turn_end,
+        .agent_end,
+    };
+    try std.testing.expectEqualSlices(std.meta.Tag(AgentEvent), &expected, capture.tags.items);
+    try std.testing.expect(capture.saw_agent_start_unaborted);
+    try std.testing.expect(capture.saw_agent_end_while_active);
+    try std.testing.expect(agent.waitForIdle());
+    try std.testing.expect(!agent.state.is_streaming);
+    try std.testing.expect(agent.state.streaming_message == null);
+    try std.testing.expectEqual(@as(usize, 2), agent.state.messages.len);
+    try std.testing.expect(agent.state.messages[0] == .user);
+    try std.testing.expect(agent.state.messages[1] == .assistant);
+
+    agent.unsubscribe(listener_id);
+    try agent.promptTextAlloc("again", &.{});
+    try std.testing.expectEqual(@as(usize, expected.len), capture.tags.items.len);
+}
+
+// Ported from packages/agent/test/agent.test.ts thrown run failure lifecycle.
+test "agent emits full lifecycle events for thrown run failures" {
+    var agent = try Agent.initAlloc(std.testing.allocator, .{
+        .stream = .{ .call_fn = testThrowingStream },
+    });
+    defer agent.deinit();
+
+    var capture: ListenerCapture = .{ .agent = &agent };
+    defer capture.deinit(std.testing.allocator);
+    _ = try agent.subscribe(.{ .ptr = &capture, .call_fn = captureListener });
+
+    try agent.promptTextAlloc("hello", &.{});
+
+    const expected = [_]std.meta.Tag(AgentEvent){
+        .agent_start,
+        .turn_start,
+        .message_start,
+        .message_end,
+        .message_start,
+        .message_end,
+        .turn_end,
+        .agent_end,
+    };
+    try std.testing.expectEqualSlices(std.meta.Tag(AgentEvent), &expected, capture.tags.items);
+    try std.testing.expectEqual(@as(usize, 2), agent.state.messages.len);
+    const last_message = agent.state.messages[agent.state.messages.len - 1];
+    try std.testing.expect(last_message == .assistant);
+    try std.testing.expectEqual(ai.StopReason.@"error", last_message.assistant.stop_reason);
+    try std.testing.expectEqualStrings("ProviderExploded", last_message.assistant.error_message.?);
+    try std.testing.expectEqualStrings("ProviderExploded", agent.state.error_message.?);
+    try std.testing.expect(agent.waitForIdle());
+}
+
+// Ported from packages/agent/test/agent.test.ts active run guards.
+test "agent rejects nested prompts while a run is active" {
+    const NestedPromptCapture = struct {
+        agent: *Agent,
+        rejected: bool = false,
+
+        fn listener(ptr: ?*anyopaque, event: AgentEvent, _: *ai.AbortSignal) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            if (event != .agent_start) return;
+            self.agent.promptTextAlloc("nested", &.{}) catch |err| {
+                if (err == error.AlreadyProcessing) {
+                    self.rejected = true;
+                    return;
+                }
+                return err;
+            };
+            return error.ExpectedAlreadyProcessing;
+        }
+    };
+
+    var stream_context: TestStreamContext = .{};
+    var agent = try Agent.initAlloc(std.testing.allocator, .{
+        .stream = .{ .ptr = &stream_context, .call_fn = testOkStream },
+    });
+    defer agent.deinit();
+
+    var capture: NestedPromptCapture = .{ .agent = &agent };
+    _ = try agent.subscribe(.{ .ptr = &capture, .call_fn = NestedPromptCapture.listener });
+
+    try agent.promptTextAlloc("hello", &.{});
+    try std.testing.expect(capture.rejected);
+}
+
+// Ported from packages/agent/test/agent.test.ts sessionId forwarding.
+test "agent forwards session id to stream options and supports setter" {
+    var stream_context: TestStreamContext = .{};
+    var agent = try Agent.initAlloc(std.testing.allocator, .{
+        .stream = .{ .ptr = &stream_context, .call_fn = testOkStream },
+        .session_id = "session-abc",
+    });
+    defer agent.deinit();
+
+    try agent.promptTextAlloc("hello", &.{});
+    try std.testing.expect(stream_context.received_signal != null);
+    try std.testing.expectEqualStrings("session-abc", stream_context.received_session_id.?);
+
+    try agent.setSessionId("session-def");
+    try agent.promptTextAlloc("hello again", &.{});
+    try std.testing.expectEqualStrings("session-def", stream_context.received_session_id.?);
+}
+
+// Ported from packages/agent/test/agent.test.ts assistant-tail follow-up continuation.
+test "agent continueRun processes queued follow-up messages after assistant tail" {
+    var stream_context: TestStreamContext = .{};
+    var agent = try Agent.initAlloc(std.testing.allocator, .{
+        .stream = .{ .ptr = &stream_context, .call_fn = testOkStream },
+    });
+    defer agent.deinit();
+
+    var initial_user = try testUserMessageAlloc(std.testing.allocator, "Initial", 1);
+    defer deinitAgentMessage(std.testing.allocator, &initial_user);
+    var initial_assistant = try testAssistantMessageAlloc(std.testing.allocator, "Initial response", .stop, null);
+    defer deinitAgentMessage(std.testing.allocator, &initial_assistant);
+    try agent.state.setMessagesAlloc(&.{ initial_user, initial_assistant });
+
+    var follow_up = try testUserMessageAlloc(std.testing.allocator, "Queued follow-up", 2);
+    defer deinitAgentMessage(std.testing.allocator, &follow_up);
+    try agent.followUp(follow_up);
+
+    try agent.continueRunAlloc();
+
+    try std.testing.expect(hasUserText(agent.state.messages, "Queued follow-up"));
+    try std.testing.expect(agent.state.messages[agent.state.messages.len - 1] == .assistant);
+    try std.testing.expectEqual(@as(usize, 1), stream_context.response_count);
+}
+
+// Ported from packages/agent/test/agent.test.ts assistant-tail one-at-a-time steering semantics.
+test "agent continueRun keeps one-at-a-time steering semantics from assistant tail" {
+    var stream_context: TestStreamContext = .{};
+    var agent = try Agent.initAlloc(std.testing.allocator, .{
+        .stream = .{ .ptr = &stream_context, .call_fn = testOkStream },
+    });
+    defer agent.deinit();
+
+    var initial_user = try testUserMessageAlloc(std.testing.allocator, "Initial", 1);
+    defer deinitAgentMessage(std.testing.allocator, &initial_user);
+    var initial_assistant = try testAssistantMessageAlloc(std.testing.allocator, "Initial response", .stop, null);
+    defer deinitAgentMessage(std.testing.allocator, &initial_assistant);
+    try agent.state.setMessagesAlloc(&.{ initial_user, initial_assistant });
+
+    var steering_one = try testUserMessageAlloc(std.testing.allocator, "Steering 1", 2);
+    defer deinitAgentMessage(std.testing.allocator, &steering_one);
+    var steering_two = try testUserMessageAlloc(std.testing.allocator, "Steering 2", 3);
+    defer deinitAgentMessage(std.testing.allocator, &steering_two);
+    try agent.steer(steering_one);
+    try agent.steer(steering_two);
+
+    try agent.continueRunAlloc();
+
+    try std.testing.expectEqual(@as(usize, 2), stream_context.response_count);
+    try std.testing.expectEqual(@as(usize, 6), agent.state.messages.len);
+    const recent = agent.state.messages[2..];
+    try std.testing.expect(recent[0] == .user);
+    try std.testing.expect(recent[1] == .assistant);
+    try std.testing.expect(recent[2] == .user);
+    try std.testing.expect(recent[3] == .assistant);
+    try std.testing.expect(hasUserText(recent, "Steering 1"));
+    try std.testing.expect(hasUserText(recent, "Steering 2"));
 }

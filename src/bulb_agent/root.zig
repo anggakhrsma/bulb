@@ -40,6 +40,7 @@ pub const Agent = agent.Agent;
 pub const AgentOptions = agent.AgentOptions;
 pub const AgentState = agent.AgentState;
 pub const AgentInitialState = agent.AgentInitialState;
+pub const AgentListener = agent.AgentListener;
 pub const PendingMessageQueue = agent.PendingMessageQueue;
 
 pub const AgentEventTag = enum {
