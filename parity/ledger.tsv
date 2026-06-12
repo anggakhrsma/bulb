@@ -42,9 +42,9 @@ packages/agent/package.json	bulb_agent	source	pending
 packages/agent/src/agent-loop.ts	bulb_agent	source	pending		
 packages/agent/src/agent.ts	bulb_agent	source	in_progress	src/bulb_agent/root.zig	Initial streaming lifecycle state
 packages/agent/src/harness/agent-harness.ts	bulb_agent	source	pending		
-packages/agent/src/harness/compaction/branch-summarization.ts	bulb_agent	source	pending		
-packages/agent/src/harness/compaction/compaction.ts	bulb_agent	source	pending		
-packages/agent/src/harness/compaction/utils.ts	bulb_agent	source	pending		
+packages/agent/src/harness/compaction/branch-summarization.ts	bulb_agent	source	implemented	src/bulb_agent/compaction.zig	Native branch-summary entry collection, common-ancestor detection, branch preparation, summary prompt construction, file-operation carry-forward, token-budget pruning, and generated summary result assembly ported
+packages/agent/src/harness/compaction/compaction.ts	bulb_agent	source	implemented	src/bulb_agent/compaction.zig	Native context-token accounting, last assistant usage filtering, cut-point and split-turn selection, compaction preparation, summarization request construction, reasoning/max-token handling, compact result assembly, and details JSON ported
+packages/agent/src/harness/compaction/utils.ts	bulb_agent	source	implemented	src/bulb_agent/compaction.zig	Native file-operation extraction, read-only/modified list computation, file metadata formatting, conversation serialization, and long tool-result truncation ported
 packages/agent/src/harness/env/nodejs.ts	bulb_agent	source	implemented	src/bulb_agent/node_env.zig	Native LocalExecutionEnv ports path resolution, shell exec, file IO, directory listing, canonical paths, temp files, cleanup, error mapping, timeout/callback handling, and shell-output capture integration
 packages/agent/src/harness/messages.ts	bulb_agent	source	implemented	src/bulb_agent/messages.zig	Bash execution, custom messages, branch summaries, compaction summaries, ISO timestamp factories, and convertToLlm transformer ported with owned generated text/content and borrowed pass-through AI messages
 packages/agent/src/harness/prompt-templates.ts	bulb_agent	source	implemented	src/bulb_agent/prompt_templates.zig	Native direct-filesystem prompt template loading, sourced provenance wrappers, frontmatter diagnostics, shell-style argument parsing, placeholder substitution, and invocation formatting ported
@@ -69,7 +69,7 @@ packages/agent/test/agent.test.ts	bulb_agent	test	in_progress	src/bulb_agent/roo
 packages/agent/test/e2e.test.ts	bulb_agent	test	pending		
 packages/agent/test/harness/agent-harness-stream.test.ts	bulb_agent	test	pending		
 packages/agent/test/harness/agent-harness.test.ts	bulb_agent	test	pending		
-packages/agent/test/harness/compaction.test.ts	bulb_agent	test	pending		
+packages/agent/test/harness/compaction.test.ts	bulb_agent	test	implemented	src/bulb_agent/compaction.zig	No-credential compaction tests port token accounting, threshold checks, cut points, repeated compaction preparation, split-turn/file-operation details, serialization truncation, summary request options, compact result details, and branch-summary preparation
 packages/agent/test/harness/nodejs-env.test.ts	bulb_agent	test	implemented	src/bulb_agent/node_env.zig	Pi no-credential filesystem, symlink, text-line, temp-file, recursive remove, pre-abort, exec cwd/env, stream callback, non-zero exit, timeout, callback-error, shell-unavailable/spawn-error, and large shell capture cases ported to native Zig
 packages/agent/test/harness/prompt-templates.test.ts	bulb_agent	test	implemented	src/bulb_agent/prompt_templates.zig	Upstream non-recursive loading, sourced provenance, diagnostic provenance, explicit file/symlink loading, and argument substitution regressions ported
 packages/agent/test/harness/repo.test.ts	bulb_agent	test	implemented	src/bulb_agent/session_repo.zig	Upstream in-memory and JSONL repo create/open/list/delete/fork coverage ported, including encoded cwd directories and default parentSession path behavior

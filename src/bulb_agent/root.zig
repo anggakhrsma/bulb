@@ -13,6 +13,7 @@ pub const node_env = @import("node_env.zig");
 pub const session_storage = @import("session_storage.zig");
 pub const session = @import("session.zig");
 pub const session_repo = @import("session_repo.zig");
+pub const compaction = @import("compaction.zig");
 
 pub const PromptTemplate = types.PromptTemplate;
 pub const Skill = types.Skill;
@@ -21,6 +22,7 @@ pub const InMemorySessionStorage = session_storage.InMemorySessionStorage;
 pub const JsonlSessionStorage = session_storage.JsonlSessionStorage;
 pub const InMemorySessionRepo = session_repo.InMemorySessionRepo;
 pub const JsonlSessionRepo = session_repo.JsonlSessionRepo;
+pub const CompactionSettings = compaction.CompactionSettings;
 
 pub const AgentStatus = enum {
     idle,
@@ -88,4 +90,5 @@ test {
     _ = @import("session_storage.zig");
     _ = @import("session.zig");
     _ = @import("session_repo.zig");
+    _ = @import("compaction.zig");
 }
