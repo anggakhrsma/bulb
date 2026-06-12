@@ -14,6 +14,7 @@ pub const session_storage = @import("session_storage.zig");
 pub const session = @import("session.zig");
 pub const session_repo = @import("session_repo.zig");
 pub const compaction = @import("compaction.zig");
+pub const harness = @import("harness.zig");
 
 pub const PromptTemplate = types.PromptTemplate;
 pub const Skill = types.Skill;
@@ -23,6 +24,12 @@ pub const JsonlSessionStorage = session_storage.JsonlSessionStorage;
 pub const InMemorySessionRepo = session_repo.InMemorySessionRepo;
 pub const JsonlSessionRepo = session_repo.JsonlSessionRepo;
 pub const CompactionSettings = compaction.CompactionSettings;
+pub const AgentHarness = harness.AgentHarness;
+pub const AgentHarnessOptions = harness.AgentHarnessOptions;
+pub const AgentHarnessStreamOptions = harness.AgentHarnessStreamOptions;
+pub const AgentHarnessStreamOptionsPatch = harness.AgentHarnessStreamOptionsPatch;
+pub const AgentTool = harness.AgentTool;
+pub const QueueMode = harness.QueueMode;
 
 pub const AgentStatus = enum {
     idle,
@@ -91,4 +98,5 @@ test {
     _ = @import("session.zig");
     _ = @import("session_repo.zig");
     _ = @import("compaction.zig");
+    _ = @import("harness.zig");
 }
