@@ -785,10 +785,31 @@ fn prepareToolCall(
         .is_error = true,
     } };
 
+    return prepareKnownToolCall(state, assistant_message, tool_call, tool) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => .{ .immediate = .{
+            .result = try createErrorToolResultAlloc(a, @errorName(err)),
+            .is_error = true,
+        } },
+    };
+}
+
+fn prepareKnownToolCall(
+    state: *LoopState,
+    assistant_message: ai.AssistantMessage,
+    tool_call: ai.ToolCall,
+    tool: AgentLoopTool,
+) !ToolPreparation {
+    const a = state.allocator;
     var arguments_json = tool_call.arguments_json;
     if (tool.prepare_arguments) |handler| {
         arguments_json = try handler.call(a, arguments_json);
     }
+
+    const prepared_tool_call = try cloneToolCallWithArgsAlloc(a, tool_call, arguments_json);
+    var validated_arguments = try ai.validation.validateToolArguments(a, tool.asAiTool(), prepared_tool_call);
+    defer validated_arguments.deinit();
+    arguments_json = try std.json.Stringify.valueAlloc(a, validated_arguments.value, .{});
 
     if (state.config.before_tool_call) |handler| {
         const result = try handler.call(.{
@@ -1437,6 +1458,44 @@ fn toolThenTextStream(
     return try doneStreamResult(allocator, try assistantTextAlloc(allocator, model, "done", .stop));
 }
 
+fn numberStringToolThenTextStream(
+    ptr: ?*anyopaque,
+    allocator: std.mem.Allocator,
+    model: ai.Model,
+    context: ai.Context,
+    _: ai.StreamOptions,
+) !ai.StreamResult {
+    _ = context;
+    const state: *ToolStreamState = @ptrCast(@alignCast(ptr.?));
+    defer state.call_count += 1;
+    if (state.call_count == 0) {
+        return try doneStreamResult(
+            allocator,
+            try assistantToolAlloc(allocator, model, "tool-1", "echo", "{\"value\":\"42\"}"),
+        );
+    }
+    return try doneStreamResult(allocator, try assistantTextAlloc(allocator, model, "done", .stop));
+}
+
+fn invalidBooleanToolThenTextStream(
+    ptr: ?*anyopaque,
+    allocator: std.mem.Allocator,
+    model: ai.Model,
+    context: ai.Context,
+    _: ai.StreamOptions,
+) !ai.StreamResult {
+    _ = context;
+    const state: *ToolStreamState = @ptrCast(@alignCast(ptr.?));
+    defer state.call_count += 1;
+    if (state.call_count == 0) {
+        return try doneStreamResult(
+            allocator,
+            try assistantToolAlloc(allocator, model, "tool-1", "echo", "{\"value\":\"1\"}"),
+        );
+    }
+    return try doneStreamResult(allocator, try assistantTextAlloc(allocator, model, "done", .stop));
+}
+
 const EchoToolState = struct {
     executed: std.ArrayList([]const u8) = .empty,
 };
@@ -1873,6 +1932,20 @@ fn rewriteEchoArguments(
     return .{ .arguments_json = "{\"value\":\"rewritten\"}" };
 }
 
+const ValidationHookState = struct {
+    arguments_json: ?[]const u8 = null,
+};
+
+fn captureValidatedNumberThenRewrite(
+    ptr: ?*anyopaque,
+    context: BeforeToolCallContext,
+    _: ?*ai.AbortSignal,
+) !BeforeToolCallResult {
+    const state: *ValidationHookState = @ptrCast(@alignCast(ptr.?));
+    state.arguments_json = context.arguments_json;
+    return .{ .arguments_json = "{\"value\":\"not-a-number\"}" };
+}
+
 const CaptureArgumentsState = struct {
     arguments_json: ?[]const u8 = null,
 };
@@ -2180,6 +2253,69 @@ test "agent loop prepares tool arguments before execution" {
     try std.testing.expect(std.mem.indexOf(u8, capture_state.arguments_json.?, "\"edits\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, capture_state.arguments_json.?, "\"oldText\":\"before\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, capture_state.arguments_json.?, "\"newText\":\"after\"") != null);
+}
+
+test "agent loop validates tool arguments before beforeToolCall without revalidating hook rewrites" {
+    const allocator = std.testing.allocator;
+    const prompt_content = [_]ai.UserContent{.{ .text = .{ .text = "echo something" } }};
+    const prompt = userMessage(&prompt_content);
+
+    var stream_state: ToolStreamState = .{};
+    var hook_state: ValidationHookState = .{};
+    var capture_state: CaptureArgumentsState = .{};
+    const tools = [_]AgentLoopTool{.{
+        .name = "echo",
+        .parameters_json = "{\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"number\"}},\"required\":[\"value\"]}",
+        .execute = .{ .ptr = &capture_state, .call_fn = captureArgumentsToolExecute },
+    }};
+    const config: AgentLoopConfig = .{
+        .model = createModel(),
+        .stream = .{ .ptr = &stream_state, .call_fn = numberStringToolThenTextStream },
+        .before_tool_call = .{ .ptr = &hook_state, .call_fn = captureValidatedNumberThenRewrite },
+    };
+
+    var result = try runAgentLoopAlloc(allocator, &.{prompt}, .{ .tools = &tools }, config, null);
+    defer result.deinit();
+
+    try std.testing.expect(hook_state.arguments_json != null);
+    try std.testing.expectEqualStrings("{\"value\":42}", hook_state.arguments_json.?);
+    try std.testing.expect(capture_state.arguments_json != null);
+    try std.testing.expectEqualStrings("{\"value\":\"not-a-number\"}", capture_state.arguments_json.?);
+    try std.testing.expectEqual(@as(usize, 4), result.messages.len);
+    try std.testing.expect(result.messages[2] == .tool_result);
+    try std.testing.expect(!result.messages[2].tool_result.is_error);
+}
+
+test "agent loop emits an error tool result when validated arguments fail schema" {
+    const allocator = std.testing.allocator;
+    const prompt_content = [_]ai.UserContent{.{ .text = .{ .text = "echo something" } }};
+    const prompt = userMessage(&prompt_content);
+
+    var stream_state: ToolStreamState = .{};
+    var tool_state: EchoToolState = .{};
+    defer tool_state.executed.deinit(std.testing.allocator);
+    const tools = [_]AgentLoopTool{.{
+        .name = "echo",
+        .parameters_json = "{\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"boolean\"}},\"required\":[\"value\"]}",
+        .execute = .{ .ptr = &tool_state, .call_fn = echoToolExecute },
+    }};
+    const config: AgentLoopConfig = .{
+        .model = createModel(),
+        .stream = .{ .ptr = &stream_state, .call_fn = invalidBooleanToolThenTextStream },
+    };
+
+    var result = try runAgentLoopAlloc(allocator, &.{prompt}, .{ .tools = &tools }, config, null);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), tool_state.executed.items.len);
+    try std.testing.expectEqual(@as(usize, 2), stream_state.call_count);
+    try std.testing.expectEqual(@as(usize, 4), result.messages.len);
+    try std.testing.expect(result.messages[2] == .tool_result);
+    const tool_result = result.messages[2].tool_result;
+    try std.testing.expect(tool_result.is_error);
+    try std.testing.expectEqual(@as(usize, 1), tool_result.content.len);
+    try std.testing.expect(tool_result.content[0] == .text);
+    try std.testing.expect(std.mem.indexOf(u8, tool_result.content[0].text.text, "ValidationFailed") != null);
 }
 
 test "agent loop emits tool_execution_end in completion order while keeping tool results in source order" {
