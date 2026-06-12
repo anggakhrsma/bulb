@@ -1472,6 +1472,26 @@ const StopState = struct {
     callback_tool_results: usize = 0,
 };
 
+const BatchQueueState = struct {
+    tool_state: *EchoToolState,
+    queued_delivered: bool = false,
+    polls: usize = 0,
+};
+
+fn queuedAfterToolStarts(ptr: ?*anyopaque, allocator: std.mem.Allocator) ![]const AgentMessage {
+    const state: *BatchQueueState = @ptrCast(@alignCast(ptr.?));
+    state.polls += 1;
+    if (state.tool_state.executed.items.len >= 1 and !state.queued_delivered) {
+        state.queued_delivered = true;
+        const content = try allocator.alloc(ai.UserContent, 1);
+        content[0] = .{ .text = .{ .text = "interrupt" } };
+        const output = try allocator.alloc(AgentMessage, 1);
+        output[0] = userMessage(content);
+        return output;
+    }
+    return &.{};
+}
+
 fn countSteeringPolls(ptr: ?*anyopaque, _: std.mem.Allocator) ![]const AgentMessage {
     const state: *StopState = @ptrCast(@alignCast(ptr.?));
     state.steering_polls += 1;
@@ -1964,13 +1984,14 @@ fn assistantToolBatchAlloc(
 
 const MultiToolStreamState = struct {
     call_count: usize = 0,
+    saw_interrupt_in_second_context: bool = false,
 };
 
 fn echoTwoToolCallStream(
     ptr: ?*anyopaque,
     allocator: std.mem.Allocator,
     model: ai.Model,
-    _: ai.Context,
+    context: ai.Context,
     _: ai.StreamOptions,
 ) !ai.StreamResult {
     const state: *MultiToolStreamState = @ptrCast(@alignCast(ptr.?));
@@ -1980,6 +2001,13 @@ fn echoTwoToolCallStream(
             .{ .id = "tool-1", .name = "echo", .arguments_json = "{\"value\":\"first\"}" },
             .{ .id = "tool-2", .name = "echo", .arguments_json = "{\"value\":\"second\"}" },
         }));
+    }
+    for (context.messages) |message| {
+        if (message == .user and message.user.content.len > 0 and message.user.content[0] == .text and
+            std.mem.eql(u8, message.user.content[0].text.text, "interrupt"))
+        {
+            state.saw_interrupt_in_second_context = true;
+        }
     }
     return try doneStreamResult(allocator, try assistantTextAlloc(allocator, model, "done", .stop));
 }
@@ -2160,6 +2188,67 @@ test "agent loop emits tool_execution_end in completion order while keeping tool
     try std.testing.expectEqualStrings("tool-1", end_ids.items[1]);
     try std.testing.expectEqualStrings("tool-1", result_ids.items[0]);
     try std.testing.expectEqualStrings("tool-2", result_ids.items[1]);
+}
+
+test "agent loop injects queued steering only after a tool batch completes" {
+    const allocator = std.testing.allocator;
+    const prompt_content = [_]ai.UserContent{.{ .text = .{ .text = "start" } }};
+    const prompt = userMessage(&prompt_content);
+    const prompts = [_]AgentMessage{prompt};
+
+    var tool_state: EchoToolState = .{};
+    defer tool_state.executed.deinit(std.testing.allocator);
+    var queue_state: BatchQueueState = .{ .tool_state = &tool_state };
+    var stream_state: MultiToolStreamState = .{};
+    const tools = [_]AgentLoopTool{.{
+        .name = "echo",
+        .execute = .{ .ptr = &tool_state, .call_fn = echoToolExecute },
+    }};
+    const config: AgentLoopConfig = .{
+        .model = createModel(),
+        .stream = .{ .ptr = &stream_state, .call_fn = echoTwoToolCallStream },
+        .get_steering_messages = .{ .ptr = &queue_state, .call_fn = queuedAfterToolStarts },
+        .tool_execution = .sequential,
+    };
+
+    var result = try runAgentLoopAlloc(allocator, &prompts, .{ .tools = &tools }, config, null);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), tool_state.executed.items.len);
+    try std.testing.expectEqualStrings("first", tool_state.executed.items[0]);
+    try std.testing.expectEqualStrings("second", tool_state.executed.items[1]);
+    try std.testing.expect(queue_state.queued_delivered);
+    try std.testing.expect(queue_state.polls >= 2);
+    try std.testing.expect(stream_state.saw_interrupt_in_second_context);
+    try std.testing.expectEqual(@as(usize, 6), result.messages.len);
+
+    const missing = std.math.maxInt(usize);
+    var tool_1_index: usize = missing;
+    var tool_2_index: usize = missing;
+    var interrupt_index: usize = missing;
+    for (result.events, 0..) |event, index| {
+        if (event != .message_start) continue;
+        switch (event.message_start.message) {
+            .tool_result => |tool_result| {
+                if (std.mem.eql(u8, tool_result.tool_call_id, "tool-1")) tool_1_index = index;
+                if (std.mem.eql(u8, tool_result.tool_call_id, "tool-2")) tool_2_index = index;
+            },
+            .user => |user| {
+                if (user.content.len > 0 and user.content[0] == .text and
+                    std.mem.eql(u8, user.content[0].text.text, "interrupt"))
+                {
+                    interrupt_index = index;
+                }
+            },
+            else => {},
+        }
+    }
+
+    try std.testing.expect(tool_1_index != missing);
+    try std.testing.expect(tool_2_index != missing);
+    try std.testing.expect(interrupt_index != missing);
+    try std.testing.expect(tool_1_index < interrupt_index);
+    try std.testing.expect(tool_2_index < interrupt_index);
 }
 
 test "agent loop forces sequential execution when a tool is marked sequential" {
