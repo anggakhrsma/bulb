@@ -2,6 +2,7 @@ const std = @import("std");
 const ai = @import("bulb_ai");
 
 const agent_loop = @import("agent_loop.zig");
+const agent_messages = @import("messages.zig");
 const harness = @import("harness.zig");
 const types = @import("types.zig");
 
@@ -1042,6 +1043,49 @@ const TestStreamContext = struct {
     received_signal: ?*ai.AbortSignal = null,
 };
 
+const StreamOptionsCapture = struct {
+    resolver_calls: usize = 0,
+    resolved_api_key: ?[]const u8 = null,
+    resolver_provider: ?[]const u8 = null,
+    api_key: ?[]const u8 = null,
+    temperature: ?f64 = null,
+    max_tokens: ?u64 = null,
+    cache_retention: ai.CacheRetention = .short,
+    metadata_json: ?[]const u8 = null,
+    header_count: usize = 0,
+    context_message_count: usize = 0,
+    system_prompt: ?[]const u8 = null,
+    signal_seen: bool = false,
+};
+
+const TransformConvertCapture = struct {
+    transform_source_len: usize = 0,
+    transform_output_len: usize = 0,
+    converted_len: usize = 0,
+    stream_message_len: usize = 0,
+    transform_signal_seen: bool = false,
+    convert_signal_seen: bool = false,
+    stream_signal_seen: bool = false,
+};
+
+const ToolHookCapture = struct {
+    stream_calls: usize = 0,
+    before_context_len: usize = 0,
+    after_context_len: usize = 0,
+    before_signal_seen: bool = false,
+    after_signal_seen: bool = false,
+    execute_signal_seen: bool = false,
+    after_is_error: bool = true,
+    executed_arguments_json: ?[]u8 = null,
+
+    fn deinit(self: *ToolHookCapture, allocator: std.mem.Allocator) void {
+        if (self.executed_arguments_json) |value| allocator.free(value);
+        self.* = undefined;
+    }
+};
+
+const after_tool_content = [_]ai.UserContent{.{ .text = .{ .text = "after hook" } }};
+
 fn testOkStream(
     ptr: ?*anyopaque,
     allocator: std.mem.Allocator,
@@ -1084,6 +1128,182 @@ fn testThrowingStream(
     _: ai.StreamOptions,
 ) !ai.StreamResult {
     return error.ProviderExploded;
+}
+
+fn testCaptureOptionsStream(
+    ptr: ?*anyopaque,
+    allocator: std.mem.Allocator,
+    model: ai.Model,
+    context: ai.Context,
+    options: ai.StreamOptions,
+) !ai.StreamResult {
+    const capture: *StreamOptionsCapture = @ptrCast(@alignCast(ptr.?));
+    capture.api_key = options.api_key;
+    capture.temperature = options.temperature;
+    capture.max_tokens = options.max_tokens;
+    capture.cache_retention = options.cache_retention;
+    capture.metadata_json = options.metadata_json;
+    capture.header_count = options.headers.len;
+    capture.context_message_count = context.messages.len;
+    capture.system_prompt = context.system_prompt;
+    capture.signal_seen = options.signal != null;
+
+    const content = try allocator.alloc(ai.AssistantContent, 1);
+    content[0] = .{ .text = .{ .text = try allocator.dupe(u8, "ok") } };
+    var result: ai.StreamResult = .{
+        .allocator = allocator,
+        .message = .{
+            .content = content,
+            .api = model.api,
+            .provider = model.provider,
+            .model = model.id,
+            .stop_reason = .stop,
+            .timestamp_ms = 1,
+        },
+    };
+    errdefer result.deinit();
+    try result.events.append(allocator, .{ .done = .stop });
+    return result;
+}
+
+fn testResolveApiKey(ptr: ?*anyopaque, provider: []const u8) !?[]const u8 {
+    const capture: *StreamOptionsCapture = @ptrCast(@alignCast(ptr.?));
+    capture.resolver_calls += 1;
+    capture.resolver_provider = provider;
+    return capture.resolved_api_key;
+}
+
+fn testKeepOnlyLatestMessage(
+    ptr: ?*anyopaque,
+    allocator: std.mem.Allocator,
+    source: []const AgentMessage,
+    signal: ?*ai.AbortSignal,
+) ![]const AgentMessage {
+    const capture: *TransformConvertCapture = @ptrCast(@alignCast(ptr.?));
+    capture.transform_source_len = source.len;
+    capture.transform_signal_seen = signal != null;
+    const kept = source[source.len - 1 ..];
+    capture.transform_output_len = kept.len;
+    return try cloneAgentMessageSliceAlloc(allocator, kept);
+}
+
+fn testCaptureConvertToLlm(
+    ptr: ?*anyopaque,
+    allocator: std.mem.Allocator,
+    source: []const AgentMessage,
+    signal: ?*ai.AbortSignal,
+) ![]ai.Message {
+    const capture: *TransformConvertCapture = @ptrCast(@alignCast(ptr.?));
+    capture.converted_len = source.len;
+    capture.convert_signal_seen = signal != null;
+    const converted = try agent_messages.convertToLlmAlloc(allocator, source);
+    return converted.messages;
+}
+
+fn testCaptureLlmContextStream(
+    ptr: ?*anyopaque,
+    allocator: std.mem.Allocator,
+    model: ai.Model,
+    context: ai.Context,
+    options: ai.StreamOptions,
+) !ai.StreamResult {
+    const capture: *TransformConvertCapture = @ptrCast(@alignCast(ptr.?));
+    capture.stream_message_len = context.messages.len;
+    capture.stream_signal_seen = options.signal != null;
+
+    const content = try allocator.alloc(ai.AssistantContent, 1);
+    content[0] = .{ .text = .{ .text = try allocator.dupe(u8, "converted") } };
+    var result: ai.StreamResult = .{
+        .allocator = allocator,
+        .message = .{
+            .content = content,
+            .api = model.api,
+            .provider = model.provider,
+            .model = model.id,
+            .stop_reason = .stop,
+            .timestamp_ms = 1,
+        },
+    };
+    errdefer result.deinit();
+    try result.events.append(allocator, .{ .done = .stop });
+    return result;
+}
+
+fn testToolCallStream(
+    ptr: ?*anyopaque,
+    allocator: std.mem.Allocator,
+    model: ai.Model,
+    _: ai.Context,
+    _: ai.StreamOptions,
+) !ai.StreamResult {
+    const capture: *ToolHookCapture = @ptrCast(@alignCast(ptr.?));
+    capture.stream_calls += 1;
+
+    const content = try allocator.alloc(ai.AssistantContent, 1);
+    content[0] = .{ .tool_call = .{
+        .id = try allocator.dupe(u8, "tool-1"),
+        .name = try allocator.dupe(u8, "echo"),
+        .arguments_json = try allocator.dupe(u8, "{\"value\":\"original\"}"),
+    } };
+    var result: ai.StreamResult = .{
+        .allocator = allocator,
+        .message = .{
+            .content = content,
+            .api = model.api,
+            .provider = model.provider,
+            .model = model.id,
+            .stop_reason = .tool_use,
+            .timestamp_ms = 1,
+        },
+    };
+    errdefer result.deinit();
+    try result.events.append(allocator, .{ .done = .tool_use });
+    return result;
+}
+
+fn testBeforeToolCallRewrite(
+    ptr: ?*anyopaque,
+    context: agent_loop.BeforeToolCallContext,
+    signal: ?*ai.AbortSignal,
+) !agent_loop.BeforeToolCallResult {
+    const capture: *ToolHookCapture = @ptrCast(@alignCast(ptr.?));
+    capture.before_context_len = context.context.messages.len;
+    capture.before_signal_seen = signal != null;
+    return .{ .arguments_json = "{\"value\":\"rewritten\"}" };
+}
+
+fn testAfterToolCallTerminate(
+    ptr: ?*anyopaque,
+    context: agent_loop.AfterToolCallContext,
+    signal: ?*ai.AbortSignal,
+) !?agent_loop.AfterToolCallResult {
+    const capture: *ToolHookCapture = @ptrCast(@alignCast(ptr.?));
+    capture.after_context_len = context.context.messages.len;
+    capture.after_signal_seen = signal != null;
+    capture.after_is_error = context.is_error;
+    return .{
+        .content = &after_tool_content,
+        .details_json = "{\"after\":true}",
+        .terminate = true,
+    };
+}
+
+fn testCaptureToolExecute(
+    ptr: ?*anyopaque,
+    allocator: std.mem.Allocator,
+    _: []const u8,
+    arguments_json: []const u8,
+    signal: ?*ai.AbortSignal,
+    _: agent_loop.ToolUpdateCallback,
+) !agent_loop.AgentToolResult {
+    const capture: *ToolHookCapture = @ptrCast(@alignCast(ptr.?));
+    if (capture.executed_arguments_json) |value| std.testing.allocator.free(value);
+    capture.executed_arguments_json = try std.testing.allocator.dupe(u8, arguments_json);
+    capture.execute_signal_seen = signal != null;
+
+    const content = try allocator.alloc(ai.UserContent, 1);
+    content[0] = .{ .text = .{ .text = try allocator.dupe(u8, "tool result") } };
+    return .{ .content = content, .details_json = "{\"before\":true}" };
 }
 
 const ListenerCapture = struct {
@@ -1454,6 +1674,129 @@ test "agent forwards session id to stream options and supports setter" {
     try agent.setSessionId("session-def");
     try agent.promptTextAlloc("hello again", &.{});
     try std.testing.expectEqualStrings("session-def", stream_context.received_session_id.?);
+}
+
+// Ported from packages/agent/test/agent.test.ts stream option and auth forwarding.
+test "agent forwards stream options and api key resolver results" {
+    const headers = [_]ai.Header{.{ .name = "x-test", .value = "one" }};
+    var capture: StreamOptionsCapture = .{ .resolved_api_key = "resolved-key" };
+    var agent = try Agent.initAlloc(std.testing.allocator, .{
+        .initial_state = .{
+            .system_prompt = "system prompt",
+            .model = .{
+                .id = "mock",
+                .name = "mock",
+                .api = ai.types.api.openai_responses,
+                .provider = "openai",
+                .base_url = "https://example.invalid",
+            },
+        },
+        .stream = .{ .ptr = &capture, .call_fn = testCaptureOptionsStream },
+        .stream_options = .{
+            .temperature = 0.7,
+            .max_tokens = 123,
+            .cache_retention = .long,
+            .headers = &headers,
+            .metadata_json = "{\"trace\":\"abc\"}",
+        },
+        .api_key = "fallback-key",
+        .get_api_key = .{ .ptr = &capture, .call_fn = testResolveApiKey },
+    });
+    defer agent.deinit();
+
+    try agent.promptTextAlloc("hello", &.{});
+    try std.testing.expectEqual(@as(usize, 1), capture.resolver_calls);
+    try std.testing.expectEqualStrings("openai", capture.resolver_provider.?);
+    try std.testing.expectEqualStrings("resolved-key", capture.api_key.?);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.7), capture.temperature.?, 0.000001);
+    try std.testing.expectEqual(@as(u64, 123), capture.max_tokens.?);
+    try std.testing.expectEqual(ai.CacheRetention.long, capture.cache_retention);
+    try std.testing.expectEqualStrings("{\"trace\":\"abc\"}", capture.metadata_json.?);
+    try std.testing.expectEqual(@as(usize, 1), capture.header_count);
+    try std.testing.expectEqual(@as(usize, 1), capture.context_message_count);
+    try std.testing.expectEqualStrings("system prompt", capture.system_prompt.?);
+    try std.testing.expect(capture.signal_seen);
+
+    capture.resolved_api_key = null;
+    try agent.setApiKey("next-fallback");
+    try agent.promptTextAlloc("hello again", &.{});
+    try std.testing.expectEqual(@as(usize, 2), capture.resolver_calls);
+    try std.testing.expectEqualStrings("next-fallback", capture.api_key.?);
+}
+
+// Ported from packages/agent/test/agent.test.ts transform/convert option forwarding.
+test "agent forwards transform context and convert to llm hooks" {
+    var capture: TransformConvertCapture = .{};
+    var old_user = try testUserMessageAlloc(std.testing.allocator, "old user", 1);
+    defer deinitAgentMessage(std.testing.allocator, &old_user);
+    var old_assistant = try testAssistantMessageAlloc(std.testing.allocator, "old assistant", .stop, null);
+    defer deinitAgentMessage(std.testing.allocator, &old_assistant);
+    var agent = try Agent.initAlloc(std.testing.allocator, .{
+        .initial_state = .{ .messages = &.{ old_user, old_assistant } },
+        .stream = .{ .ptr = &capture, .call_fn = testCaptureLlmContextStream },
+        .transform_context = .{ .ptr = &capture, .call_fn = testKeepOnlyLatestMessage },
+        .convert_to_llm = .{ .ptr = &capture, .call_fn = testCaptureConvertToLlm },
+    });
+    defer agent.deinit();
+
+    try agent.promptTextAlloc("latest", &.{});
+
+    try std.testing.expectEqual(@as(usize, 3), capture.transform_source_len);
+    try std.testing.expectEqual(@as(usize, 1), capture.transform_output_len);
+    try std.testing.expectEqual(@as(usize, 1), capture.converted_len);
+    try std.testing.expectEqual(@as(usize, 1), capture.stream_message_len);
+    try std.testing.expect(capture.transform_signal_seen);
+    try std.testing.expect(capture.convert_signal_seen);
+    try std.testing.expect(capture.stream_signal_seen);
+}
+
+// Ported from packages/agent/test/agent.test.ts tool hook forwarding through Agent.
+test "agent forwards before and after tool call hooks through prompt runs" {
+    var capture: ToolHookCapture = .{};
+    defer capture.deinit(std.testing.allocator);
+    const tools = [_]AgentLoopTool{.{
+        .name = "echo",
+        .label = "Echo",
+        .description = "Echo tool",
+        .parameters_json = "{}",
+        .execute = .{ .ptr = &capture, .call_fn = testCaptureToolExecute },
+    }};
+    var agent = try Agent.initAlloc(std.testing.allocator, .{
+        .initial_state = .{ .tools = &tools },
+        .stream = .{ .ptr = &capture, .call_fn = testToolCallStream },
+        .before_tool_call = .{ .ptr = &capture, .call_fn = testBeforeToolCallRewrite },
+        .after_tool_call = .{ .ptr = &capture, .call_fn = testAfterToolCallTerminate },
+    });
+    defer agent.deinit();
+
+    try agent.promptTextAlloc("use a tool", &.{});
+
+    try std.testing.expectEqual(@as(usize, 1), capture.stream_calls);
+    try std.testing.expectEqual(@as(usize, 2), capture.before_context_len);
+    try std.testing.expectEqual(@as(usize, 2), capture.after_context_len);
+    try std.testing.expect(capture.before_signal_seen);
+    try std.testing.expect(capture.after_signal_seen);
+    try std.testing.expect(capture.execute_signal_seen);
+    try std.testing.expect(!capture.after_is_error);
+    try std.testing.expectEqualStrings("{\"value\":\"rewritten\"}", capture.executed_arguments_json.?);
+    try std.testing.expectEqual(@as(usize, 3), agent.state.messages.len);
+    try std.testing.expect(agent.state.messages[2] == .tool_result);
+    try std.testing.expectEqualStrings("after hook", agent.state.messages[2].tool_result.content[0].text.text);
+    try std.testing.expect(!agent.state.messages[2].tool_result.is_error);
+}
+
+// Ported from packages/agent/test/agent.test.ts continue run guard behavior.
+test "agent continueRun rejects empty state and assistant tails without queued work" {
+    var agent = try Agent.initAlloc(std.testing.allocator, .{});
+    defer agent.deinit();
+
+    try std.testing.expectError(error.CannotContinueNoMessages, agent.continueRunAlloc());
+
+    var assistant = try testAssistantMessageAlloc(std.testing.allocator, "done", .stop, null);
+    defer deinitAgentMessage(std.testing.allocator, &assistant);
+    try agent.state.setMessagesAlloc(&.{assistant});
+
+    try std.testing.expectError(error.CannotContinueFromAssistant, agent.continueRunAlloc());
 }
 
 // Ported from packages/agent/test/agent.test.ts assistant-tail follow-up continuation.
