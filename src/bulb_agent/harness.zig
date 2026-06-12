@@ -1299,6 +1299,40 @@ test "agent harness snapshots stream options and chains provider request hooks" 
     try std.testing.expectEqualStrings("1", state.seen_headers.items[1]);
 }
 
+// Ported from packages/agent/test/harness/agent-harness-stream.test.ts save-point stream snapshots.
+test "agent harness uses updated stream options for later save-point snapshots" {
+    const allocator = std.testing.allocator;
+    var storage = try session_storage.InMemorySessionStorage.initAlloc(allocator, std.testing.io, .{});
+    defer storage.deinit();
+    var session = session_mod.Session(session_storage.InMemorySessionStorage).init(allocator, std.testing.io, &storage);
+    const model = testModel("first");
+    var harness = try AgentHarness(@TypeOf(session)).init(allocator, .{
+        .env = nullEnv(),
+        .session = &session,
+        .model = &model,
+        .stream_options = .{
+            .timeout_ms = 1000,
+            .headers = &.{.{ .name = "turn", .value = "first" }},
+        },
+    });
+    defer harness.deinit();
+
+    var first_request = try harness.prepareProviderRequestAlloc(allocator, "session-1", .{});
+    defer first_request.deinit();
+
+    try harness.setStreamOptions(.{
+        .timeout_ms = 2000,
+        .headers = &.{.{ .name = "turn", .value = "second" }},
+    });
+    var second_request = try harness.prepareProviderRequestAlloc(allocator, "session-1", .{});
+    defer second_request.deinit();
+
+    try std.testing.expectEqual(@as(?u64, 1000), first_request.stream_options.timeout_ms);
+    try expectHeaderValues(first_request.stream_options.headers, &.{.{ .name = "turn", .value = "first" }});
+    try std.testing.expectEqual(@as(?u64, 2000), second_request.stream_options.timeout_ms);
+    try expectHeaderValues(second_request.stream_options.headers, &.{.{ .name = "turn", .value = "second" }});
+}
+
 // Ported from packages/agent/test/harness/agent-harness-stream.test.ts provider payload hooks.
 test "agent harness chains provider payload hooks" {
     const allocator = std.testing.allocator;
