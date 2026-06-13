@@ -552,13 +552,14 @@ fn streamAssistantResponse(state: *LoopState) !AgentMessage {
 
     const assistant_message = try cloneAssistantMessageAlloc(a, response.message);
     const agent_message: AgentMessage = .{ .assistant = assistant_message };
+    var partial = AssistantPartialProjection.init(a, assistant_message);
 
     var emitted_start = false;
     for (response.events.items) |event| {
         switch (event) {
             .start => {
                 if (!emitted_start) {
-                    try appendEvent(a, &state.events, .{ .message_start = .{ .message = agent_message } });
+                    try appendEvent(a, &state.events, .{ .message_start = .{ .message = try partial.messageAlloc() } });
                     emitted_start = true;
                 }
             },
@@ -573,11 +574,12 @@ fn streamAssistantResponse(state: *LoopState) !AgentMessage {
             .toolcall_end,
             => {
                 if (!emitted_start) {
-                    try appendEvent(a, &state.events, .{ .message_start = .{ .message = agent_message } });
+                    try appendEvent(a, &state.events, .{ .message_start = .{ .message = try partial.messageAlloc() } });
                     emitted_start = true;
                 }
+                try partial.apply(event);
                 try appendEvent(a, &state.events, .{ .message_update = .{
-                    .message = agent_message,
+                    .message = try partial.messageAlloc(),
                     .assistant_message_event = event,
                 } });
             },
@@ -592,6 +594,113 @@ fn streamAssistantResponse(state: *LoopState) !AgentMessage {
     try appendEvent(a, &state.events, .{ .message_end = .{ .message = agent_message } });
     return agent_message;
 }
+
+const AssistantPartialProjection = struct {
+    allocator: std.mem.Allocator,
+    template: ai.AssistantMessage,
+    content: std.ArrayList(ai.AssistantContent) = .empty,
+
+    fn init(allocator: std.mem.Allocator, template: ai.AssistantMessage) AssistantPartialProjection {
+        return .{ .allocator = allocator, .template = template };
+    }
+
+    fn messageAlloc(self: *AssistantPartialProjection) !AgentMessage {
+        const assistant = ai.AssistantMessage{
+            .content = self.content.items,
+            .api = self.template.api,
+            .provider = self.template.provider,
+            .model = self.template.model,
+            .response_model = self.template.response_model,
+            .usage = self.template.usage,
+            .stop_reason = self.template.stop_reason,
+            .error_message = self.template.error_message,
+            .response_id = self.template.response_id,
+            .diagnostics = self.template.diagnostics,
+            .timestamp_ms = self.template.timestamp_ms,
+        };
+        return .{ .assistant = try cloneAssistantMessageAlloc(self.allocator, assistant) };
+    }
+
+    fn apply(self: *AssistantPartialProjection, event: ai.StreamEvent) !void {
+        switch (event) {
+            .text_start => |payload| try self.setText(payload.content_index, ""),
+            .text_delta => |payload| try self.appendText(payload.content_index, payload.delta),
+            .text_end => |payload| try self.setText(payload.content_index, payload.content),
+            .thinking_start => |payload| try self.setThinking(payload.content_index, ""),
+            .thinking_delta => |payload| try self.appendThinking(payload.content_index, payload.delta),
+            .thinking_end => |payload| try self.setThinking(payload.content_index, payload.content),
+            .toolcall_start => |payload| try self.setToolCall(payload.content_index, .{
+                .id = "",
+                .name = "",
+                .arguments_json = "",
+            }),
+            .toolcall_delta => |payload| try self.appendToolCallArguments(payload.content_index, payload.delta),
+            .toolcall_end => |payload| try self.setToolCall(payload.content_index, payload.tool_call),
+            else => {},
+        }
+    }
+
+    fn ensureSlot(self: *AssistantPartialProjection, index: usize) !void {
+        while (self.content.items.len <= index) {
+            try self.content.append(self.allocator, .{ .text = .{ .text = "" } });
+        }
+    }
+
+    fn setText(self: *AssistantPartialProjection, index: usize, text: []const u8) !void {
+        try self.ensureSlot(index);
+        self.content.items[index] = .{ .text = .{ .text = try self.allocator.dupe(u8, text) } };
+    }
+
+    fn appendText(self: *AssistantPartialProjection, index: usize, delta: []const u8) !void {
+        try self.ensureSlot(index);
+        const current = switch (self.content.items[index]) {
+            .text => |text| text.text,
+            else => "",
+        };
+        self.content.items[index] = .{ .text = .{ .text = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ current, delta }) } };
+    }
+
+    fn setThinking(self: *AssistantPartialProjection, index: usize, thinking: []const u8) !void {
+        try self.ensureSlot(index);
+        self.content.items[index] = .{ .thinking = .{
+            .thinking = try self.allocator.dupe(u8, thinking),
+            .thinking_signature = null,
+            .redacted = false,
+        } };
+    }
+
+    fn appendThinking(self: *AssistantPartialProjection, index: usize, delta: []const u8) !void {
+        try self.ensureSlot(index);
+        const current = switch (self.content.items[index]) {
+            .thinking => |thinking| thinking.thinking,
+            else => "",
+        };
+        self.content.items[index] = .{ .thinking = .{
+            .thinking = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ current, delta }),
+            .thinking_signature = null,
+            .redacted = false,
+        } };
+    }
+
+    fn setToolCall(self: *AssistantPartialProjection, index: usize, tool_call: ai.ToolCall) !void {
+        try self.ensureSlot(index);
+        self.content.items[index] = .{ .tool_call = try cloneToolCallAlloc(self.allocator, tool_call) };
+    }
+
+    fn appendToolCallArguments(self: *AssistantPartialProjection, index: usize, delta: []const u8) !void {
+        try self.ensureSlot(index);
+        const current = switch (self.content.items[index]) {
+            .tool_call => |tool_call| tool_call,
+            else => ai.ToolCall{ .id = "", .name = "", .arguments_json = "" },
+        };
+        self.content.items[index] = .{ .tool_call = .{
+            .id = try self.allocator.dupe(u8, current.id),
+            .name = try self.allocator.dupe(u8, current.name),
+            .arguments_json = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ current.arguments_json, delta }),
+            .thought_signature = if (current.thought_signature) |value| try self.allocator.dupe(u8, value) else null,
+        } };
+    }
+};
 
 fn executeToolCalls(state: *LoopState, assistant_message: ai.AssistantMessage) !ExecutedToolCallBatch {
     if (!canUseParallelToolExecution(state.config, state.current.tools) or countToolCalls(assistant_message.content) <= 1) {
@@ -1371,6 +1480,67 @@ fn doneStreamResult(allocator: std.mem.Allocator, message: ai.AssistantMessage) 
     return result;
 }
 
+fn assistantRichToolAlloc(
+    allocator: std.mem.Allocator,
+    model: ai.Model,
+) !ai.AssistantMessage {
+    const content = try allocator.alloc(ai.AssistantContent, 3);
+    content[0] = .{ .thinking = .{
+        .thinking = "plan",
+        .thinking_signature = "sig",
+    } };
+    content[1] = .{ .text = .{ .text = "answer" } };
+    content[2] = .{ .tool_call = .{
+        .id = "tool-1",
+        .name = "echo",
+        .arguments_json = "{\"value\":\"hello\"}",
+    } };
+    return .{
+        .content = content,
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
+        .stop_reason = .tool_use,
+        .timestamp_ms = 2,
+    };
+}
+
+fn richDeltaThenTextStream(
+    ptr: ?*anyopaque,
+    allocator: std.mem.Allocator,
+    model: ai.Model,
+    _: ai.Context,
+    _: ai.StreamOptions,
+) !ai.StreamResult {
+    const state: *ToolStreamState = @ptrCast(@alignCast(ptr.?));
+    defer state.call_count += 1;
+    if (state.call_count > 0) {
+        return try doneStreamResult(allocator, try assistantTextAlloc(allocator, model, "done", .stop));
+    }
+
+    const message = try assistantRichToolAlloc(allocator, model);
+    const tool_call = message.content[2].tool_call;
+    var result: ai.StreamResult = .{
+        .allocator = allocator,
+        .message = message,
+    };
+    try result.events.append(allocator, .{ .start = {} });
+    try result.events.append(allocator, .{ .thinking_start = .{ .content_index = 0 } });
+    try result.events.append(allocator, .{ .thinking_delta = .{ .content_index = 0, .delta = "pl" } });
+    try result.events.append(allocator, .{ .thinking_delta = .{ .content_index = 0, .delta = "an" } });
+    try result.events.append(allocator, .{ .thinking_end = .{ .content_index = 0, .content = "plan" } });
+    try result.events.append(allocator, .{ .text_start = .{ .content_index = 1 } });
+    try result.events.append(allocator, .{ .text_delta = .{ .content_index = 1, .delta = "ans" } });
+    try result.events.append(allocator, .{ .text_delta = .{ .content_index = 1, .delta = "wer" } });
+    try result.events.append(allocator, .{ .text_end = .{ .content_index = 1, .content = "answer" } });
+    try result.events.append(allocator, .{ .toolcall_start = .{ .content_index = 2 } });
+    try result.events.append(allocator, .{ .toolcall_delta = .{ .content_index = 2, .delta = "{\"value\":\"" } });
+    try result.events.append(allocator, .{ .toolcall_delta = .{ .content_index = 2, .delta = "hello\"}" } });
+    try result.events.append(allocator, .{ .toolcall_end = .{ .content_index = 2, .tool_call = tool_call } });
+    try result.events.append(allocator, .{ .done = .tool_use });
+    return result;
+}
+
 fn textStream(
     _: ?*anyopaque,
     allocator: std.mem.Allocator,
@@ -1748,6 +1918,109 @@ test "agent loop executes tool calls and emits tool events" {
     try std.testing.expect(saw_start);
     try std.testing.expect(saw_update);
     try std.testing.expect(saw_end);
+}
+
+// Ported from packages/agent/src/agent-loop.ts streamAssistantResponse partial update behavior.
+test "agent loop projects assistant stream deltas into partial message updates" {
+    const allocator = std.testing.allocator;
+    const prompt_content = [_]ai.UserContent{.{ .text = .{ .text = "stream rich response" } }};
+    const prompt = userMessage(&prompt_content);
+
+    var stream_state: ToolStreamState = .{};
+    var tool_state: EchoToolState = .{};
+    defer tool_state.executed.deinit(std.testing.allocator);
+    const tools = [_]AgentLoopTool{.{
+        .name = "echo",
+        .execute = .{ .ptr = &tool_state, .call_fn = echoToolExecute },
+    }};
+    const config: AgentLoopConfig = .{
+        .model = createModel(),
+        .stream = .{ .ptr = &stream_state, .call_fn = richDeltaThenTextStream },
+    };
+
+    var result = try runAgentLoopAlloc(allocator, &.{prompt}, .{ .tools = &tools }, config, null);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), stream_state.call_count);
+    try std.testing.expectEqual(@as(usize, 1), tool_state.executed.items.len);
+    try std.testing.expectEqualStrings("hello", tool_state.executed.items[0]);
+
+    var update_tags: std.ArrayList(std.meta.Tag(ai.StreamEvent)) = .empty;
+    defer update_tags.deinit(allocator);
+    var saw_empty_assistant_start = false;
+    var saw_final_tool_use_end = false;
+
+    for (result.events) |event| switch (event) {
+        .message_start => |payload| if (payload.message == .assistant and payload.message.assistant.stop_reason == .tool_use) {
+            saw_empty_assistant_start = payload.message.assistant.content.len == 0;
+        },
+        .message_update => |payload| {
+            try update_tags.append(allocator, std.meta.activeTag(payload.assistant_message_event));
+            const assistant = payload.message.assistant;
+            switch (payload.assistant_message_event) {
+                .thinking_delta => |delta| {
+                    try std.testing.expect(assistant.content[0] == .thinking);
+                    const expected = if (std.mem.eql(u8, delta.delta, "pl")) "pl" else "plan";
+                    try std.testing.expectEqualStrings(expected, assistant.content[0].thinking.thinking);
+                },
+                .thinking_end => {
+                    try std.testing.expect(assistant.content[0] == .thinking);
+                    try std.testing.expectEqualStrings("plan", assistant.content[0].thinking.thinking);
+                },
+                .text_delta => |delta| {
+                    try std.testing.expect(assistant.content[1] == .text);
+                    const expected = if (std.mem.eql(u8, delta.delta, "ans")) "ans" else "answer";
+                    try std.testing.expectEqualStrings(expected, assistant.content[1].text.text);
+                },
+                .text_end => {
+                    try std.testing.expect(assistant.content[1] == .text);
+                    try std.testing.expectEqualStrings("answer", assistant.content[1].text.text);
+                },
+                .toolcall_delta => |delta| {
+                    try std.testing.expect(assistant.content[2] == .tool_call);
+                    const expected = if (std.mem.eql(u8, delta.delta, "{\"value\":\""))
+                        "{\"value\":\""
+                    else
+                        "{\"value\":\"hello\"}";
+                    try std.testing.expectEqualStrings(expected, assistant.content[2].tool_call.arguments_json);
+                },
+                .toolcall_end => {
+                    try std.testing.expect(assistant.content[2] == .tool_call);
+                    try std.testing.expectEqualStrings("tool-1", assistant.content[2].tool_call.id);
+                    try std.testing.expectEqualStrings("echo", assistant.content[2].tool_call.name);
+                    try std.testing.expectEqualStrings("{\"value\":\"hello\"}", assistant.content[2].tool_call.arguments_json);
+                },
+                else => {},
+            }
+        },
+        .message_end => |payload| if (payload.message == .assistant and payload.message.assistant.stop_reason == .tool_use) {
+            const assistant = payload.message.assistant;
+            try std.testing.expectEqual(@as(usize, 3), assistant.content.len);
+            try std.testing.expectEqualStrings("plan", assistant.content[0].thinking.thinking);
+            try std.testing.expectEqualStrings("answer", assistant.content[1].text.text);
+            try std.testing.expectEqualStrings("{\"value\":\"hello\"}", assistant.content[2].tool_call.arguments_json);
+            saw_final_tool_use_end = true;
+        },
+        else => {},
+    };
+
+    const expected_tags = [_]std.meta.Tag(ai.StreamEvent){
+        .thinking_start,
+        .thinking_delta,
+        .thinking_delta,
+        .thinking_end,
+        .text_start,
+        .text_delta,
+        .text_delta,
+        .text_end,
+        .toolcall_start,
+        .toolcall_delta,
+        .toolcall_delta,
+        .toolcall_end,
+    };
+    try std.testing.expectEqualSlices(std.meta.Tag(ai.StreamEvent), &expected_tags, update_tags.items[0..expected_tags.len]);
+    try std.testing.expect(saw_empty_assistant_start);
+    try std.testing.expect(saw_final_tool_use_end);
 }
 
 // Ported from packages/agent/test/agent-loop.test.ts stop-after-turn semantics.
