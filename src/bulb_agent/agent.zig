@@ -1085,6 +1085,16 @@ const ToolHookCapture = struct {
 };
 
 const after_tool_content = [_]ai.UserContent{.{ .text = .{ .text = "after hook" } }};
+const rich_stream_content = [_]ai.AssistantContent{
+    .{ .thinking = .{ .thinking = "plan", .thinking_signature = "sig" } },
+    .{ .text = .{ .text = "answer" } },
+    .{ .tool_call = .{
+        .id = "tool-1",
+        .name = "echo",
+        .arguments_json = "{\"value\":\"hello\"}",
+    } },
+};
+const done_stream_content = [_]ai.AssistantContent{.{ .text = .{ .text = "done" } }};
 
 fn testOkStream(
     ptr: ?*anyopaque,
@@ -1261,6 +1271,63 @@ fn testToolCallStream(
     return result;
 }
 
+fn testRichDeltaThenTextStream(
+    ptr: ?*anyopaque,
+    allocator: std.mem.Allocator,
+    model: ai.Model,
+    _: ai.Context,
+    _: ai.StreamOptions,
+) !ai.StreamResult {
+    const context: *TestStreamContext = @ptrCast(@alignCast(ptr.?));
+    defer context.response_count += 1;
+
+    if (context.response_count > 0) {
+        var result: ai.StreamResult = .{
+            .allocator = allocator,
+            .message = .{
+                .content = &done_stream_content,
+                .api = model.api,
+                .provider = model.provider,
+                .model = model.id,
+                .stop_reason = .stop,
+                .timestamp_ms = 3,
+            },
+        };
+        try result.events.append(allocator, .{ .done = .stop });
+        return result;
+    }
+
+    var result: ai.StreamResult = .{
+        .allocator = allocator,
+        .message = .{
+            .content = &rich_stream_content,
+            .api = model.api,
+            .provider = model.provider,
+            .model = model.id,
+            .stop_reason = .tool_use,
+            .timestamp_ms = 2,
+        },
+    };
+    try result.events.append(allocator, .{ .start = {} });
+    try result.events.append(allocator, .{ .thinking_start = .{ .content_index = 0 } });
+    try result.events.append(allocator, .{ .thinking_delta = .{ .content_index = 0, .delta = "pl" } });
+    try result.events.append(allocator, .{ .thinking_delta = .{ .content_index = 0, .delta = "an" } });
+    try result.events.append(allocator, .{ .thinking_end = .{ .content_index = 0, .content = "plan" } });
+    try result.events.append(allocator, .{ .text_start = .{ .content_index = 1 } });
+    try result.events.append(allocator, .{ .text_delta = .{ .content_index = 1, .delta = "ans" } });
+    try result.events.append(allocator, .{ .text_delta = .{ .content_index = 1, .delta = "wer" } });
+    try result.events.append(allocator, .{ .text_end = .{ .content_index = 1, .content = "answer" } });
+    try result.events.append(allocator, .{ .toolcall_start = .{ .content_index = 2 } });
+    try result.events.append(allocator, .{ .toolcall_delta = .{ .content_index = 2, .delta = "{\"value\":\"" } });
+    try result.events.append(allocator, .{ .toolcall_delta = .{ .content_index = 2, .delta = "hello\"}" } });
+    try result.events.append(allocator, .{ .toolcall_end = .{
+        .content_index = 2,
+        .tool_call = rich_stream_content[2].tool_call,
+    } });
+    try result.events.append(allocator, .{ .done = .tool_use });
+    return result;
+}
+
 fn testBeforeToolCallRewrite(
     ptr: ?*anyopaque,
     context: agent_loop.BeforeToolCallContext,
@@ -1317,6 +1384,17 @@ const ListenerCapture = struct {
     }
 };
 
+const StreamingProjectionCapture = struct {
+    agent: *Agent,
+    update_tags: std.ArrayList(std.meta.Tag(ai.StreamEvent)) = .empty,
+    saw_empty_tool_use_start: bool = false,
+    saw_final_tool_use_end: bool = false,
+
+    fn deinit(self: *StreamingProjectionCapture, allocator: std.mem.Allocator) void {
+        self.update_tags.deinit(allocator);
+    }
+};
+
 fn captureListener(ptr: ?*anyopaque, event: AgentEvent, signal: *ai.AbortSignal) !void {
     const capture: *ListenerCapture = @ptrCast(@alignCast(ptr.?));
     const tag = std.meta.activeTag(event);
@@ -1326,6 +1404,95 @@ fn captureListener(ptr: ?*anyopaque, event: AgentEvent, signal: *ai.AbortSignal)
     }
     if (tag == .agent_end) {
         capture.saw_agent_end_while_active = capture.agent.active and capture.agent.state.is_streaming;
+    }
+}
+
+fn captureStreamingProjection(ptr: ?*anyopaque, event: AgentEvent, _: *ai.AbortSignal) !void {
+    const capture: *StreamingProjectionCapture = @ptrCast(@alignCast(ptr.?));
+    switch (event) {
+        .message_start => |payload| if (payload.message == .assistant and payload.message.assistant.stop_reason == .tool_use) {
+            capture.saw_empty_tool_use_start = payload.message.assistant.content.len == 0;
+            const streaming_message = capture.agent.state.streaming_message orelse return error.ExpectedStreamingMessage;
+            try std.testing.expect(streaming_message == .assistant);
+            try std.testing.expectEqual(@as(usize, 0), streaming_message.assistant.content.len);
+        },
+        .message_update => |payload| {
+            try capture.update_tags.append(std.testing.allocator, std.meta.activeTag(payload.assistant_message_event));
+            try expectRichPartialAssistant(payload.message.assistant, payload.assistant_message_event);
+            const streaming_message = capture.agent.state.streaming_message orelse return error.ExpectedStreamingMessage;
+            try std.testing.expect(streaming_message == .assistant);
+            try expectRichPartialAssistant(streaming_message.assistant, payload.assistant_message_event);
+        },
+        .message_end => |payload| if (payload.message == .assistant and payload.message.assistant.stop_reason == .tool_use) {
+            capture.saw_final_tool_use_end = true;
+            try std.testing.expect(capture.agent.state.streaming_message == null);
+            try std.testing.expectEqual(@as(usize, 3), payload.message.assistant.content.len);
+            try std.testing.expectEqualStrings("plan", payload.message.assistant.content[0].thinking.thinking);
+            try std.testing.expectEqualStrings("answer", payload.message.assistant.content[1].text.text);
+            try std.testing.expectEqualStrings("{\"value\":\"hello\"}", payload.message.assistant.content[2].tool_call.arguments_json);
+        },
+        else => {},
+    }
+}
+
+fn expectRichPartialAssistant(assistant: ai.AssistantMessage, event: ai.StreamEvent) !void {
+    switch (event) {
+        .thinking_start => {
+            try std.testing.expectEqual(@as(usize, 1), assistant.content.len);
+            try std.testing.expect(assistant.content[0] == .thinking);
+            try std.testing.expectEqualStrings("", assistant.content[0].thinking.thinking);
+        },
+        .thinking_delta => |delta| {
+            try std.testing.expectEqual(@as(usize, 1), assistant.content.len);
+            try std.testing.expect(assistant.content[0] == .thinking);
+            const expected = if (std.mem.eql(u8, delta.delta, "pl")) "pl" else "plan";
+            try std.testing.expectEqualStrings(expected, assistant.content[0].thinking.thinking);
+        },
+        .thinking_end => {
+            try std.testing.expectEqual(@as(usize, 1), assistant.content.len);
+            try std.testing.expect(assistant.content[0] == .thinking);
+            try std.testing.expectEqualStrings("plan", assistant.content[0].thinking.thinking);
+        },
+        .text_start => {
+            try std.testing.expectEqual(@as(usize, 2), assistant.content.len);
+            try std.testing.expect(assistant.content[1] == .text);
+            try std.testing.expectEqualStrings("", assistant.content[1].text.text);
+        },
+        .text_delta => |delta| {
+            try std.testing.expectEqual(@as(usize, 2), assistant.content.len);
+            try std.testing.expect(assistant.content[1] == .text);
+            const expected = if (std.mem.eql(u8, delta.delta, "ans")) "ans" else "answer";
+            try std.testing.expectEqualStrings(expected, assistant.content[1].text.text);
+        },
+        .text_end => {
+            try std.testing.expectEqual(@as(usize, 2), assistant.content.len);
+            try std.testing.expect(assistant.content[1] == .text);
+            try std.testing.expectEqualStrings("answer", assistant.content[1].text.text);
+        },
+        .toolcall_start => {
+            try std.testing.expectEqual(@as(usize, 3), assistant.content.len);
+            try std.testing.expect(assistant.content[2] == .tool_call);
+            try std.testing.expectEqualStrings("", assistant.content[2].tool_call.id);
+            try std.testing.expectEqualStrings("", assistant.content[2].tool_call.name);
+            try std.testing.expectEqualStrings("", assistant.content[2].tool_call.arguments_json);
+        },
+        .toolcall_delta => |delta| {
+            try std.testing.expectEqual(@as(usize, 3), assistant.content.len);
+            try std.testing.expect(assistant.content[2] == .tool_call);
+            const expected = if (std.mem.eql(u8, delta.delta, "{\"value\":\""))
+                "{\"value\":\""
+            else
+                "{\"value\":\"hello\"}";
+            try std.testing.expectEqualStrings(expected, assistant.content[2].tool_call.arguments_json);
+        },
+        .toolcall_end => {
+            try std.testing.expectEqual(@as(usize, 3), assistant.content.len);
+            try std.testing.expect(assistant.content[2] == .tool_call);
+            try std.testing.expectEqualStrings("tool-1", assistant.content[2].tool_call.id);
+            try std.testing.expectEqualStrings("echo", assistant.content[2].tool_call.name);
+            try std.testing.expectEqualStrings("{\"value\":\"hello\"}", assistant.content[2].tool_call.arguments_json);
+        },
+        else => return error.ExpectedAssistantDeltaEvent,
     }
 }
 
@@ -1590,6 +1757,56 @@ test "agent prompt replays lifecycle events to subscribers before becoming idle"
     agent.unsubscribe(listener_id);
     try agent.promptTextAlloc("again", &.{});
     try std.testing.expectEqual(@as(usize, expected.len), capture.tags.items.len);
+}
+
+// Ported from packages/agent/test/agent.test.ts streaming message state and subscriber visibility.
+test "agent prompt exposes assistant stream partial updates to subscribers" {
+    var stream_context: TestStreamContext = .{};
+    const tools = [_]AgentLoopTool{.{
+        .name = "echo",
+        .label = "Echo",
+        .description = "Echo tool",
+        .parameters_json = "{}",
+        .execute = .{ .call_fn = noopToolExecute },
+    }};
+    var agent = try Agent.initAlloc(std.testing.allocator, .{
+        .initial_state = .{ .tools = &tools },
+        .stream = .{ .ptr = &stream_context, .call_fn = testRichDeltaThenTextStream },
+    });
+    defer agent.deinit();
+
+    var capture: StreamingProjectionCapture = .{ .agent = &agent };
+    defer capture.deinit(std.testing.allocator);
+    _ = try agent.subscribe(.{ .ptr = &capture, .call_fn = captureStreamingProjection });
+
+    try agent.promptTextAlloc("stream rich response", &.{});
+
+    const expected_tags = [_]std.meta.Tag(ai.StreamEvent){
+        .thinking_start,
+        .thinking_delta,
+        .thinking_delta,
+        .thinking_end,
+        .text_start,
+        .text_delta,
+        .text_delta,
+        .text_end,
+        .toolcall_start,
+        .toolcall_delta,
+        .toolcall_delta,
+        .toolcall_end,
+    };
+    try std.testing.expectEqualSlices(std.meta.Tag(ai.StreamEvent), &expected_tags, capture.update_tags.items[0..expected_tags.len]);
+    try std.testing.expect(capture.saw_empty_tool_use_start);
+    try std.testing.expect(capture.saw_final_tool_use_end);
+    try std.testing.expect(agent.waitForIdle());
+    try std.testing.expect(agent.state.streaming_message == null);
+    try std.testing.expectEqual(@as(usize, 2), stream_context.response_count);
+    try std.testing.expectEqual(@as(usize, 4), agent.state.messages.len);
+    try std.testing.expect(agent.state.messages[1] == .assistant);
+    try std.testing.expectEqual(ai.StopReason.tool_use, agent.state.messages[1].assistant.stop_reason);
+    try std.testing.expect(agent.state.messages[2] == .tool_result);
+    try std.testing.expect(agent.state.messages[3] == .assistant);
+    try std.testing.expectEqualStrings("done", agent.state.messages[3].assistant.content[0].text.text);
 }
 
 // Ported from packages/agent/test/agent.test.ts thrown run failure lifecycle.
