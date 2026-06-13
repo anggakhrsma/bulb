@@ -13,6 +13,13 @@ It is generated from the upstream checkout and enriched with
 - `blocked`: cannot be ported yet; the notes column must explain why.
 - `not_applicable`: intentionally excluded; the notes column must explain why.
 
+## Test Strategy
+
+Production feature parity is the active priority. For each feature slice, port
+the smallest upstream-derived tests needed to lock critical behavior and keep
+`zig build test` passing. Full upstream test parity remains a later hardening
+pass, and deferred test groups must stay visible in `parity/status.tsv` notes.
+
 Update `parity/status.tsv`, then regenerate the ledger:
 
 ```sh
@@ -21,4 +28,3 @@ Update `parity/status.tsv`, then regenerate the ledger:
 
 The generated ledger is committed so progress can be reviewed without an
 upstream checkout.
-

@@ -17,6 +17,7 @@ pub const compaction = @import("compaction.zig");
 pub const harness = @import("harness.zig");
 pub const agent_loop = @import("agent_loop.zig");
 pub const agent = @import("agent.zig");
+pub const proxy = @import("proxy.zig");
 
 pub const PromptTemplate = types.PromptTemplate;
 pub const Skill = types.Skill;
@@ -42,6 +43,9 @@ pub const AgentState = agent.AgentState;
 pub const AgentInitialState = agent.AgentInitialState;
 pub const AgentListener = agent.AgentListener;
 pub const PendingMessageQueue = agent.PendingMessageQueue;
+pub const ProxyStreamOptions = proxy.ProxyStreamOptions;
+pub const ProxyTransport = proxy.ProxyTransport;
+pub const streamProxy = proxy.streamProxy;
 
 pub const AgentEventTag = enum {
     agent_start,
@@ -76,4 +80,5 @@ test {
     _ = @import("harness.zig");
     _ = @import("agent_loop.zig");
     _ = @import("agent.zig");
+    _ = @import("proxy.zig");
 }
