@@ -93,6 +93,9 @@ pub const LocalExecutionEnv = struct {
     }
 };
 
+pub const NodeExecutionEnvOptions = LocalExecutionEnvOptions;
+pub const NodeExecutionEnv = LocalExecutionEnv;
+
 fn absolutePath(ptr: ?*anyopaque, allocator: std.mem.Allocator, path: []const u8) !Result([]u8, types.FileError) {
     const self = context(ptr);
     return .{ .ok = try resolvePathAlloc(allocator, self.cwd, path) };
