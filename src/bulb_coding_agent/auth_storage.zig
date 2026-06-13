@@ -929,6 +929,8 @@ test "auth storage resolves stored command values through the shared cache" {
     var storage = try makeTestStorage(allocator, &env, &registry, &resolver);
     defer storage.deinit();
     try storage.setApiKey("anthropic", "!stored-command");
+    config_value.clearConfigValueCache();
+    defer config_value.clearConfigValueCache();
 
     for (0..3) |_| {
         const key = (try storage.getApiKeyAlloc(allocator, "anthropic", .{})).?;
@@ -941,6 +943,44 @@ test "auth storage resolves stored command values through the shared cache" {
     const key = (try storage.getApiKeyAlloc(allocator, "anthropic", .{})).?;
     defer allocator.free(key);
     try std.testing.expectEqualStrings("stored-command", key);
+    try std.testing.expectEqual(@as(usize, 2), runner.calls);
+}
+
+test "auth storage command cache persists across instances" {
+    const allocator = std.testing.allocator;
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    var registry = try ai.oauth.Registry.init(allocator);
+    defer registry.deinit();
+    var runner: TestCommandRunner = .{};
+    var resolver1 = config_value.Resolver.init(allocator, &env);
+    defer resolver1.deinit();
+    resolver1.runner = .{ .ptr = &runner, .run_fn = TestCommandRunner.run };
+    var resolver2 = config_value.Resolver.init(allocator, &env);
+    defer resolver2.deinit();
+    resolver2.runner = .{ .ptr = &runner, .run_fn = TestCommandRunner.run };
+    var storage1 = try makeTestStorage(allocator, &env, &registry, &resolver1);
+    defer storage1.deinit();
+    var storage2 = try makeTestStorage(allocator, &env, &registry, &resolver2);
+    defer storage2.deinit();
+    try storage1.setApiKey("anthropic", "!shared-command");
+    try storage2.setApiKey("anthropic", "!shared-command");
+
+    config_value.clearConfigValueCache();
+    defer config_value.clearConfigValueCache();
+
+    const first = (try storage1.getApiKeyAlloc(allocator, "anthropic", .{})).?;
+    defer allocator.free(first);
+    const second = (try storage2.getApiKeyAlloc(allocator, "anthropic", .{})).?;
+    defer allocator.free(second);
+    try std.testing.expectEqualStrings("shared-command", first);
+    try std.testing.expectEqualStrings("shared-command", second);
+    try std.testing.expectEqual(@as(usize, 1), runner.calls);
+
+    config_value.clearConfigValueCache();
+    const third = (try storage2.getApiKeyAlloc(allocator, "anthropic", .{})).?;
+    defer allocator.free(third);
+    try std.testing.expectEqualStrings("shared-command", third);
     try std.testing.expectEqual(@as(usize, 2), runner.calls);
 }
 

@@ -16,6 +16,32 @@ pub const CommandRunner = struct {
     }
 };
 
+var command_result_cache_storage: std.StringHashMap(?[]u8) = undefined;
+var command_result_cache_initialized = false;
+
+fn commandResultCache() *std.StringHashMap(?[]u8) {
+    if (!command_result_cache_initialized) {
+        command_result_cache_storage = std.StringHashMap(?[]u8).init(std.heap.page_allocator);
+        command_result_cache_initialized = true;
+    }
+    return &command_result_cache_storage;
+}
+
+fn clearCommandResultCache() void {
+    if (!command_result_cache_initialized) return;
+    var iterator = command_result_cache_storage.iterator();
+    while (iterator.next()) |entry| {
+        std.heap.page_allocator.free(entry.key_ptr.*);
+        if (entry.value_ptr.*) |value| std.heap.page_allocator.free(value);
+    }
+    command_result_cache_storage.deinit();
+    command_result_cache_initialized = false;
+}
+
+pub fn clearConfigValueCache() void {
+    clearCommandResultCache();
+}
+
 pub const HeaderInput = struct {
     key: []const u8,
     value: []const u8,
@@ -72,32 +98,21 @@ pub const Resolver = struct {
     allocator: std.mem.Allocator,
     env: *const std.process.Environ.Map,
     runner: CommandRunner = .{},
-    command_cache: std.StringHashMap(?[]u8),
 
     pub fn init(allocator: std.mem.Allocator, env: *const std.process.Environ.Map) Resolver {
         return .{
             .allocator = allocator,
             .env = env,
-            .command_cache = std.StringHashMap(?[]u8).init(allocator),
         };
     }
 
     pub fn deinit(self: *Resolver) void {
-        var iterator = self.command_cache.iterator();
-        while (iterator.next()) |entry| {
-            self.allocator.free(entry.key_ptr.*);
-            if (entry.value_ptr.*) |value| self.allocator.free(value);
-        }
-        self.command_cache.deinit();
+        _ = self;
     }
 
     pub fn clearConfigValueCache(self: *Resolver) void {
-        var iterator = self.command_cache.iterator();
-        while (iterator.next()) |entry| {
-            self.allocator.free(entry.key_ptr.*);
-            if (entry.value_ptr.*) |value| self.allocator.free(value);
-        }
-        self.command_cache.clearRetainingCapacity();
+        _ = self;
+        clearCommandResultCache();
     }
 
     pub fn resolveConfigValueAlloc(
@@ -194,8 +209,9 @@ pub const Resolver = struct {
         allocator: std.mem.Allocator,
         config: []const u8,
     ) !?[]u8 {
-        if (self.command_cache.contains(config)) {
-            const cached = self.command_cache.get(config).?;
+        const cache = commandResultCache();
+        if (cache.contains(config)) {
+            const cached = cache.get(config).?;
             return if (cached) |value| try allocator.dupe(u8, value) else null;
         }
 
@@ -203,9 +219,12 @@ pub const Resolver = struct {
         errdefer if (result) |value| self.allocator.free(value);
         const copy = if (result) |value| try allocator.dupe(u8, value) else null;
         errdefer if (copy) |value| allocator.free(value);
-        const key = try self.allocator.dupe(u8, config);
-        errdefer self.allocator.free(key);
-        try self.command_cache.put(key, result);
+        const key = try std.heap.page_allocator.dupe(u8, config);
+        errdefer std.heap.page_allocator.free(key);
+        const cached_result = if (result) |value| try std.heap.page_allocator.dupe(u8, value) else null;
+        errdefer if (cached_result) |value| std.heap.page_allocator.free(value);
+        try cache.put(key, cached_result);
+        if (result) |value| self.allocator.free(value);
         return copy;
     }
 };
@@ -729,6 +748,8 @@ test "config command results including failures are cached until cleared" {
     var resolver = Resolver.init(allocator, &env);
     defer resolver.deinit();
     resolver.runner = .{ .ptr = &runner, .run_fn = FakeRunner.run };
+    clearConfigValueCache();
+    defer clearConfigValueCache();
 
     for (0..3) |_| {
         const value = (try resolver.resolveConfigValueAlloc(allocator, "!cached")).?;
@@ -742,6 +763,36 @@ test "config command results including failures are cached until cleared" {
     const value = (try resolver.resolveConfigValueAlloc(allocator, "!cached")).?;
     defer allocator.free(value);
     try std.testing.expectEqual(@as(usize, 3), runner.calls);
+}
+
+test "config command results persist across resolver instances until cleared" {
+    const allocator = std.testing.allocator;
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    var runner: FakeRunner = .{};
+    var resolver1 = Resolver.init(allocator, &env);
+    defer resolver1.deinit();
+    resolver1.runner = .{ .ptr = &runner, .run_fn = FakeRunner.run };
+    var resolver2 = Resolver.init(allocator, &env);
+    defer resolver2.deinit();
+    resolver2.runner = .{ .ptr = &runner, .run_fn = FakeRunner.run };
+
+    clearConfigValueCache();
+    defer clearConfigValueCache();
+
+    const first = (try resolver1.resolveConfigValueAlloc(allocator, "!shared-cache")).?;
+    defer allocator.free(first);
+    const second = (try resolver2.resolveConfigValueAlloc(allocator, "!shared-cache")).?;
+    defer allocator.free(second);
+    try std.testing.expectEqualStrings("shared-cache", first);
+    try std.testing.expectEqualStrings("shared-cache", second);
+    try std.testing.expectEqual(@as(usize, 1), runner.calls);
+
+    clearConfigValueCache();
+    const third = (try resolver2.resolveConfigValueAlloc(allocator, "!shared-cache")).?;
+    defer allocator.free(third);
+    try std.testing.expectEqualStrings("shared-cache", third);
+    try std.testing.expectEqual(@as(usize, 2), runner.calls);
 }
 
 test "config value helpers expose environment references and legacy names" {
