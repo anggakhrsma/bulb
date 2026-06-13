@@ -3,6 +3,7 @@ const std = @import("std");
 const agent_session_services = @import("agent_session_services.zig");
 const extensions = @import("extensions/root.zig");
 const paths = @import("paths.zig");
+const resource_loader = @import("resource_loader.zig");
 const session_cwd = @import("session_cwd.zig");
 const session_manager = @import("session_manager.zig");
 const source_info = @import("source_info.zig");
@@ -14,6 +15,7 @@ pub const RuntimeError = error{
     FailedToCreateForkedSession,
     InvalidForkEntry,
     PersistedSessionMissingFile,
+    ReloadUnavailable,
     ReplacedSessionContextUnavailable,
     SessionImportFileNotFound,
 };
@@ -62,6 +64,7 @@ pub const RuntimeSession = struct {
     release_session_manager_fn: ?*const fn (*anyopaque) void = null,
     create_replaced_session_context_fn: ?*const fn (*anyopaque) extensions.ReplacedSessionContext = null,
     refresh_session_context_fn: ?*const fn (*anyopaque) anyerror!void = null,
+    reload_fn: ?*const fn (*anyopaque, RuntimeSessionReloadOptions) anyerror!void = null,
 
     pub fn getSessionFile(self: RuntimeSession) ?[]const u8 {
         return self.get_session_file_fn(self.ptr);
@@ -93,6 +96,16 @@ pub const RuntimeSession = struct {
         const refresh_fn = self.refresh_session_context_fn orelse return;
         try refresh_fn(self.ptr);
     }
+
+    pub fn reload(self: RuntimeSession, options: RuntimeSessionReloadOptions) !void {
+        const reload_fn = self.reload_fn orelse return RuntimeError.ReloadUnavailable;
+        try reload_fn(self.ptr, options);
+    }
+};
+
+pub const RuntimeSessionReloadOptions = struct {
+    services: *agent_session_services.AgentSessionServices,
+    stale_message: []const u8,
 };
 
 pub const RebindSessionCallback = struct {
@@ -418,6 +431,14 @@ pub const AgentSessionRuntime = struct {
         return .{};
     }
 
+    pub fn reload(self: *AgentSessionRuntime) !void {
+        if (!self.active) return;
+        try self.session.reload(.{
+            .services = self.services,
+            .stale_message = stale_session_message,
+        });
+    }
+
     pub fn dispose(self: *AgentSessionRuntime) !void {
         if (!self.active) return;
         try self.teardownCurrent(.quit, null);
@@ -625,6 +646,8 @@ const TestSession = struct {
     manager: ?*session_manager.SessionManager,
     runtime: *extensions.loader.ExtensionRuntimeController,
     runner: *extensions.ExtensionRunner,
+    extension_list: []const extensions.Extension,
+    has_extension_bindings: bool = false,
     disposed: bool = false,
 
     fn init(
@@ -656,6 +679,7 @@ const TestSession = struct {
             .manager = manager,
             .runtime = runtime,
             .runner = runner,
+            .extension_list = extension_list,
         };
         return session;
     }
@@ -678,6 +702,7 @@ const TestSession = struct {
             .dispose_fn = dispose,
             .release_session_manager_fn = releaseSessionManager,
             .create_replaced_session_context_fn = createReplacedSessionContext,
+            .reload_fn = reload,
         };
     }
 
@@ -711,13 +736,209 @@ const TestSession = struct {
         const self: *TestSession = @ptrCast(@alignCast(ptr));
         return .{ .command = .{ .base = self.runner.createContext() catch unreachable } };
     }
+
+    fn reload(ptr: *anyopaque, options: RuntimeSessionReloadOptions) !void {
+        const self: *TestSession = @ptrCast(@alignCast(ptr));
+        const manager = self.manager.?;
+
+        const previous_flags = try cloneFlagEntriesAlloc(self.allocator, self.runner.getFlagValues());
+        defer deinitFlagEntries(self.allocator, previous_flags);
+
+        if (self.runner.hasHandlers(.session_shutdown)) {
+            _ = try self.runner.emit(.{ .session = .{ .shutdown = .{ .reason = .reload } } });
+        }
+        self.runner.invalidate(options.stale_message);
+
+        try options.services.settings_manager.reload();
+        try options.services.model_registry.refresh();
+        try options.services.resource_loader.reload();
+
+        const new_runtime = try self.allocator.create(extensions.loader.ExtensionRuntimeController);
+        errdefer self.allocator.destroy(new_runtime);
+        new_runtime.* = extensions.loader.createExtensionRuntime(self.allocator);
+        errdefer new_runtime.deinit();
+        for (previous_flags) |entry| try new_runtime.setFlagValue(entry.name, entry.value);
+
+        const new_runner = try self.allocator.create(extensions.ExtensionRunner);
+        errdefer self.allocator.destroy(new_runner);
+        new_runner.* = extensions.ExtensionRunner.init(
+            self.allocator,
+            self.extension_list,
+            new_runtime,
+            options.services.cwd,
+            manager,
+            options.services.model_registry,
+        );
+        errdefer new_runner.deinit();
+
+        self.runner.deinit();
+        self.allocator.destroy(self.runner);
+        self.runtime.deinit();
+        self.allocator.destroy(self.runtime);
+        self.runtime = new_runtime;
+        self.runner = new_runner;
+        self.disposed = false;
+
+        if (self.has_extension_bindings) {
+            if (self.runner.hasHandlers(.session_start)) {
+                _ = try self.runner.emit(.{ .session = .{ .start = .{ .reason = .reload } } });
+            }
+            try self.extendResourcesFromExtensions(options.services, .reload);
+        }
+    }
+
+    fn extendResourcesFromExtensions(
+        self: *TestSession,
+        services: *agent_session_services.AgentSessionServices,
+        reason: extensions.types.ResourcesDiscoverReason,
+    ) !void {
+        if (!self.runner.hasHandlers(.resources_discover)) return;
+
+        var discovered = try self.runner.emitResourcesDiscoverAlloc(self.allocator, services.cwd, reason);
+        defer discovered.deinit();
+
+        var skill_entries = try resourceEntriesFromExtensionPathsAlloc(self.allocator, discovered.skill_paths);
+        defer skill_entries.deinit();
+        var prompt_entries = try resourceEntriesFromExtensionPathsAlloc(self.allocator, discovered.prompt_paths);
+        defer prompt_entries.deinit();
+        var theme_entries = try resourceEntriesFromExtensionPathsAlloc(self.allocator, discovered.theme_paths);
+        defer theme_entries.deinit();
+
+        try services.resource_loader.extendResources(.{
+            .skill_paths = skill_entries.entries,
+            .prompt_paths = prompt_entries.entries,
+            .theme_paths = theme_entries.entries,
+        });
+    }
 };
+
+fn cloneFlagEntriesAlloc(
+    allocator: std.mem.Allocator,
+    entries: []const extensions.types.FlagEntry,
+) ![]extensions.types.FlagEntry {
+    const cloned = try allocator.alloc(extensions.types.FlagEntry, entries.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (cloned[0..initialized]) |*entry| {
+            allocator.free(@constCast(entry.name));
+            deinitFlagValue(allocator, &entry.value);
+        }
+        allocator.free(cloned);
+    }
+    for (entries, 0..) |entry, index| {
+        const name = try allocator.dupe(u8, entry.name);
+        errdefer allocator.free(name);
+        cloned[index] = .{
+            .name = name,
+            .value = try cloneFlagValueAlloc(allocator, entry.value),
+        };
+        initialized += 1;
+    }
+    return cloned;
+}
+
+fn cloneFlagValueAlloc(
+    allocator: std.mem.Allocator,
+    value: extensions.types.FlagValue,
+) !extensions.types.FlagValue {
+    return switch (value) {
+        .boolean => |boolean| .{ .boolean = boolean },
+        .string => |string| .{ .string = try allocator.dupe(u8, string) },
+    };
+}
+
+fn deinitFlagEntries(allocator: std.mem.Allocator, entries: []extensions.types.FlagEntry) void {
+    for (entries) |*entry| {
+        allocator.free(@constCast(entry.name));
+        deinitFlagValue(allocator, &entry.value);
+    }
+    allocator.free(entries);
+}
+
+fn deinitFlagValue(allocator: std.mem.Allocator, value: *extensions.types.FlagValue) void {
+    switch (value.*) {
+        .boolean => {},
+        .string => |string| allocator.free(@constCast(string)),
+    }
+    value.* = .{ .boolean = false };
+}
+
+const OwnedResourceEntries = struct {
+    allocator: std.mem.Allocator,
+    entries: []resource_loader.ResourcePathEntry,
+
+    fn deinit(self: *OwnedResourceEntries) void {
+        for (self.entries) |entry| allocatorFreeMetadataSource(self.allocator, entry.metadata.source);
+        self.allocator.free(self.entries);
+        self.* = .{ .allocator = self.allocator, .entries = &.{} };
+    }
+};
+
+fn resourceEntriesFromExtensionPathsAlloc(
+    allocator: std.mem.Allocator,
+    entries: []const extensions.runner.ExtensionResourcePath,
+) !OwnedResourceEntries {
+    const converted = try allocator.alloc(resource_loader.ResourcePathEntry, entries.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (converted[0..initialized]) |entry| allocatorFreeMetadataSource(allocator, entry.metadata.source);
+        allocator.free(converted);
+    }
+    for (entries, 0..) |entry, index| {
+        converted[index] = .{
+            .path = entry.path,
+            .metadata = .{
+                .source = try extensionSourceLabelAlloc(allocator, entry.extension_path),
+                .scope = .temporary,
+                .origin = .top_level,
+                .base_dir = extensionBaseDir(entry.extension_path),
+            },
+        };
+        initialized += 1;
+    }
+    return .{ .allocator = allocator, .entries = converted };
+}
+
+fn extensionSourceLabelAlloc(allocator: std.mem.Allocator, extension_path: []const u8) ![]u8 {
+    if (std.mem.startsWith(u8, extension_path, "<")) {
+        var trimmed: std.ArrayList(u8) = .empty;
+        errdefer trimmed.deinit(allocator);
+        for (extension_path) |byte| {
+            if (byte == '<' or byte == '>') continue;
+            try trimmed.append(allocator, byte);
+        }
+        const inner = try trimmed.toOwnedSlice(allocator);
+        defer allocator.free(inner);
+        return std.fmt.allocPrint(allocator, "extension:{s}", .{inner});
+    }
+
+    const base = std.fs.path.basename(extension_path);
+    const stem = stripKnownExtension(base);
+    return std.fmt.allocPrint(allocator, "extension:{s}", .{stem});
+}
+
+fn stripKnownExtension(base: []const u8) []const u8 {
+    inline for (.{ ".zig", ".ts", ".js" }) |extension| {
+        if (std.mem.endsWith(u8, base, extension)) return base[0 .. base.len - extension.len];
+    }
+    return base;
+}
+
+fn extensionBaseDir(extension_path: []const u8) ?[]const u8 {
+    if (std.mem.startsWith(u8, extension_path, "<")) return null;
+    return std.fs.path.dirname(extension_path);
+}
+
+fn allocatorFreeMetadataSource(allocator: std.mem.Allocator, source: []const u8) void {
+    allocator.free(@constCast(source));
+}
 
 const RuntimeHarness = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     env: std.process.Environ.Map,
     extension_list: []const extensions.Extension,
+    load_prompt_templates: bool = false,
     sessions: std.ArrayList(*TestSession) = .empty,
 
     fn init(
@@ -764,7 +985,7 @@ const RuntimeHarness = struct {
             .resource_loader_options = .{
                 .no_extensions = true,
                 .no_skills = true,
-                .no_prompt_templates = true,
+                .no_prompt_templates = !self.load_prompt_templates,
                 .no_themes = true,
                 .no_context_files = true,
             },
@@ -803,6 +1024,8 @@ const EventRecorder = struct {
     events: std.ArrayList(RecordedEvent) = .empty,
     cancel_next_switch: bool = false,
     cancel_next_fork: bool = false,
+    discovered_prompt_path: ?[]const u8 = null,
+    resources_discover_count: usize = 0,
 
     fn init(allocator: std.mem.Allocator) EventRecorder {
         return .{
@@ -870,6 +1093,16 @@ const EventRecorder = struct {
                 },
                 else => {},
             },
+            .resources_discover => {
+                self.resources_discover_count += 1;
+                const prompt_path = self.discovered_prompt_path orelse return null;
+                const arena_allocator = self.json_arena.allocator();
+                var prompt_paths = std.json.Array.init(arena_allocator);
+                try prompt_paths.append(.{ .string = prompt_path });
+                var object = std.json.Value{ .object = .empty };
+                try object.object.put(arena_allocator, "promptPaths", .{ .array = prompt_paths });
+                return object;
+            },
             else => {},
         }
         return null;
@@ -926,6 +1159,20 @@ fn tempDirPathAlloc(allocator: std.mem.Allocator, tmp: *const std.testing.TmpDir
     const cwd = try std.process.currentPathAlloc(std.testing.io, allocator);
     defer allocator.free(cwd);
     return std.fs.path.join(allocator, &.{ cwd, ".zig-cache", "tmp", tmp.sub_path[0..] });
+}
+
+fn writeJoinedFile(allocator: std.mem.Allocator, parts: []const []const u8, data: []const u8) !void {
+    const file_path = try std.fs.path.join(allocator, parts);
+    defer allocator.free(file_path);
+    if (std.fs.path.dirname(file_path)) |dir| try std.Io.Dir.cwd().createDirPath(std.testing.io, dir);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = file_path, .data = data });
+}
+
+fn findPrompt(prompts: []resource_loader.PromptTemplate, name: []const u8) ?*resource_loader.PromptTemplate {
+    for (prompts) |*prompt| {
+        if (std.mem.eql(u8, prompt.name, name)) return prompt;
+    }
+    return null;
 }
 
 fn createBoxedSessionManager(
@@ -1080,6 +1327,89 @@ test "AgentSessionRuntime emits new and resume lifecycle events" {
     try std.testing.expectEqualStrings(original_session_file, recorder.events.items[1].target_session_file.?);
     try expectRecordedEvent(recorder.events.items[2], "session_start", "resume");
     try std.testing.expectEqualStrings(second_session_file, recorder.events.items[2].previous_session_file.?);
+}
+
+test "AgentSessionRuntime reload refreshes services resources flags and lifecycle" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try tempDirPathAlloc(allocator, &tmp);
+    defer allocator.free(root);
+    const cwd = try std.fs.path.join(allocator, &.{ root, "project" });
+    defer allocator.free(cwd);
+    const agent_dir = try std.fs.path.join(allocator, &.{ root, "agent" });
+    defer allocator.free(agent_dir);
+    const session_dir = try std.fs.path.join(allocator, &.{ root, "sessions" });
+    defer allocator.free(session_dir);
+    const extension_prompt_dir = try std.fs.path.join(allocator, &.{ root, "extension-prompts" });
+    defer allocator.free(extension_prompt_dir);
+    const extension_prompt_path = try std.fs.path.join(allocator, &.{ extension_prompt_dir, "extra.md" });
+    defer allocator.free(extension_prompt_path);
+
+    try std.Io.Dir.cwd().createDirPath(io, cwd);
+    try std.Io.Dir.cwd().createDirPath(io, agent_dir);
+    try writeJoinedFile(allocator, &.{ agent_dir, "prompts", "test.md" }, "---\ndescription: Test prompt\n---\nTest prompt");
+    try writeJoinedFile(allocator, &.{extension_prompt_path}, "---\ndescription: Extra prompt\n---\nExtra prompt");
+
+    var recorder = EventRecorder.init(allocator);
+    recorder.discovered_prompt_path = extension_prompt_path;
+    defer recorder.deinit();
+    const handlers = [_]extensions.ExtensionHandler{
+        .{ .ptr = &recorder, .event_name = .session_start, .handler_fn = EventRecorder.handler },
+        .{ .ptr = &recorder, .event_name = .session_shutdown, .handler_fn = EventRecorder.handler },
+        .{ .ptr = &recorder, .event_name = .resources_discover, .handler_fn = EventRecorder.handler },
+    };
+    const extension_list = [_]extensions.Extension{testExtension("/tmp/runtime-reload.zig", &handlers)};
+    var harness = try RuntimeHarness.init(allocator, io, cwd, &extension_list);
+    harness.load_prompt_templates = true;
+    defer harness.deinit();
+
+    const initial_manager = try createBoxedSessionManager(allocator, io, cwd, session_dir);
+    var runtime = try createAgentSessionRuntime(
+        allocator,
+        io,
+        harness.factory(),
+        .{
+            .cwd = cwd,
+            .agent_dir = agent_dir,
+            .session_manager = initial_manager,
+            .session_start_event = .{ .reason = .startup },
+        },
+    );
+    defer runtime.dispose() catch {};
+
+    try std.testing.expect(findPrompt(runtime.getServices().resource_loader.getPrompts().prompts, "test") != null);
+    try runtime.session.getExtensionRunner().setFlagValue("reload-mode", .{ .string = "sticky" });
+    harness.sessions.items[0].has_extension_bindings = true;
+
+    try writeJoinedFile(allocator, &.{ agent_dir, "settings.json" }, "{\"prompts\":[\"-prompts/test.md\"]}");
+    try runtime.reload();
+
+    try std.testing.expectEqual(@as(usize, 3), recorder.events.items.len);
+    try expectRecordedEvent(recorder.events.items[0], "session_start", "startup");
+    try expectRecordedEvent(recorder.events.items[1], "session_shutdown", "reload");
+    try expectRecordedEvent(recorder.events.items[2], "session_start", "reload");
+    try std.testing.expectEqual(@as(usize, 1), recorder.resources_discover_count);
+
+    const global_prompts = try runtime.getServices().settings_manager.getGlobalPromptTemplatePathsAlloc(allocator);
+    defer {
+        for (global_prompts) |path| allocator.free(@constCast(path));
+        allocator.free(global_prompts);
+    }
+    try std.testing.expectEqual(@as(usize, 1), global_prompts.len);
+    try std.testing.expectEqualStrings("-prompts/test.md", global_prompts[0]);
+
+    const prompts = runtime.getServices().resource_loader.getPrompts().prompts;
+    try std.testing.expect(findPrompt(prompts, "test") == null);
+    const extension_prompt = findPrompt(prompts, "extra").?;
+    try std.testing.expectEqualStrings("extension:runtime-reload", extension_prompt.source_info.source);
+
+    const flags = runtime.session.getExtensionRunner().getFlagValues();
+    try std.testing.expectEqual(@as(usize, 1), flags.len);
+    try std.testing.expectEqualStrings("reload-mode", flags[0].name);
+    try std.testing.expectEqualStrings("sticky", flags[0].value.string);
 }
 
 test "AgentSessionRuntime honors session_before_switch cancellation" {

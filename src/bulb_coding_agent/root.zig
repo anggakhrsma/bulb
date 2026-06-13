@@ -85,6 +85,7 @@ pub const CreateAgentSessionRuntimeOptions = agent_session_runtime.CreateAgentSe
 pub const CreateAgentSessionRuntimeResult = agent_session_runtime.CreateAgentSessionRuntimeResult;
 pub const RebindSessionCallback = agent_session_runtime.RebindSessionCallback;
 pub const RuntimeSession = agent_session_runtime.RuntimeSession;
+pub const RuntimeSessionReloadOptions = agent_session_runtime.RuntimeSessionReloadOptions;
 pub const SessionChangeResult = agent_session_runtime.SessionChangeResult;
 pub const SwitchSessionOptions = agent_session_runtime.SwitchSessionOptions;
 pub const createAgentSessionRuntime = agent_session_runtime.createAgentSessionRuntime;
