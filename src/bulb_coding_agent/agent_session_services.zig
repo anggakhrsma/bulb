@@ -4,6 +4,7 @@ const ai = @import("bulb_ai");
 const auth_storage = @import("auth_storage.zig");
 const config = @import("config.zig");
 const config_value = @import("resolve_config_value.zig");
+const migrations = @import("migrations.zig");
 const extensions = @import("extensions/root.zig");
 const model_registry = @import("model_registry.zig");
 const paths = @import("paths.zig");
@@ -146,6 +147,9 @@ pub fn createAgentSessionServicesAlloc(
     const resolved_agent_dir = try resolveAgentDirAlloc(allocator, options.agent_dir, env.ptr);
     errdefer allocator.free(resolved_agent_dir);
 
+    var startup_migrations = try migrations.runStartupMigrationsAlloc(allocator, resolved_cwd, resolved_agent_dir);
+    errdefer startup_migrations.deinit(allocator);
+
     const oauth_registry = try resolveOAuthRegistry(allocator, options.auth_storage);
     errdefer if (oauth_registry.owned) |owned_registry| {
         owned_registry.deinit();
@@ -158,7 +162,14 @@ pub fn createAgentSessionServicesAlloc(
         allocator.destroy(owned_resolver);
     };
 
-    const auth = try resolveAuthStorage(allocator, options.auth_storage, env.ptr, oauth_registry.ptr, resolver.ptr);
+    const auth = try resolveAuthStorage(
+        allocator,
+        options.auth_storage,
+        resolved_agent_dir,
+        env.ptr,
+        oauth_registry.ptr,
+        resolver.ptr,
+    );
     errdefer if (auth.owned) |owned_auth| {
         owned_auth.deinit();
         allocator.destroy(owned_auth);
@@ -189,6 +200,14 @@ pub fn createAgentSessionServicesAlloc(
     errdefer {
         deinitDiagnosticMessages(allocator, diagnostics.items);
         diagnostics.deinit(allocator);
+    }
+
+    if (startup_migrations.config_value_migrations.items.len > 0) {
+        const warning = try migrations.formatConfigValueMigrationWarningAlloc(
+            allocator,
+            startup_migrations.config_value_migrations.items,
+        );
+        try appendDiagnostic(allocator, &diagnostics, .warning, warning);
     }
 
     if (options.extension_runtime) |runtime| {
@@ -285,6 +304,7 @@ const AuthStorageRef = struct {
 fn resolveAuthStorage(
     allocator: std.mem.Allocator,
     injected: ?*auth_storage.AuthStorage,
+    agent_dir: []const u8,
     env: *const std.process.Environ.Map,
     oauth_registry: *ai.oauth.Registry,
     resolver: *config_value.Resolver,
@@ -292,7 +312,9 @@ fn resolveAuthStorage(
     if (injected) |auth| return .{ .ptr = auth };
     const auth = try allocator.create(auth_storage.AuthStorage);
     errdefer allocator.destroy(auth);
-    auth.* = try auth_storage.AuthStorage.initMemory(allocator, env, oauth_registry, resolver);
+    const auth_path = try std.fs.path.join(allocator, &.{ agent_dir, "auth.json" });
+    defer allocator.free(auth_path);
+    auth.* = try auth_storage.AuthStorage.initFile(allocator, env, oauth_registry, resolver, auth_path);
     return .{ .ptr = auth, .owned = auth };
 }
 
@@ -620,6 +642,69 @@ test "createAgentSessionServices owns cwd-bound services and resolves Bulb agent
     try std.testing.expect(services.owns_settings_manager);
     try std.testing.expect(services.owns_model_registry);
     try std.testing.expectEqual(@as(usize, 0), services.diagnostics.len);
+}
+
+test "createAgentSessionServices runs startup migrations for legacy auth files" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try tempDirPathAlloc(allocator, &tmp);
+    defer allocator.free(cwd);
+    const agent_dir = try std.fs.path.join(allocator, &.{ cwd, "agent-home" });
+    defer allocator.free(agent_dir);
+    try std.Io.Dir.cwd().createDirPath(io, agent_dir);
+
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "agent-home/oauth.json",
+        .data =
+        \\{
+        \\  "anthropic": {
+        \\    "access": "ACCESS_TOKEN",
+        \\    "refresh": "REFRESH_TOKEN",
+        \\    "expires": 1
+        \\  }
+        \\}
+        ,
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "agent-home/settings.json",
+        .data =
+        \\{
+        \\  "apiKeys": {
+        \\    "openai": "openai-secret"
+        \\  }
+        \\}
+        ,
+    });
+
+    var env = try testEnv(allocator, cwd);
+    defer env.deinit();
+    try env.put(config.agent_dir_env, agent_dir);
+
+    var services = try createAgentSessionServicesAlloc(allocator, io, .{
+        .cwd = cwd,
+        .env = &env,
+        .resource_loader_options = .{
+            .no_extensions = true,
+            .no_skills = true,
+            .no_prompt_templates = true,
+            .no_themes = true,
+            .no_context_files = true,
+        },
+    });
+    defer services.deinit();
+
+    const anth_status = try services.auth_storage.getAuthStatus("anthropic");
+    try std.testing.expect(anth_status.configured);
+    try std.testing.expectEqual(auth_storage.AuthSource.stored, anth_status.source.?);
+    try std.testing.expect(services.auth_storage.has("openai"));
+    try std.testing.expectEqual(@as(usize, 0), services.diagnostics.len);
+
+    const migrated_oauth_path = try std.fs.path.join(allocator, &.{ agent_dir, "oauth.json.migrated" });
+    defer allocator.free(migrated_oauth_path);
+    try std.Io.Dir.cwd().access(io, migrated_oauth_path, .{});
 }
 
 test "createAgentSessionServices applies extension flag values and reports unknown flags" {
