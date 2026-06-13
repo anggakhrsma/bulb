@@ -4,10 +4,12 @@ const coding_agent = @import("bulb_coding_agent");
 const build_options = @import("build_options");
 
 pub fn main(init: std.process.Init) !void {
+    const allocator = init.arena.allocator();
+    _ = try coding_agent.restoreSandboxEnv(allocator, init.io, init.environ_map);
+
     coding_agent.tui.keys.setProcessEnvironment(init.environ_map);
     coding_agent.tui.terminal_image.setProcessEnvironment(init.environ_map);
 
-    const allocator = init.arena.allocator();
     const process_args = try init.minimal.args.toSlice(allocator);
     const argv = if (process_args.len > 1) process_args[1..] else &.{};
     var parsed = try coding_agent.cli_args.parseArgs(allocator, argv);

@@ -401,7 +401,7 @@ packages/coding-agent/package.json	bulb_coding_agent	source	pending
 packages/coding-agent/scripts/migrate-sessions.sh	bulb_coding_agent	source	pending		
 packages/coding-agent/src/bun/cli.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/bun/register-bedrock.ts	bulb_coding_agent	source	pending		
-packages/coding-agent/src/bun/restore-sandbox-env.ts	bulb_coding_agent	source	pending		
+packages/coding-agent/src/bun/restore-sandbox-env.ts	bulb_coding_agent	source	implemented	src/bulb_coding_agent/restore_sandbox_env.zig	Native Linux /proc/self/environ restoration for unexpectedly empty process env maps wired into bulb startup; Bun runtime guard intentionally translated away because Bulb is native Zig
 packages/coding-agent/src/cli.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/cli/args.ts	bulb_coding_agent	source	implemented	src/bulb_coding_agent/cli_args.zig	Native CLI argument parser, value flags, diagnostics, unknown extension flags, list-models/search, read-only session-reservation helper, and Bulb help/environment text ported
 packages/coding-agent/src/cli/config-selector.ts	bulb_coding_agent	source	pending		
@@ -645,7 +645,7 @@ packages/coding-agent/test/plan-mode-utils.test.ts	bulb_coding_agent	test	implem
 packages/coding-agent/test/print-mode.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/prompt-templates.test.ts	bulb_coding_agent	test	implemented	src/bulb_coding_agent/prompt_templates.zig	Upstream positional, wildcard, non-recursive, slice, quote, whitespace, Unicode, multiline expansion, and argument-hint frontmatter regressions ported
 packages/coding-agent/test/resource-loader.test.ts	bulb_coding_agent	test	in_progress	src/bulb_coding_agent/resource_loader.zig	No-extension DefaultResourceLoader coverage translated: initial empty state, skill/prompt/theme discovery, project-over-user collisions, settings override disables, context file discovery/noContextFiles, Bulb SYSTEM/APPEND_SYSTEM prompts, noSkills, and extension resource metadata/file URL injection; native extension conflict/runner cases remain
-packages/coding-agent/test/restore-sandbox-env.test.ts	bulb_coding_agent	test	pending		
+packages/coding-agent/test/restore-sandbox-env.test.ts	bulb_coding_agent	test	implemented	src/bulb_coding_agent/restore_sandbox_env.zig	Focused upstream behavior tests ported for no-op with existing env, non-Linux no-op, malformed entries, empty values, and /proc-style null-delimited restoration
 packages/coding-agent/test/rpc-client-clone.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/rpc-client-process-exit.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/rpc-example.ts	bulb_coding_agent	test	pending		
