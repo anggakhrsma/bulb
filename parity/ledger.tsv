@@ -405,7 +405,7 @@ packages/coding-agent/src/bun/restore-sandbox-env.ts	bulb_coding_agent	source	im
 packages/coding-agent/src/cli.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/cli/args.ts	bulb_coding_agent	source	implemented	src/bulb_coding_agent/cli_args.zig	Native CLI argument parser, value flags, diagnostics, unknown extension flags, list-models/search, read-only session-reservation helper, and Bulb help/environment text ported
 packages/coding-agent/src/cli/config-selector.ts	bulb_coding_agent	source	pending		
-packages/coding-agent/src/cli/file-processor.ts	bulb_coding_agent	source	pending		
+packages/coding-agent/src/cli/file-processor.ts	bulb_coding_agent	source	in_progress	src/bulb_coding_agent/file_processor.zig	Native @file argument processor for text files, empty-file skipping, supported image MIME detection, base64 image attachments, missing-file errors, resize callback contract, dimension-note formatting, and resize-failure omission ported; default native image resizing remains pending with utils/image-resize
 packages/coding-agent/src/cli/initial-message.ts	bulb_coding_agent	source	implemented	src/bulb_coding_agent/initial_message.zig	Native stdin file-text and first CLI message merge helper ported with borrowed file-image passthrough
 packages/coding-agent/src/cli/list-models.ts	bulb_coding_agent	source	implemented	src/bulb_coding_agent/list_models.zig	Native auth-aware --list-models renderer with models.json warnings, no-auth guidance, fuzzy search, sorted fixed-width provider/model table, token abbreviations, and focused CLI behavior tests
 packages/coding-agent/src/cli/session-picker.ts	bulb_coding_agent	source	pending		
