@@ -522,7 +522,7 @@ packages/coding-agent/src/modes/interactive/theme/light.json	bulb_coding_agent	s
 packages/coding-agent/src/modes/interactive/theme/theme-schema.json	bulb_coding_agent	source	pending		
 packages/coding-agent/src/modes/interactive/theme/theme.ts	bulb_coding_agent	source	in_progress	src/bulb_coding_agent/theme.zig	Native theme JSON loading started with name/colors validation, source metadata, and built-in/registered theme-name validation for resource loader and extension setTheme parity; full color resolution, ANSI rendering, watcher lifecycle, and TUI integration remain
 packages/coding-agent/src/modes/print-mode.ts	bulb_coding_agent	source	pending		
-packages/coding-agent/src/modes/rpc/jsonl.ts	bulb_coding_agent	source	pending		
+packages/coding-agent/src/modes/rpc/jsonl.ts	bulb_coding_agent	source	implemented	src/bulb_coding_agent/rpc_jsonl.zig	Native strict-LF JSONL serializer and incremental line reader with CRLF trimming and final partial-line flush ported; RPC client and mode wiring remain later
 packages/coding-agent/src/modes/rpc/rpc-client.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/modes/rpc/rpc-mode.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/modes/rpc/rpc-types.ts	bulb_coding_agent	source	pending		
@@ -649,7 +649,7 @@ packages/coding-agent/test/restore-sandbox-env.test.ts	bulb_coding_agent	test	im
 packages/coding-agent/test/rpc-client-clone.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/rpc-client-process-exit.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/rpc-example.ts	bulb_coding_agent	test	pending		
-packages/coding-agent/test/rpc-jsonl.test.ts	bulb_coding_agent	test	pending		
+packages/coding-agent/test/rpc-jsonl.test.ts	bulb_coding_agent	test	implemented	src/bulb_coding_agent/rpc_jsonl.zig	Minimal Unicode-separator, CRLF, and final partial-line regression coverage ported
 packages/coding-agent/test/rpc-prompt-response-semantics.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/rpc.test.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/sdk-codex-cache-probe-tool-loop.ts	bulb_coding_agent	test	pending		
