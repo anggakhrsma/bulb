@@ -522,8 +522,8 @@ packages/coding-agent/src/modes/interactive/theme/light.json	bulb_coding_agent	s
 packages/coding-agent/src/modes/interactive/theme/theme-schema.json	bulb_coding_agent	source	pending		
 packages/coding-agent/src/modes/interactive/theme/theme.ts	bulb_coding_agent	source	in_progress	src/bulb_coding_agent/theme.zig	Native theme JSON loading started with name/colors validation, source metadata, and built-in/registered theme-name validation for resource loader and extension setTheme parity; full color resolution, ANSI rendering, watcher lifecycle, and TUI integration remain
 packages/coding-agent/src/modes/print-mode.ts	bulb_coding_agent	source	pending		
-packages/coding-agent/src/modes/rpc/jsonl.ts	bulb_coding_agent	source	implemented	src/bulb_coding_agent/rpc_jsonl.zig	Native strict-LF JSONL serializer and incremental line reader with CRLF trimming and final partial-line flush ported; RPC client and mode wiring remain later
-packages/coding-agent/src/modes/rpc/rpc-client.ts	bulb_coding_agent	source	pending		
+packages/coding-agent/src/modes/rpc/jsonl.ts	bulb_coding_agent	source	implemented	src/bulb_coding_agent/rpc_jsonl.zig	Native strict-LF JSONL serializer and incremental line reader with CRLF trimming and final partial-line flush ported; full RPC mode wiring remains later
+packages/coding-agent/src/modes/rpc/rpc-client.ts	bulb_coding_agent	source	in_progress	src/bulb_coding_agent/rpc_client.zig	Native sequential RPC client started with bulb --mode rpc spawning, provider/model/extra argv forwarding, LF-framed request serialization, response matching, clone command, raw get_commands response helper, process-exit diagnostics, and focused clone/process-exit regressions; full typed command surface, background event pump, prompt wait helpers, and stderr capture remain
 packages/coding-agent/src/modes/rpc/rpc-mode.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/modes/rpc/rpc-types.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/package-manager-cli.ts	bulb_coding_agent	source	pending		
@@ -646,8 +646,8 @@ packages/coding-agent/test/print-mode.test.ts	bulb_coding_agent	test	pending
 packages/coding-agent/test/prompt-templates.test.ts	bulb_coding_agent	test	implemented	src/bulb_coding_agent/prompt_templates.zig	Upstream positional, wildcard, non-recursive, slice, quote, whitespace, Unicode, multiline expansion, and argument-hint frontmatter regressions ported
 packages/coding-agent/test/resource-loader.test.ts	bulb_coding_agent	test	in_progress	src/bulb_coding_agent/resource_loader.zig	No-extension DefaultResourceLoader coverage translated: initial empty state, skill/prompt/theme discovery, project-over-user collisions, settings override disables, context file discovery/noContextFiles, Bulb SYSTEM/APPEND_SYSTEM prompts, noSkills, and extension resource metadata/file URL injection; native extension conflict/runner cases remain
 packages/coding-agent/test/restore-sandbox-env.test.ts	bulb_coding_agent	test	implemented	src/bulb_coding_agent/restore_sandbox_env.zig	Focused upstream behavior tests ported for no-op with existing env, non-Linux no-op, malformed entries, empty values, and /proc-style null-delimited restoration
-packages/coding-agent/test/rpc-client-clone.test.ts	bulb_coding_agent	test	pending		
-packages/coding-agent/test/rpc-client-process-exit.test.ts	bulb_coding_agent	test	pending		
+packages/coding-agent/test/rpc-client-clone.test.ts	bulb_coding_agent	test	implemented	src/bulb_coding_agent/rpc_client.zig	Upstream clone RPC command regression ported with a native executable JSONL fixture
+packages/coding-agent/test/rpc-client-process-exit.test.ts	bulb_coding_agent	test	implemented	src/bulb_coding_agent/rpc_client.zig	Upstream in-flight child process exit rejection regression ported with native process spawning and exit-code diagnostics
 packages/coding-agent/test/rpc-example.ts	bulb_coding_agent	test	pending		
 packages/coding-agent/test/rpc-jsonl.test.ts	bulb_coding_agent	test	implemented	src/bulb_coding_agent/rpc_jsonl.zig	Minimal Unicode-separator, CRLF, and final partial-line regression coverage ported
 packages/coding-agent/test/rpc-prompt-response-semantics.test.ts	bulb_coding_agent	test	pending		
