@@ -1,5 +1,8 @@
 const std = @import("std");
 const ai = @import("bulb_ai");
+const messages = @import("messages.zig");
+const session_manager = @import("session_manager.zig");
+const session_stats = @import("session_stats.zig");
 
 pub const QueueMode = enum {
     all,
@@ -191,6 +194,90 @@ pub fn emptyMessagesDataJsonAlloc(allocator: std.mem.Allocator) ![]u8 {
     return allocator.dupe(u8, "{\"messages\":[]}");
 }
 
+pub fn messagesDataJsonAlloc(
+    allocator: std.mem.Allocator,
+    values: []const messages.CodingAgentMessage,
+) ![]u8 {
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(allocator);
+    try output.appendSlice(allocator, "{\"messages\":[");
+    for (values, 0..) |message, index| {
+        if (index > 0) try output.append(allocator, ',');
+        const json = try messageJsonAlloc(allocator, message);
+        defer allocator.free(json);
+        try output.appendSlice(allocator, json);
+    }
+    try output.appendSlice(allocator, "]}");
+    return output.toOwnedSlice(allocator);
+}
+
+fn messageJsonAlloc(
+    allocator: std.mem.Allocator,
+    message: messages.CodingAgentMessage,
+) ![]u8 {
+    return switch (message) {
+        .branch_summary => |summary| branchSummaryMessageJsonAlloc(allocator, summary),
+        .compaction_summary => |summary| compactionSummaryMessageJsonAlloc(allocator, summary),
+        else => session_manager.codingAgentMessageJsonAlloc(allocator, message),
+    };
+}
+
+fn branchSummaryMessageJsonAlloc(
+    allocator: std.mem.Allocator,
+    message: messages.BranchSummaryMessage,
+) ![]u8 {
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(allocator);
+    try output.append(allocator, '{');
+    var first = true;
+    try appendStringField(allocator, &output, &first, "role", "branchSummary");
+    try appendStringField(allocator, &output, &first, "summary", message.summary);
+    try appendStringField(allocator, &output, &first, "fromId", message.from_id);
+    try appendSignedField(allocator, &output, &first, "timestamp", message.timestamp_ms);
+    try output.append(allocator, '}');
+    return output.toOwnedSlice(allocator);
+}
+
+fn compactionSummaryMessageJsonAlloc(
+    allocator: std.mem.Allocator,
+    message: messages.CompactionSummaryMessage,
+) ![]u8 {
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(allocator);
+    try output.append(allocator, '{');
+    var first = true;
+    try appendStringField(allocator, &output, &first, "role", "compactionSummary");
+    try appendStringField(allocator, &output, &first, "summary", message.summary);
+    try appendUnsignedField(allocator, &output, &first, "tokensBefore", message.tokens_before);
+    try appendSignedField(allocator, &output, &first, "timestamp", message.timestamp_ms);
+    try output.append(allocator, '}');
+    return output.toOwnedSlice(allocator);
+}
+
+pub const ForkMessage = struct {
+    entry_id: []const u8,
+    text: []const u8,
+};
+
+pub fn forkMessagesDataJsonAlloc(
+    allocator: std.mem.Allocator,
+    values: []const ForkMessage,
+) ![]u8 {
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(allocator);
+    try output.appendSlice(allocator, "{\"messages\":[");
+    for (values, 0..) |message, index| {
+        if (index > 0) try output.append(allocator, ',');
+        try output.append(allocator, '{');
+        var first = true;
+        try appendStringField(allocator, &output, &first, "entryId", message.entry_id);
+        try appendStringField(allocator, &output, &first, "text", message.text);
+        try output.append(allocator, '}');
+    }
+    try output.appendSlice(allocator, "]}");
+    return output.toOwnedSlice(allocator);
+}
+
 pub fn lastAssistantTextDataJsonAlloc(allocator: std.mem.Allocator, text: ?[]const u8) ![]u8 {
     var output: std.ArrayList(u8) = .empty;
     errdefer output.deinit(allocator);
@@ -204,20 +291,40 @@ pub fn lastAssistantTextDataJsonAlloc(allocator: std.mem.Allocator, text: ?[]con
     return output.toOwnedSlice(allocator);
 }
 
-pub fn sessionStatsDataJsonAlloc(allocator: std.mem.Allocator, state: RpcSessionState) ![]u8 {
+pub fn sessionStatsDataJsonAlloc(
+    allocator: std.mem.Allocator,
+    stats: session_stats.SessionStats,
+) ![]u8 {
     var output: std.ArrayList(u8) = .empty;
     errdefer output.deinit(allocator);
     try output.append(allocator, '{');
     var first = true;
-    if (state.session_file) |session_file| try appendStringField(allocator, &output, &first, "sessionFile", session_file);
-    try appendStringField(allocator, &output, &first, "sessionId", state.session_id);
-    try appendUnsignedField(allocator, &output, &first, "userMessages", 0);
-    try appendUnsignedField(allocator, &output, &first, "assistantMessages", 0);
-    try appendUnsignedField(allocator, &output, &first, "toolCalls", 0);
-    try appendUnsignedField(allocator, &output, &first, "toolResults", 0);
-    try appendUnsignedField(allocator, &output, &first, "totalMessages", state.message_count);
-    try appendRawField(allocator, &output, &first, "tokens", "{\"input\":0,\"output\":0,\"cacheRead\":0,\"cacheWrite\":0,\"total\":0}");
-    try appendRawField(allocator, &output, &first, "cost", "0");
+    if (stats.session_file) |session_file| try appendStringField(allocator, &output, &first, "sessionFile", session_file);
+    try appendStringField(allocator, &output, &first, "sessionId", stats.session_id);
+    try appendUnsignedField(allocator, &output, &first, "userMessages", stats.user_messages);
+    try appendUnsignedField(allocator, &output, &first, "assistantMessages", stats.assistant_messages);
+    try appendUnsignedField(allocator, &output, &first, "toolCalls", stats.tool_calls);
+    try appendUnsignedField(allocator, &output, &first, "toolResults", stats.tool_results);
+    try appendUnsignedField(allocator, &output, &first, "totalMessages", stats.total_messages);
+    try fieldPrefix(allocator, &output, &first, "tokens");
+    try output.append(allocator, '{');
+    var tokens_first = true;
+    try appendUnsignedField(allocator, &output, &tokens_first, "input", stats.tokens.input);
+    try appendUnsignedField(allocator, &output, &tokens_first, "output", stats.tokens.output);
+    try appendUnsignedField(allocator, &output, &tokens_first, "cacheRead", stats.tokens.cache_read);
+    try appendUnsignedField(allocator, &output, &tokens_first, "cacheWrite", stats.tokens.cache_write);
+    try appendUnsignedField(allocator, &output, &tokens_first, "total", stats.tokens.total);
+    try output.append(allocator, '}');
+    try appendFloatField(allocator, &output, &first, "cost", stats.cost);
+    if (stats.context_usage) |usage| {
+        try fieldPrefix(allocator, &output, &first, "contextUsage");
+        try output.append(allocator, '{');
+        var usage_first = true;
+        try appendOptionalUnsignedField(allocator, &output, &usage_first, "tokens", usage.tokens);
+        try appendUnsignedField(allocator, &output, &usage_first, "contextWindow", usage.context_window);
+        try appendOptionalFloatField(allocator, &output, &usage_first, "percent", usage.percent);
+        try output.append(allocator, '}');
+    }
     try output.append(allocator, '}');
     return output.toOwnedSlice(allocator);
 }
@@ -396,6 +503,17 @@ fn appendUnsignedField(
     try output.print(allocator, "{d}", .{value});
 }
 
+fn appendSignedField(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(u8),
+    first: *bool,
+    key: []const u8,
+    value: i64,
+) !void {
+    try fieldPrefix(allocator, output, first, key);
+    try output.print(allocator, "{d}", .{value});
+}
+
 fn appendFloatField(
     allocator: std.mem.Allocator,
     output: *std.ArrayList(u8),
@@ -405,6 +523,34 @@ fn appendFloatField(
 ) !void {
     try fieldPrefix(allocator, output, first, key);
     try appendJsonValueAlloc(allocator, output, value);
+}
+
+fn appendOptionalUnsignedField(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(u8),
+    first: *bool,
+    key: []const u8,
+    value: ?u64,
+) !void {
+    if (value) |number| {
+        try appendUnsignedField(allocator, output, first, key, number);
+    } else {
+        try appendRawField(allocator, output, first, key, "null");
+    }
+}
+
+fn appendOptionalFloatField(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(u8),
+    first: *bool,
+    key: []const u8,
+    value: ?f64,
+) !void {
+    if (value) |number| {
+        try appendFloatField(allocator, output, first, key, number);
+    } else {
+        try appendRawField(allocator, output, first, key, "null");
+    }
 }
 
 fn appendJsonOrStringField(
@@ -550,4 +696,31 @@ test "RPC model JSON uses Pi-compatible camelCase fields" {
     try std.testing.expectEqualStrings("yes", object.get("headers").?.object.get("X-Test").?.string);
     try std.testing.expectEqual(false, object.get("compat").?.object.get("supportsUsageInStreaming").?.bool);
     try std.testing.expectEqualStrings("max_completion_tokens", object.get("compat").?.object.get("maxTokensField").?.string);
+}
+
+test "RPC message JSON serializes context-only summary roles" {
+    const allocator = std.testing.allocator;
+    const values = [_]messages.CodingAgentMessage{
+        .{ .branch_summary = .{
+            .summary = "alternate branch",
+            .from_id = "entry-1",
+            .timestamp_ms = 10,
+        } },
+        .{ .compaction_summary = .{
+            .summary = "old context",
+            .tokens_before = 123,
+            .timestamp_ms = 20,
+        } },
+    };
+
+    const json = try messagesDataJsonAlloc(allocator, &values);
+    defer allocator.free(json);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+    const array = parsed.value.object.get("messages").?.array.items;
+    try std.testing.expectEqualStrings("branchSummary", array[0].object.get("role").?.string);
+    try std.testing.expectEqualStrings("entry-1", array[0].object.get("fromId").?.string);
+    try std.testing.expectEqualStrings("compactionSummary", array[1].object.get("role").?.string);
+    try std.testing.expectEqual(@as(i64, 123), array[1].object.get("tokensBefore").?.integer);
 }

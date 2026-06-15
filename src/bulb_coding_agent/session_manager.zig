@@ -2435,7 +2435,7 @@ fn messageEntryJsonAlloc(
     return output.toOwnedSlice();
 }
 
-fn codingAgentMessageJsonAlloc(
+pub fn codingAgentMessageJsonAlloc(
     allocator: std.mem.Allocator,
     message: messages_mod.CodingAgentMessage,
 ) ![]u8 {

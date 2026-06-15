@@ -3,6 +3,8 @@ const std = @import("std");
 const ai = @import("bulb_ai");
 const model_registry = @import("model_registry.zig");
 const rpc_types = @import("rpc_types.zig");
+const session_manager = @import("session_manager.zig");
+const session_stats = @import("session_stats.zig");
 
 const stdin_buffer_bytes = 64 * 1024;
 const max_rpc_jsonl_line_bytes = 16 * 1024 * 1024;
@@ -11,6 +13,7 @@ const default_session_id = "rpc-session";
 pub const RpcModeOptions = struct {
     io: ?std.Io = null,
     model_registry: ?*model_registry.ModelRegistry = null,
+    session_manager: ?*session_manager.SessionManager = null,
     initial_model: ?*const ai.Model = null,
     static_models: []const ai.Model = &.{},
     thinking_level: ai.ThinkingLevel = .medium,
@@ -21,6 +24,7 @@ pub const RpcMode = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     model_registry: ?*model_registry.ModelRegistry,
+    session_manager: ?*session_manager.SessionManager,
     static_models: []const ai.Model,
     state: rpc_types.RpcSessionState,
     auto_retry_enabled: bool = true,
@@ -31,11 +35,13 @@ pub const RpcMode = struct {
             .allocator = allocator,
             .io = options.io orelse std.Io.Threaded.global_single_threaded.io(),
             .model_registry = options.model_registry,
+            .session_manager = options.session_manager,
             .static_models = options.static_models,
             .state = .{
                 .model = options.initial_model,
                 .thinking_level = options.thinking_level,
-                .session_id = options.session_id,
+                .session_file = if (options.session_manager) |manager| manager.getSessionFile() else null,
+                .session_id = if (options.session_manager) |manager| manager.getSessionId() else options.session_id,
             },
         };
     }
@@ -100,6 +106,7 @@ pub const RpcMode = struct {
         object: std.json.ObjectMap,
     ) ![]u8 {
         if (std.mem.eql(u8, command_type, "get_state")) {
+            try self.refreshSessionState();
             const data = try rpc_types.stateDataJsonAlloc(self.allocator, self.state);
             defer self.allocator.free(data);
             return rpc_types.successLineAlloc(self.allocator, id, "get_state", data);
@@ -124,6 +131,11 @@ pub const RpcMode = struct {
                 return rpc_types.errorLineAlloc(self.allocator, id, "set_model", message);
             };
             self.state.model = model;
+            if (self.session_manager) |manager| {
+                _ = manager.appendModelChange(self.io, model.provider, model.id) catch |err| {
+                    return self.commandErrorLineAlloc(id, "set_model", err);
+                };
+            }
             const data = try rpc_types.modelDataJsonAlloc(self.allocator, model.*);
             defer self.allocator.free(data);
             return rpc_types.successLineAlloc(self.allocator, id, "set_model", data);
@@ -131,6 +143,13 @@ pub const RpcMode = struct {
 
         if (std.mem.eql(u8, command_type, "cycle_model")) {
             const model = try self.cycleModel();
+            if (model) |selected| {
+                if (self.session_manager) |manager| {
+                    _ = manager.appendModelChange(self.io, selected.provider, selected.id) catch |err| {
+                        return self.commandErrorLineAlloc(id, "cycle_model", err);
+                    };
+                }
+            }
             const data = try rpc_types.cycleModelDataJsonAlloc(self.allocator, model, self.state.thinking_level);
             defer self.allocator.free(data);
             return rpc_types.successLineAlloc(self.allocator, id, "cycle_model", data);
@@ -145,11 +164,23 @@ pub const RpcMode = struct {
                 defer self.allocator.free(message);
                 return rpc_types.errorLineAlloc(self.allocator, id, "set_thinking_level", message);
             };
+            if (self.session_manager) |manager| {
+                _ = manager.appendThinkingLevelChange(
+                    self.io,
+                    rpc_types.thinkingLevelName(self.state.thinking_level),
+                ) catch |err| return self.commandErrorLineAlloc(id, "set_thinking_level", err);
+            }
             return rpc_types.successLineAlloc(self.allocator, id, "set_thinking_level", null);
         }
 
         if (std.mem.eql(u8, command_type, "cycle_thinking_level")) {
             self.state.thinking_level = nextThinkingLevel(self.state.thinking_level);
+            if (self.session_manager) |manager| {
+                _ = manager.appendThinkingLevelChange(
+                    self.io,
+                    rpc_types.thinkingLevelName(self.state.thinking_level),
+                ) catch |err| return self.commandErrorLineAlloc(id, "cycle_thinking_level", err);
+            }
             const data = try rpc_types.levelDataJsonAlloc(self.allocator, self.state.thinking_level);
             defer self.allocator.free(data);
             return rpc_types.successLineAlloc(self.allocator, id, "cycle_thinking_level", data);
@@ -201,25 +232,50 @@ pub const RpcMode = struct {
         }
 
         if (std.mem.eql(u8, command_type, "get_session_stats")) {
-            const data = try rpc_types.sessionStatsDataJsonAlloc(self.allocator, self.state);
+            const manager = self.session_manager orelse
+                return self.sessionRuntimeRequiredLineAlloc(id, "get_session_stats");
+            var context = manager.buildSessionContextAlloc(self.allocator) catch |err|
+                return self.commandErrorLineAlloc(id, "get_session_stats", err);
+            defer context.deinit();
+            const stats = session_stats.getSessionStatsAlloc(self.allocator, .{
+                .session_manager = manager,
+                .messages = context.messages,
+                .model = if (self.state.model) |model| model.* else null,
+            }) catch |err| return self.commandErrorLineAlloc(id, "get_session_stats", err);
+            const data = try rpc_types.sessionStatsDataJsonAlloc(self.allocator, stats);
             defer self.allocator.free(data);
             return rpc_types.successLineAlloc(self.allocator, id, "get_session_stats", data);
         }
 
         if (std.mem.eql(u8, command_type, "get_messages")) {
-            const data = try rpc_types.emptyMessagesDataJsonAlloc(self.allocator);
+            const manager = self.session_manager orelse
+                return self.sessionRuntimeRequiredLineAlloc(id, "get_messages");
+            var context = manager.buildSessionContextAlloc(self.allocator) catch |err|
+                return self.commandErrorLineAlloc(id, "get_messages", err);
+            defer context.deinit();
+            const data = try rpc_types.messagesDataJsonAlloc(self.allocator, context.messages);
             defer self.allocator.free(data);
             return rpc_types.successLineAlloc(self.allocator, id, "get_messages", data);
         }
 
         if (std.mem.eql(u8, command_type, "get_fork_messages")) {
-            const data = try rpc_types.emptyMessagesDataJsonAlloc(self.allocator);
+            const manager = self.session_manager orelse
+                return self.sessionRuntimeRequiredLineAlloc(id, "get_fork_messages");
+            const fork_messages = self.forkMessagesAlloc(manager) catch |err|
+                return self.commandErrorLineAlloc(id, "get_fork_messages", err);
+            defer deinitForkMessages(self.allocator, fork_messages);
+            const data = try rpc_types.forkMessagesDataJsonAlloc(self.allocator, fork_messages);
             defer self.allocator.free(data);
             return rpc_types.successLineAlloc(self.allocator, id, "get_fork_messages", data);
         }
 
         if (std.mem.eql(u8, command_type, "get_last_assistant_text")) {
-            const data = try rpc_types.lastAssistantTextDataJsonAlloc(self.allocator, null);
+            const manager = self.session_manager orelse
+                return self.sessionRuntimeRequiredLineAlloc(id, "get_last_assistant_text");
+            const text = self.lastAssistantTextAlloc(manager) catch |err|
+                return self.commandErrorLineAlloc(id, "get_last_assistant_text", err);
+            defer if (text) |value| self.allocator.free(value);
+            const data = try rpc_types.lastAssistantTextDataJsonAlloc(self.allocator, text);
             defer self.allocator.free(data);
             return rpc_types.successLineAlloc(self.allocator, id, "get_last_assistant_text", data);
         }
@@ -230,10 +286,17 @@ pub const RpcMode = struct {
             };
             const name = std.mem.trim(u8, raw_name, " \t\r\n");
             if (name.len == 0) return rpc_types.errorLineAlloc(self.allocator, id, "set_session_name", "Session name cannot be empty");
-            const copy = try self.allocator.dupe(u8, name);
-            if (self.session_name_storage) |previous| self.allocator.free(previous);
-            self.session_name_storage = copy;
-            self.state.session_name = copy;
+            if (self.session_manager) |manager| {
+                _ = manager.appendSessionInfo(self.io, name) catch |err| {
+                    return self.commandErrorLineAlloc(id, "set_session_name", err);
+                };
+                try self.refreshSessionState();
+            } else {
+                const copy = try self.allocator.dupe(u8, name);
+                if (self.session_name_storage) |previous| self.allocator.free(previous);
+                self.session_name_storage = copy;
+                self.state.session_name = copy;
+            }
             return rpc_types.successLineAlloc(self.allocator, id, "set_session_name", null);
         }
 
@@ -243,24 +306,71 @@ pub const RpcMode = struct {
             return rpc_types.successLineAlloc(self.allocator, id, "get_commands", data);
         }
 
-        if (std.mem.eql(u8, command_type, "new_session") or
-            std.mem.eql(u8, command_type, "switch_session") or
-            std.mem.eql(u8, command_type, "fork") or
-            std.mem.eql(u8, command_type, "clone") or
-            std.mem.eql(u8, command_type, "prompt") or
+        if (std.mem.eql(u8, command_type, "new_session")) {
+            const manager = self.session_manager orelse
+                return self.sessionRuntimeRequiredLineAlloc(id, "new_session");
+            _ = manager.newSession(self.io, .{
+                .parent_session = optionalString(object, "parentSession"),
+            }) catch |err| return self.commandErrorLineAlloc(id, "new_session", err);
+            try self.refreshSessionState();
+            const data = try rpc_types.cancelledDataJsonAlloc(self.allocator, false);
+            defer self.allocator.free(data);
+            return rpc_types.successLineAlloc(self.allocator, id, "new_session", data);
+        }
+
+        if (std.mem.eql(u8, command_type, "switch_session")) {
+            const manager = self.session_manager orelse
+                return self.sessionRuntimeRequiredLineAlloc(id, "switch_session");
+            const session_path = optionalString(object, "sessionPath") orelse {
+                return rpc_types.errorLineAlloc(self.allocator, id, "switch_session", "switch_session requires sessionPath");
+            };
+            const next = session_manager.SessionManager.open(self.allocator, self.io, session_path, .{}) catch |err|
+                return self.commandErrorLineAlloc(id, "switch_session", err);
+            manager.deinit();
+            manager.* = next;
+            try self.refreshSessionState();
+            const data = try rpc_types.cancelledDataJsonAlloc(self.allocator, false);
+            defer self.allocator.free(data);
+            return rpc_types.successLineAlloc(self.allocator, id, "switch_session", data);
+        }
+
+        if (std.mem.eql(u8, command_type, "fork")) {
+            const manager = self.session_manager orelse
+                return self.sessionRuntimeRequiredLineAlloc(id, "fork");
+            const entry_id = optionalString(object, "entryId") orelse {
+                return rpc_types.errorLineAlloc(self.allocator, id, "fork", "fork requires entryId");
+            };
+            const selected_text = self.forkBefore(manager, entry_id) catch |err|
+                return self.commandErrorLineAlloc(id, "fork", err);
+            defer self.allocator.free(selected_text);
+            try self.refreshSessionState();
+            const data = try rpc_types.forkDataJsonAlloc(self.allocator, selected_text, false);
+            defer self.allocator.free(data);
+            return rpc_types.successLineAlloc(self.allocator, id, "fork", data);
+        }
+
+        if (std.mem.eql(u8, command_type, "clone")) {
+            const manager = self.session_manager orelse
+                return self.sessionRuntimeRequiredLineAlloc(id, "clone");
+            const leaf_id = manager.getLeafId() orelse {
+                return rpc_types.errorLineAlloc(self.allocator, id, "clone", "Cannot clone session: no current entry selected");
+            };
+            _ = manager.createBranchedSession(self.io, leaf_id) catch |err|
+                return self.commandErrorLineAlloc(id, "clone", err);
+            try self.refreshSessionState();
+            const data = try rpc_types.cancelledDataJsonAlloc(self.allocator, false);
+            defer self.allocator.free(data);
+            return rpc_types.successLineAlloc(self.allocator, id, "clone", data);
+        }
+
+        if (std.mem.eql(u8, command_type, "prompt") or
             std.mem.eql(u8, command_type, "steer") or
             std.mem.eql(u8, command_type, "follow_up") or
             std.mem.eql(u8, command_type, "compact") or
             std.mem.eql(u8, command_type, "bash") or
             std.mem.eql(u8, command_type, "export_html"))
         {
-            const message = try std.fmt.allocPrint(
-                self.allocator,
-                "RPC command {s} requires AgentSession runtime integration",
-                .{command_type},
-            );
-            defer self.allocator.free(message);
-            return rpc_types.errorLineAlloc(self.allocator, id, command_type, message);
+            return self.sessionRuntimeRequiredLineAlloc(id, command_type);
         }
 
         const message = try std.fmt.allocPrint(self.allocator, "Unknown command: {s}", .{command_type});
@@ -339,7 +449,201 @@ pub const RpcMode = struct {
 
         return line_writer.toOwnedSlice();
     }
+
+    fn refreshSessionState(self: *RpcMode) !void {
+        const manager = self.session_manager orelse return;
+        self.state.session_file = manager.getSessionFile();
+        self.state.session_id = manager.getSessionId();
+
+        var context = try manager.buildSessionContextAlloc(self.allocator);
+        defer context.deinit();
+        self.state.message_count = context.messages.len;
+        if (context.model) |session_model| {
+            if (try self.findAvailableModel(session_model.provider, session_model.model_id)) |model| {
+                self.state.model = model;
+            }
+        }
+        if (sessionHasEntryType(manager, "thinking_level_change")) {
+            if (rpc_types.parseThinkingLevel(context.thinking_level)) |level| {
+                self.state.thinking_level = level;
+            }
+        }
+
+        const name = try manager.getSessionName(self.allocator);
+        if (self.session_name_storage) |previous| self.allocator.free(previous);
+        self.session_name_storage = name;
+        self.state.session_name = name;
+    }
+
+    fn sessionRuntimeRequiredLineAlloc(
+        self: *RpcMode,
+        id: ?[]const u8,
+        command: []const u8,
+    ) ![]u8 {
+        const message = try std.fmt.allocPrint(
+            self.allocator,
+            "RPC command {s} requires AgentSession runtime integration",
+            .{command},
+        );
+        defer self.allocator.free(message);
+        return rpc_types.errorLineAlloc(self.allocator, id, command, message);
+    }
+
+    fn commandErrorLineAlloc(
+        self: *RpcMode,
+        id: ?[]const u8,
+        command: []const u8,
+        err: anyerror,
+    ) ![]u8 {
+        return rpc_types.errorLineAlloc(self.allocator, id, command, @errorName(err));
+    }
+
+    fn forkMessagesAlloc(
+        self: *RpcMode,
+        manager: *const session_manager.SessionManager,
+    ) ![]rpc_types.ForkMessage {
+        var result: std.ArrayList(rpc_types.ForkMessage) = .empty;
+        errdefer {
+            freeForkMessageItems(self.allocator, result.items);
+            result.deinit(self.allocator);
+        }
+
+        for (manager.getEntries()) |entry| {
+            if (entry.id == null or entry.entry_type == null or
+                !std.mem.eql(u8, entry.entry_type.?, "message"))
+            {
+                continue;
+            }
+            const text = try userMessageTextFromEntryAlloc(self.allocator, entry.raw_json) orelse continue;
+            errdefer self.allocator.free(text);
+            if (text.len == 0) {
+                self.allocator.free(text);
+                continue;
+            }
+            const entry_id = try self.allocator.dupe(u8, entry.id.?);
+            errdefer self.allocator.free(entry_id);
+            try result.append(self.allocator, .{ .entry_id = entry_id, .text = text });
+        }
+        return result.toOwnedSlice(self.allocator);
+    }
+
+    fn lastAssistantTextAlloc(
+        self: *RpcMode,
+        manager: *const session_manager.SessionManager,
+    ) !?[]u8 {
+        var context = try manager.buildSessionContextAlloc(self.allocator);
+        defer context.deinit();
+
+        var index = context.messages.len;
+        while (index > 0) {
+            index -= 1;
+            const message = context.messages[index];
+            if (message != .assistant) continue;
+            const assistant = message.assistant;
+            if (assistant.stop_reason == .aborted and assistant.content.len == 0) continue;
+
+            var text: std.ArrayList(u8) = .empty;
+            errdefer text.deinit(self.allocator);
+            for (assistant.content) |content| {
+                if (content == .text) try text.appendSlice(self.allocator, content.text.text);
+            }
+            const trimmed = std.mem.trim(u8, text.items, " \t\r\n");
+            if (trimmed.len == 0) {
+                text.deinit(self.allocator);
+                return null;
+            }
+            const result = try self.allocator.dupe(u8, trimmed);
+            text.deinit(self.allocator);
+            return result;
+        }
+        return null;
+    }
+
+    fn forkBefore(
+        self: *RpcMode,
+        manager: *session_manager.SessionManager,
+        entry_id: []const u8,
+    ) ![]u8 {
+        const entry = manager.getEntry(entry_id) orelse return error.InvalidForkEntry;
+        const selected_text = try userMessageTextFromEntryAlloc(self.allocator, entry.raw_json) orelse
+            return error.InvalidForkEntry;
+        errdefer self.allocator.free(selected_text);
+        const parent_id = try parentIdFromEntryAlloc(self.allocator, entry.raw_json);
+        defer if (parent_id) |value| self.allocator.free(value);
+
+        if (parent_id) |target| {
+            _ = try manager.createBranchedSession(self.io, target);
+        } else {
+            const previous_file = manager.getSessionFile();
+            _ = try manager.newSession(self.io, .{ .parent_session = previous_file });
+        }
+        return selected_text;
+    }
 };
+
+fn deinitForkMessages(allocator: std.mem.Allocator, messages: []const rpc_types.ForkMessage) void {
+    freeForkMessageItems(allocator, messages);
+    allocator.free(messages);
+}
+
+fn freeForkMessageItems(allocator: std.mem.Allocator, messages: []const rpc_types.ForkMessage) void {
+    for (messages) |message| {
+        allocator.free(@constCast(message.entry_id));
+        allocator.free(@constCast(message.text));
+    }
+}
+
+fn userMessageTextFromEntryAlloc(allocator: std.mem.Allocator, raw_json: []const u8) !?[]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw_json, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return null,
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const message = parsed.value.object.get("message") orelse return null;
+    if (message != .object) return null;
+    const role = optionalString(message.object, "role") orelse return null;
+    if (!std.mem.eql(u8, role, "user")) return null;
+    const content = message.object.get("content") orelse return null;
+    return textFromContentValueAlloc(allocator, content);
+}
+
+fn textFromContentValueAlloc(allocator: std.mem.Allocator, content: std.json.Value) !?[]u8 {
+    if (content == .string) return try allocator.dupe(u8, content.string);
+    if (content != .array) return null;
+
+    var text: std.ArrayList(u8) = .empty;
+    errdefer text.deinit(allocator);
+    for (content.array.items) |part| {
+        if (part != .object) continue;
+        const part_type = optionalString(part.object, "type") orelse continue;
+        if (!std.mem.eql(u8, part_type, "text")) continue;
+        const value = optionalString(part.object, "text") orelse continue;
+        try text.appendSlice(allocator, value);
+    }
+    return try text.toOwnedSlice(allocator);
+}
+
+fn parentIdFromEntryAlloc(allocator: std.mem.Allocator, raw_json: []const u8) !?[]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw_json, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return null,
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const value = parsed.value.object.get("parentId") orelse return null;
+    if (value == .null) return null;
+    if (value != .string) return null;
+    return try allocator.dupe(u8, value.string);
+}
+
+fn sessionHasEntryType(manager: *const session_manager.SessionManager, entry_type: []const u8) bool {
+    for (manager.getEntries()) |entry| {
+        const current = entry.entry_type orelse continue;
+        if (std.mem.eql(u8, current, entry_type)) return true;
+    }
+    return false;
+}
 
 fn nextModelFromPointers(models: []const *const ai.Model, current: ?*const ai.Model) ?*const ai.Model {
     if (models.len == 0) return null;
@@ -453,4 +757,178 @@ test "RPC mode returns available models and structured unsupported runtime error
     try std.testing.expectEqual(false, parsed_prompt.value.object.get("success").?.bool);
     try std.testing.expectEqualStrings("prompt", parsed_prompt.value.object.get("command").?.string);
     try std.testing.expect(std.mem.indexOf(u8, parsed_prompt.value.object.get("error").?.string, "AgentSession runtime integration") != null);
+}
+
+test "RPC mode exposes persisted session messages stats fork candidates and state" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const models = [_]ai.Model{.{
+        .id = "demo",
+        .name = "Demo",
+        .api = ai.types.api.openai_completions,
+        .provider = "demo",
+        .base_url = "https://example.com/v1",
+        .reasoning = false,
+        .context_window = 1000,
+    }};
+    var session = try session_manager.SessionManager.inMemory(allocator, io, "/tmp");
+    defer session.deinit();
+
+    const user_content = [_]ai.UserContent{.{ .text = .{ .text = "hello" } }};
+    _ = try session.appendMessage(io, .{ .user = .{
+        .content = &user_content,
+        .timestamp_ms = 1,
+    } });
+    const assistant_content = [_]ai.AssistantContent{.{ .text = .{ .text = "  answer  " } }};
+    _ = try session.appendMessage(io, .{ .assistant = .{
+        .content = &assistant_content,
+        .api = ai.types.api.openai_completions,
+        .provider = "demo",
+        .model = "demo",
+        .usage = .{
+            .input = 10,
+            .output = 5,
+            .cache_read = 2,
+            .cache_write = 1,
+            .cost = .{ .total = 0.25 },
+        },
+        .stop_reason = .stop,
+        .timestamp_ms = 2,
+    } });
+
+    var mode = RpcMode.init(allocator, .{
+        .static_models = &models,
+        .initial_model = &models[0],
+        .session_manager = &session,
+    });
+    defer mode.deinit();
+
+    const messages_response = (try mode.handleLineAlloc("{\"id\":\"m\",\"type\":\"get_messages\"}")).?;
+    defer allocator.free(messages_response);
+    var parsed_messages = try std.json.parseFromSlice(std.json.Value, allocator, messages_response[0 .. messages_response.len - 1], .{});
+    defer parsed_messages.deinit();
+    const messages_array = parsed_messages.value.object.get("data").?.object.get("messages").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), messages_array.len);
+    try std.testing.expectEqualStrings("user", messages_array[0].object.get("role").?.string);
+    try std.testing.expectEqualStrings("assistant", messages_array[1].object.get("role").?.string);
+
+    const fork_response = (try mode.handleLineAlloc("{\"id\":\"f\",\"type\":\"get_fork_messages\"}")).?;
+    defer allocator.free(fork_response);
+    var parsed_fork = try std.json.parseFromSlice(std.json.Value, allocator, fork_response[0 .. fork_response.len - 1], .{});
+    defer parsed_fork.deinit();
+    const fork_messages = parsed_fork.value.object.get("data").?.object.get("messages").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), fork_messages.len);
+    try std.testing.expectEqualStrings("hello", fork_messages[0].object.get("text").?.string);
+
+    const last_response = (try mode.handleLineAlloc("{\"id\":\"l\",\"type\":\"get_last_assistant_text\"}")).?;
+    defer allocator.free(last_response);
+    var parsed_last = try std.json.parseFromSlice(std.json.Value, allocator, last_response[0 .. last_response.len - 1], .{});
+    defer parsed_last.deinit();
+    try std.testing.expectEqualStrings("answer", parsed_last.value.object.get("data").?.object.get("text").?.string);
+
+    const stats_response = (try mode.handleLineAlloc("{\"id\":\"s\",\"type\":\"get_session_stats\"}")).?;
+    defer allocator.free(stats_response);
+    var parsed_stats = try std.json.parseFromSlice(std.json.Value, allocator, stats_response[0 .. stats_response.len - 1], .{});
+    defer parsed_stats.deinit();
+    const stats = parsed_stats.value.object.get("data").?.object;
+    try std.testing.expectEqual(@as(i64, 1), stats.get("userMessages").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), stats.get("assistantMessages").?.integer);
+    try std.testing.expectEqual(@as(i64, 18), stats.get("tokens").?.object.get("total").?.integer);
+
+    const name_response = (try mode.handleLineAlloc("{\"id\":\"n\",\"type\":\"set_session_name\",\"name\":\" rpc session \"}")).?;
+    defer allocator.free(name_response);
+    const thinking_response = (try mode.handleLineAlloc("{\"id\":\"t\",\"type\":\"set_thinking_level\",\"level\":\"high\"}")).?;
+    defer allocator.free(thinking_response);
+    const model_response = (try mode.handleLineAlloc("{\"id\":\"m2\",\"type\":\"set_model\",\"provider\":\"demo\",\"modelId\":\"demo\"}")).?;
+    defer allocator.free(model_response);
+
+    const state_response = (try mode.handleLineAlloc("{\"id\":\"q\",\"type\":\"get_state\"}")).?;
+    defer allocator.free(state_response);
+    var parsed_state = try std.json.parseFromSlice(std.json.Value, allocator, state_response[0 .. state_response.len - 1], .{});
+    defer parsed_state.deinit();
+    const state = parsed_state.value.object.get("data").?.object;
+    try std.testing.expectEqualStrings("rpc session", state.get("sessionName").?.string);
+    try std.testing.expectEqualStrings("high", state.get("thinkingLevel").?.string);
+    try std.testing.expectEqualStrings("demo", state.get("model").?.object.get("provider").?.string);
+    try std.testing.expectEqual(@as(i64, 2), state.get("messageCount").?.integer);
+
+    var context = try session.buildSessionContextAlloc(allocator);
+    defer context.deinit();
+    try std.testing.expectEqualStrings("high", context.thinking_level);
+    try std.testing.expectEqualStrings("demo", context.model.?.provider);
+    try std.testing.expectEqualStrings("demo", context.model.?.model_id);
+}
+
+test "RPC mode performs session fork clone new and switch lifecycle commands" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(cwd);
+    const session_dir = try std.fs.path.join(allocator, &.{ cwd, ".zig-cache", "tmp", tmp.sub_path[0..], "sessions" });
+    defer allocator.free(session_dir);
+
+    var first = try session_manager.SessionManager.create(allocator, io, cwd, session_dir, .{});
+    const first_user_content = [_]ai.UserContent{.{ .text = .{ .text = "first" } }};
+    _ = try first.appendMessage(io, .{ .user = .{
+        .content = &first_user_content,
+        .timestamp_ms = 1,
+    } });
+    const assistant_content = [_]ai.AssistantContent{.{ .text = .{ .text = "reply" } }};
+    _ = try first.appendMessage(io, .{ .assistant = .{
+        .content = &assistant_content,
+        .api = ai.types.api.openai_completions,
+        .provider = "demo",
+        .model = "demo",
+        .stop_reason = .stop,
+        .timestamp_ms = 2,
+    } });
+    const second_user_content = [_]ai.UserContent{.{ .text = .{ .text = "second" } }};
+    const second_user_id = try first.appendMessage(io, .{ .user = .{
+        .content = &second_user_content,
+        .timestamp_ms = 3,
+    } });
+    const first_path = try allocator.dupe(u8, first.getSessionFile().?);
+    defer allocator.free(first_path);
+
+    var mode = RpcMode.init(allocator, .{ .session_manager = &first });
+    defer mode.deinit();
+    defer first.deinit();
+
+    const fork_command = try std.fmt.allocPrint(
+        allocator,
+        "{{\"id\":\"f\",\"type\":\"fork\",\"entryId\":\"{s}\"}}",
+        .{second_user_id},
+    );
+    defer allocator.free(fork_command);
+    const fork_response = (try mode.handleLineAlloc(fork_command)).?;
+    defer allocator.free(fork_response);
+    var parsed_fork = try std.json.parseFromSlice(std.json.Value, allocator, fork_response[0 .. fork_response.len - 1], .{});
+    defer parsed_fork.deinit();
+    try std.testing.expectEqualStrings("second", parsed_fork.value.object.get("data").?.object.get("text").?.string);
+
+    const forked_id = try allocator.dupe(u8, first.getSessionId());
+    defer allocator.free(forked_id);
+    const clone_response = (try mode.handleLineAlloc("{\"id\":\"c\",\"type\":\"clone\"}")).?;
+    defer allocator.free(clone_response);
+    try std.testing.expect(!std.mem.eql(u8, forked_id, first.getSessionId()));
+
+    const new_response = (try mode.handleLineAlloc("{\"id\":\"n\",\"type\":\"new_session\"}")).?;
+    defer allocator.free(new_response);
+    try std.testing.expectEqual(@as(usize, 0), first.getEntries().len);
+
+    const switch_command = try std.fmt.allocPrint(
+        allocator,
+        "{{\"id\":\"s\",\"type\":\"switch_session\",\"sessionPath\":\"{s}\"}}",
+        .{first_path},
+    );
+    defer allocator.free(switch_command);
+    const switch_response = (try mode.handleLineAlloc(switch_command)).?;
+    defer allocator.free(switch_response);
+    try std.testing.expectEqualStrings(first_path, first.getSessionFile().?);
+
+    var switched_context = try first.buildSessionContextAlloc(allocator);
+    defer switched_context.deinit();
+    try std.testing.expectEqual(@as(usize, 3), switched_context.messages.len);
 }

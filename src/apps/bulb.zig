@@ -94,17 +94,131 @@ fn runRpcMode(
     var registry = try coding_agent.model_registry.ModelRegistry.init(allocator, &auth_storage, models_json_path);
     defer registry.deinit();
 
+    var session = try createRpcSessionManager(allocator, io, environ, agent_dir, parsed);
+    defer session.deinit();
+    if (parsed.name) |name| _ = try session.appendSessionInfo(io, name);
+
     const initial_model = findInitialRpcModel(&registry, parsed.provider, parsed.model);
     const thinking_level = parsed.thinking orelse coding_agent.model_resolver.default_thinking_level;
     var rpc = coding_agent.rpc_mode.RpcMode.init(allocator, .{
         .io = io,
         .model_registry = &registry,
+        .session_manager = &session,
         .initial_model = initial_model,
         .thinking_level = thinking_level,
     });
     defer rpc.deinit();
 
     try rpc.run(stdout);
+}
+
+fn createRpcSessionManager(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environ: *const std.process.Environ.Map,
+    agent_dir: []const u8,
+    parsed: *const coding_agent.cli_args.Args,
+) !coding_agent.SessionManager {
+    const cwd = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(cwd);
+
+    if (parsed.no_session) {
+        return coding_agent.SessionManager.inMemory(allocator, io, cwd);
+    }
+
+    const session_dir = try rpcSessionDirAlloc(allocator, io, environ, cwd, agent_dir, parsed.session_dir);
+    defer allocator.free(session_dir);
+
+    if (parsed.fork) |source_arg| {
+        const source_path = try resolveRpcSessionArgAlloc(allocator, io, cwd, session_dir, agent_dir, source_arg);
+        defer allocator.free(source_path);
+        return coding_agent.session_manager.forkFrom(
+            allocator,
+            io,
+            source_path,
+            cwd,
+            session_dir,
+            .{ .id = parsed.session_id },
+        );
+    }
+
+    if (parsed.session) |session_arg| {
+        const session_path = try resolveRpcSessionArgAlloc(allocator, io, cwd, session_dir, agent_dir, session_arg);
+        defer allocator.free(session_path);
+        return coding_agent.SessionManager.open(allocator, io, session_path, .{
+            .session_dir = session_dir,
+        });
+    }
+
+    if (parsed.continue_flag or parsed.resume_flag) {
+        return coding_agent.SessionManager.continueRecent(allocator, io, cwd, session_dir);
+    }
+
+    if (parsed.session_id) |session_id| {
+        try coding_agent.session_manager.assertValidSessionId(session_id);
+        var sessions = try coding_agent.SessionManager.list(allocator, io, cwd, session_dir, agent_dir);
+        defer sessions.deinit();
+        for (sessions.sessions) |info| {
+            if (std.mem.eql(u8, info.id, session_id)) {
+                return coding_agent.SessionManager.open(allocator, io, info.path, .{
+                    .session_dir = session_dir,
+                });
+            }
+        }
+    }
+
+    return coding_agent.SessionManager.create(allocator, io, cwd, session_dir, .{
+        .id = parsed.session_id,
+    });
+}
+
+fn resolveRpcSessionArgAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    session_dir: []const u8,
+    agent_dir: []const u8,
+    arg: []const u8,
+) ![]u8 {
+    if (pathExists(io, arg)) return allocator.dupe(u8, arg);
+
+    var sessions = try coding_agent.SessionManager.list(allocator, io, cwd, session_dir, agent_dir);
+    defer sessions.deinit();
+    for (sessions.sessions) |info| {
+        if (std.mem.eql(u8, info.id, arg)) return allocator.dupe(u8, info.path);
+    }
+
+    var match: ?[]const u8 = null;
+    for (sessions.sessions) |info| {
+        if (std.mem.startsWith(u8, info.id, arg)) {
+            if (match != null) return error.AmbiguousSessionId;
+            match = info.path;
+        }
+    }
+    if (match) |path| return allocator.dupe(u8, path);
+    return allocator.dupe(u8, arg);
+}
+
+fn pathExists(io: std.Io, path: []const u8) bool {
+    std.Io.Dir.cwd().access(io, path, .{}) catch return false;
+    return true;
+}
+
+fn rpcSessionDirAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environ: *const std.process.Environ.Map,
+    cwd: []const u8,
+    agent_dir: []const u8,
+    cli_session_dir: ?[]const u8,
+) ![]u8 {
+    if (cli_session_dir) |path| return allocator.dupe(u8, path);
+    if (environ.get(coding_agent.config.session_dir_env)) |path| return allocator.dupe(u8, path);
+
+    var settings = try coding_agent.SettingsManager.create(allocator, io, cwd, agent_dir);
+    defer settings.deinit();
+    if (try settings.getSessionDirAlloc(allocator, environ.get("HOME"))) |path| return path;
+    return coding_agent.session_manager.getDefaultSessionDirPathAlloc(allocator, io, cwd, agent_dir);
 }
 
 fn findInitialRpcModel(
