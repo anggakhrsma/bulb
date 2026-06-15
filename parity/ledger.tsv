@@ -524,8 +524,8 @@ packages/coding-agent/src/modes/interactive/theme/theme.ts	bulb_coding_agent	sou
 packages/coding-agent/src/modes/print-mode.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/modes/rpc/jsonl.ts	bulb_coding_agent	source	implemented	src/bulb_coding_agent/rpc_jsonl.zig	Native strict-LF JSONL serializer and incremental line reader with CRLF trimming and final partial-line flush ported; full RPC mode wiring remains later
 packages/coding-agent/src/modes/rpc/rpc-client.ts	bulb_coding_agent	source	in_progress	src/bulb_coding_agent/rpc_client.zig	Native sequential RPC client started with bulb --mode rpc spawning, provider/model/extra argv forwarding, LF-framed request serialization, response matching, clone command, raw get_commands response helper, process-exit diagnostics, and focused clone/process-exit regressions; full typed command surface, background event pump, prompt wait helpers, and stderr capture remain
-packages/coding-agent/src/modes/rpc/rpc-mode.ts	bulb_coding_agent	source	pending		
-packages/coding-agent/src/modes/rpc/rpc-types.ts	bulb_coding_agent	source	pending		
+packages/coding-agent/src/modes/rpc/rpc-mode.ts	bulb_coding_agent	source	implemented	src/bulb_coding_agent/rpc_mode.zig	Native line-driven RPC server now handles Pi-compatible state, model, thinking, queue, session-name, command export, and structured runtime-dependent errors for prompt/bash/compaction/session actions; runtime-backed agent/session wiring remains for later
+packages/coding-agent/src/modes/rpc/rpc-types.ts	bulb_coding_agent	source	implemented	src/bulb_coding_agent/rpc_types.zig	Native RPC command/state helpers and Pi-compatible camelCase JSON serialization for session state, models, compat metadata, queue modes, and common responses ported
 packages/coding-agent/src/package-manager-cli.ts	bulb_coding_agent	source	pending		
 packages/coding-agent/src/utils/ansi.ts	bulb_coding_agent	source	implemented	src/bulb_coding_agent/ansi.zig	Pi strip-ansi-compatible OSC/CSI scanning, C1 CSI handling, incomplete-sequence preservation, and native owned output ported
 packages/coding-agent/src/utils/changelog.ts	bulb_coding_agent	source	pending		

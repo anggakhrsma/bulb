@@ -40,6 +40,8 @@ pub fn main(init: std.process.Init) !void {
         try coding_agent.cli_args.writeHelp(stdout);
     } else if (parsed.list_models) |list_models| {
         try writeModelList(allocator, init.io, init.environ_map, stdout, stderr, list_models);
+    } else if (parsed.mode == .rpc) {
+        try runRpcMode(allocator, init.io, init.environ_map, stdout, &parsed);
     } else {
         try stdout.writeAll(
             \\Bulb native coding agent
@@ -54,6 +56,82 @@ pub fn main(init: std.process.Init) !void {
 
     try stdout.flush();
     try stderr.flush();
+}
+
+fn runRpcMode(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environ: *const std.process.Environ.Map,
+    stdout: *std.Io.Writer,
+    parsed: *const coding_agent.cli_args.Args,
+) !void {
+    var oauth_registry = try coding_agent.ai.oauth.Registry.init(allocator);
+    defer oauth_registry.deinit();
+
+    var resolver = coding_agent.resolve_config_value.Resolver.init(allocator, environ);
+    defer resolver.deinit();
+
+    const agent_dir = try coding_agent.config.agentDirAlloc(allocator, environ);
+    defer allocator.free(agent_dir);
+    const auth_path = try std.fs.path.join(allocator, &.{ agent_dir, "auth.json" });
+    defer allocator.free(auth_path);
+    const models_json_path = try std.fs.path.join(allocator, &.{ agent_dir, "models.json" });
+    defer allocator.free(models_json_path);
+
+    var auth_storage = try coding_agent.auth_storage.AuthStorage.initFile(
+        allocator,
+        environ,
+        &oauth_registry,
+        &resolver,
+        auth_path,
+    );
+    defer auth_storage.deinit();
+
+    if (parsed.api_key) |api_key| {
+        if (parsed.provider) |provider| try auth_storage.setRuntimeApiKey(provider, api_key);
+    }
+
+    var registry = try coding_agent.model_registry.ModelRegistry.init(allocator, &auth_storage, models_json_path);
+    defer registry.deinit();
+
+    const initial_model = findInitialRpcModel(&registry, parsed.provider, parsed.model);
+    const thinking_level = parsed.thinking orelse coding_agent.model_resolver.default_thinking_level;
+    var rpc = coding_agent.rpc_mode.RpcMode.init(allocator, .{
+        .io = io,
+        .model_registry = &registry,
+        .initial_model = initial_model,
+        .thinking_level = thinking_level,
+    });
+    defer rpc.deinit();
+
+    try rpc.run(stdout);
+}
+
+fn findInitialRpcModel(
+    registry: *const coding_agent.model_registry.ModelRegistry,
+    provider: ?[]const u8,
+    model_id: ?[]const u8,
+) ?*const coding_agent.ai.Model {
+    if (provider) |provider_name| {
+        if (model_id) |id| {
+            if (registry.find(provider_name, id)) |model| return model;
+        } else if (coding_agent.model_resolver.defaultModelForProvider(provider_name)) |default_id| {
+            if (registry.find(provider_name, default_id)) |model| return model;
+        }
+    }
+
+    if (model_id) |id| {
+        var match: ?*const coding_agent.ai.Model = null;
+        for (registry.getAll()) |*model| {
+            if (std.mem.eql(u8, model.id, id)) {
+                if (match != null) return null;
+                match = model;
+            }
+        }
+        return match;
+    }
+
+    return null;
 }
 
 fn writeModelList(
