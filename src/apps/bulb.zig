@@ -94,16 +94,31 @@ fn runRpcMode(
     var registry = try coding_agent.model_registry.ModelRegistry.init(allocator, &auth_storage, models_json_path);
     defer registry.deinit();
 
-    var session = try createRpcSessionManager(allocator, io, environ, agent_dir, parsed);
-    defer session.deinit();
-    if (parsed.name) |name| _ = try session.appendSessionInfo(io, name);
+    const initial_session = try allocator.create(coding_agent.SessionManager);
+    var initial_session_owned = true;
+    errdefer if (initial_session_owned) {
+        initial_session.deinit();
+        allocator.destroy(initial_session);
+    };
+    initial_session.* = try createRpcSessionManager(allocator, io, environ, agent_dir, parsed);
+    if (parsed.name) |name| _ = try initial_session.appendSessionInfo(io, name);
+
+    var runtime_host = coding_agent.RpcRuntimeHost.init(allocator, io, .{
+        .env = environ,
+        .agent_dir = agent_dir,
+        .auth_storage = &auth_storage,
+        .model_registry = &registry,
+    });
+    try runtime_host.start(initial_session);
+    initial_session_owned = false;
+    defer runtime_host.deinit();
 
     const initial_model = findInitialRpcModel(&registry, parsed.provider, parsed.model);
     const thinking_level = parsed.thinking orelse coding_agent.model_resolver.default_thinking_level;
     var rpc = coding_agent.rpc_mode.RpcMode.init(allocator, .{
         .io = io,
         .model_registry = &registry,
-        .session_manager = &session,
+        .session_runtime = &runtime_host.runtime,
         .initial_model = initial_model,
         .thinking_level = thinking_level,
     });
