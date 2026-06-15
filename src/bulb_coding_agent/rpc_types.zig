@@ -1,7 +1,9 @@
 const std = @import("std");
 const ai = @import("bulb_ai");
+const bash_executor = @import("bash_executor.zig");
 const messages = @import("messages.zig");
 const session_manager = @import("session_manager.zig");
+const session_events = @import("session_events.zig");
 const session_stats = @import("session_stats.zig");
 
 pub const QueueMode = enum {
@@ -291,6 +293,132 @@ pub fn lastAssistantTextDataJsonAlloc(allocator: std.mem.Allocator, text: ?[]con
     return output.toOwnedSlice(allocator);
 }
 
+pub fn bashResultDataJsonAlloc(
+    allocator: std.mem.Allocator,
+    result: bash_executor.BashResult,
+) ![]u8 {
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(allocator);
+    try output.append(allocator, '{');
+    var first = true;
+    try appendStringField(allocator, &output, &first, "output", result.output);
+    try fieldPrefix(allocator, &output, &first, "exitCode");
+    if (result.exit_code) |exit_code| {
+        try output.print(allocator, "{d}", .{exit_code});
+    } else {
+        try output.appendSlice(allocator, "null");
+    }
+    try appendBoolField(allocator, &output, &first, "cancelled", result.cancelled);
+    try appendBoolField(allocator, &output, &first, "truncated", result.truncated);
+    if (result.full_output_path) |path| try appendStringField(allocator, &output, &first, "fullOutputPath", path);
+    try output.append(allocator, '}');
+    return output.toOwnedSlice(allocator);
+}
+
+pub fn sessionEventLineAlloc(
+    allocator: std.mem.Allocator,
+    event: session_events.SessionEvent,
+) ![]u8 {
+    const json = try sessionEventJsonAlloc(allocator, event);
+    defer allocator.free(json);
+    return std.fmt.allocPrint(allocator, "{s}\n", .{json});
+}
+
+pub fn sessionEventJsonAlloc(
+    allocator: std.mem.Allocator,
+    event: session_events.SessionEvent,
+) ![]u8 {
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(allocator);
+    try output.append(allocator, '{');
+    var first = true;
+
+    switch (event) {
+        .agent_start => {
+            try appendStringField(allocator, &output, &first, "type", "agent_start");
+        },
+        .agent_end => |payload| {
+            try appendStringField(allocator, &output, &first, "type", "agent_end");
+            try appendMessagesField(allocator, &output, &first, "messages", payload.messages);
+            try appendBoolField(allocator, &output, &first, "willRetry", payload.will_retry);
+        },
+        .auto_retry_start => |payload| {
+            try appendStringField(allocator, &output, &first, "type", "auto_retry_start");
+            try appendUnsignedField(allocator, &output, &first, "attempt", payload.attempt);
+            try appendUnsignedField(allocator, &output, &first, "maxAttempts", payload.max_attempts);
+            try appendUnsignedField(allocator, &output, &first, "delayMs", payload.delay_ms);
+            try appendStringField(allocator, &output, &first, "errorMessage", payload.error_message);
+        },
+        .auto_retry_end => |payload| {
+            try appendStringField(allocator, &output, &first, "type", "auto_retry_end");
+            try appendBoolField(allocator, &output, &first, "success", payload.success);
+            try appendUnsignedField(allocator, &output, &first, "attempt", payload.attempt);
+            if (payload.final_error) |message| try appendStringField(allocator, &output, &first, "finalError", message);
+        },
+        .queue_update => |payload| {
+            try appendStringField(allocator, &output, &first, "type", "queue_update");
+            try appendStringArrayField(allocator, &output, &first, "steering", payload.steering);
+            try appendStringArrayField(allocator, &output, &first, "followUp", payload.follow_up);
+        },
+        .compaction_start => |payload| {
+            try appendStringField(allocator, &output, &first, "type", "compaction_start");
+            try appendStringField(allocator, &output, &first, "reason", compactionReasonName(payload.reason));
+        },
+        .compaction_end => |payload| {
+            try appendStringField(allocator, &output, &first, "type", "compaction_end");
+            try appendStringField(allocator, &output, &first, "reason", compactionReasonName(payload.reason));
+            if (payload.result) |result| try appendCompactionResultField(allocator, &output, &first, "result", result);
+            try appendBoolField(allocator, &output, &first, "aborted", payload.aborted);
+            try appendBoolField(allocator, &output, &first, "willRetry", payload.will_retry);
+            if (payload.error_message) |message| try appendStringField(allocator, &output, &first, "errorMessage", message);
+        },
+        .turn_start => {
+            try appendStringField(allocator, &output, &first, "type", "turn_start");
+        },
+        .turn_end => |payload| {
+            try appendStringField(allocator, &output, &first, "type", "turn_end");
+            try appendMessageField(allocator, &output, &first, "message", payload.message);
+            try appendToolResultsField(allocator, &output, &first, "toolResults", payload.tool_results);
+        },
+        .message_start => |payload| {
+            try appendStringField(allocator, &output, &first, "type", "message_start");
+            try appendMessageField(allocator, &output, &first, "message", payload.message);
+        },
+        .message_update => |payload| {
+            try appendStringField(allocator, &output, &first, "type", "message_update");
+            try appendMessageField(allocator, &output, &first, "message", payload.message);
+            try appendStreamEventField(allocator, &output, &first, "assistantMessageEvent", payload.message, payload.assistant_message_event);
+        },
+        .message_end => |payload| {
+            try appendStringField(allocator, &output, &first, "type", "message_end");
+            try appendMessageField(allocator, &output, &first, "message", payload.message);
+        },
+        .tool_execution_start => |payload| {
+            try appendStringField(allocator, &output, &first, "type", "tool_execution_start");
+            try appendStringField(allocator, &output, &first, "toolCallId", payload.tool_call_id);
+            try appendStringField(allocator, &output, &first, "toolName", payload.tool_name);
+            try appendJsonValueField(allocator, &output, &first, "args", payload.args);
+        },
+        .tool_execution_update => |payload| {
+            try appendStringField(allocator, &output, &first, "type", "tool_execution_update");
+            try appendStringField(allocator, &output, &first, "toolCallId", payload.tool_call_id);
+            try appendStringField(allocator, &output, &first, "toolName", payload.tool_name);
+            try appendJsonValueField(allocator, &output, &first, "args", payload.args);
+            try appendJsonValueField(allocator, &output, &first, "partialResult", payload.partial_result);
+        },
+        .tool_execution_end => |payload| {
+            try appendStringField(allocator, &output, &first, "type", "tool_execution_end");
+            try appendStringField(allocator, &output, &first, "toolCallId", payload.tool_call_id);
+            try appendStringField(allocator, &output, &first, "toolName", payload.tool_name);
+            try appendJsonValueField(allocator, &output, &first, "result", payload.result);
+            try appendBoolField(allocator, &output, &first, "isError", payload.is_error);
+        },
+    }
+
+    try output.append(allocator, '}');
+    return output.toOwnedSlice(allocator);
+}
+
 pub fn sessionStatsDataJsonAlloc(
     allocator: std.mem.Allocator,
     stats: session_stats.SessionStats,
@@ -327,6 +455,180 @@ pub fn sessionStatsDataJsonAlloc(
     }
     try output.append(allocator, '}');
     return output.toOwnedSlice(allocator);
+}
+
+fn appendMessagesField(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(u8),
+    first: *bool,
+    key: []const u8,
+    values: []const messages.CodingAgentMessage,
+) !void {
+    try fieldPrefix(allocator, output, first, key);
+    try output.append(allocator, '[');
+    for (values, 0..) |message, index| {
+        if (index > 0) try output.append(allocator, ',');
+        const json = try messageJsonAlloc(allocator, message);
+        defer allocator.free(json);
+        try output.appendSlice(allocator, json);
+    }
+    try output.append(allocator, ']');
+}
+
+fn appendMessageField(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(u8),
+    first: *bool,
+    key: []const u8,
+    message: messages.CodingAgentMessage,
+) !void {
+    try fieldPrefix(allocator, output, first, key);
+    const json = try messageJsonAlloc(allocator, message);
+    defer allocator.free(json);
+    try output.appendSlice(allocator, json);
+}
+
+fn appendToolResultsField(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(u8),
+    first: *bool,
+    key: []const u8,
+    values: []const ai.ToolResultMessage,
+) !void {
+    try fieldPrefix(allocator, output, first, key);
+    try output.append(allocator, '[');
+    for (values, 0..) |tool_result, index| {
+        if (index > 0) try output.append(allocator, ',');
+        const json = try messageJsonAlloc(allocator, .{ .tool_result = tool_result });
+        defer allocator.free(json);
+        try output.appendSlice(allocator, json);
+    }
+    try output.append(allocator, ']');
+}
+
+fn appendStreamEventField(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(u8),
+    first: *bool,
+    key: []const u8,
+    message: messages.CodingAgentMessage,
+    event: ai.StreamEvent,
+) !void {
+    try fieldPrefix(allocator, output, first, key);
+    try streamEventJson(allocator, output, message, event);
+}
+
+fn streamEventJson(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(u8),
+    message: messages.CodingAgentMessage,
+    event: ai.StreamEvent,
+) !void {
+    try output.append(allocator, '{');
+    var first = true;
+    switch (event) {
+        .start => {
+            try appendStringField(allocator, output, &first, "type", "start");
+            try appendMessageField(allocator, output, &first, "partial", message);
+        },
+        .text_start => |payload| {
+            try appendStringField(allocator, output, &first, "type", "text_start");
+            try appendUnsignedField(allocator, output, &first, "contentIndex", payload.content_index);
+            try appendMessageField(allocator, output, &first, "partial", message);
+        },
+        .text_delta => |payload| {
+            try appendStringField(allocator, output, &first, "type", "text_delta");
+            try appendUnsignedField(allocator, output, &first, "contentIndex", payload.content_index);
+            try appendStringField(allocator, output, &first, "delta", payload.delta);
+            try appendMessageField(allocator, output, &first, "partial", message);
+        },
+        .text_end => |payload| {
+            try appendStringField(allocator, output, &first, "type", "text_end");
+            try appendUnsignedField(allocator, output, &first, "contentIndex", payload.content_index);
+            try appendStringField(allocator, output, &first, "content", payload.content);
+            try appendMessageField(allocator, output, &first, "partial", message);
+        },
+        .thinking_start => |payload| {
+            try appendStringField(allocator, output, &first, "type", "thinking_start");
+            try appendUnsignedField(allocator, output, &first, "contentIndex", payload.content_index);
+            try appendMessageField(allocator, output, &first, "partial", message);
+        },
+        .thinking_delta => |payload| {
+            try appendStringField(allocator, output, &first, "type", "thinking_delta");
+            try appendUnsignedField(allocator, output, &first, "contentIndex", payload.content_index);
+            try appendStringField(allocator, output, &first, "delta", payload.delta);
+            try appendMessageField(allocator, output, &first, "partial", message);
+        },
+        .thinking_end => |payload| {
+            try appendStringField(allocator, output, &first, "type", "thinking_end");
+            try appendUnsignedField(allocator, output, &first, "contentIndex", payload.content_index);
+            try appendStringField(allocator, output, &first, "content", payload.content);
+            try appendMessageField(allocator, output, &first, "partial", message);
+        },
+        .toolcall_start => |payload| {
+            try appendStringField(allocator, output, &first, "type", "toolcall_start");
+            try appendUnsignedField(allocator, output, &first, "contentIndex", payload.content_index);
+            try appendMessageField(allocator, output, &first, "partial", message);
+        },
+        .toolcall_delta => |payload| {
+            try appendStringField(allocator, output, &first, "type", "toolcall_delta");
+            try appendUnsignedField(allocator, output, &first, "contentIndex", payload.content_index);
+            try appendStringField(allocator, output, &first, "delta", payload.delta);
+            try appendMessageField(allocator, output, &first, "partial", message);
+        },
+        .toolcall_end => |payload| {
+            try appendStringField(allocator, output, &first, "type", "toolcall_end");
+            try appendUnsignedField(allocator, output, &first, "contentIndex", payload.content_index);
+            try appendToolCallField(allocator, output, &first, "toolCall", payload.tool_call);
+            try appendMessageField(allocator, output, &first, "partial", message);
+        },
+        .done => |reason| {
+            try appendStringField(allocator, output, &first, "type", "done");
+            try appendStringField(allocator, output, &first, "reason", stopReasonName(reason));
+            try appendMessageField(allocator, output, &first, "partial", message);
+        },
+        .@"error" => |payload| {
+            try appendStringField(allocator, output, &first, "type", "error");
+            try appendStringField(allocator, output, &first, "reason", stopReasonName(payload.reason));
+            try appendMessageField(allocator, output, &first, "message", .{ .assistant = payload.message });
+            try appendMessageField(allocator, output, &first, "partial", message);
+        },
+    }
+    try output.append(allocator, '}');
+}
+
+fn appendToolCallField(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(u8),
+    first: *bool,
+    key: []const u8,
+    tool_call: ai.ToolCall,
+) !void {
+    try fieldPrefix(allocator, output, first, key);
+    try output.append(allocator, '{');
+    var tool_first = true;
+    try appendStringField(allocator, output, &tool_first, "id", tool_call.id);
+    try appendStringField(allocator, output, &tool_first, "name", tool_call.name);
+    try appendJsonOrStringField(allocator, output, &tool_first, "arguments", tool_call.arguments_json);
+    if (tool_call.thought_signature) |signature| try appendStringField(allocator, output, &tool_first, "thoughtSignature", signature);
+    try output.append(allocator, '}');
+}
+
+fn appendCompactionResultField(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(u8),
+    first: *bool,
+    key: []const u8,
+    result: session_events.CompactionSessionResult,
+) !void {
+    try fieldPrefix(allocator, output, first, key);
+    try output.append(allocator, '{');
+    var result_first = true;
+    try appendStringField(allocator, output, &result_first, "summary", result.summary);
+    try appendStringField(allocator, output, &result_first, "firstKeptEntryId", result.first_kept_entry_id);
+    try appendUnsignedField(allocator, output, &result_first, "tokensBefore", result.tokens_before);
+    if (result.details_json) |details| try appendJsonOrStringField(allocator, output, &result_first, "details", details);
+    try output.append(allocator, '}');
 }
 
 fn appendModelField(
@@ -497,7 +799,7 @@ fn appendUnsignedField(
     output: *std.ArrayList(u8),
     first: *bool,
     key: []const u8,
-    value: u64,
+    value: anytype,
 ) !void {
     try fieldPrefix(allocator, output, first, key);
     try output.print(allocator, "{d}", .{value});
@@ -571,6 +873,19 @@ fn appendJsonOrStringField(
     try output.appendSlice(allocator, json);
 }
 
+fn appendJsonValueField(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(u8),
+    first: *bool,
+    key: []const u8,
+    value: std.json.Value,
+) !void {
+    try fieldPrefix(allocator, output, first, key);
+    const json = try std.json.Stringify.valueAlloc(allocator, value, .{});
+    defer allocator.free(json);
+    try output.appendSlice(allocator, json);
+}
+
 fn appendRawField(
     allocator: std.mem.Allocator,
     output: *std.ArrayList(u8),
@@ -611,6 +926,24 @@ fn thinkingLevelMapHasValues(map: ai.ThinkingLevelMap) bool {
         map.medium != .unset or
         map.high != .unset or
         map.xhigh != .unset;
+}
+
+fn stopReasonName(reason: ai.StopReason) []const u8 {
+    return switch (reason) {
+        .stop => "stop",
+        .length => "length",
+        .tool_use => "toolUse",
+        .@"error" => "error",
+        .aborted => "aborted",
+    };
+}
+
+fn compactionReasonName(reason: session_events.CompactionReason) []const u8 {
+    return switch (reason) {
+        .manual => "manual",
+        .threshold => "threshold",
+        .overflow => "overflow",
+    };
 }
 
 fn compatHasValues(compat: ai.ModelCompat) bool {

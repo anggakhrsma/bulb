@@ -1,8 +1,12 @@
 const std = @import("std");
 
 const ai = @import("bulb_ai");
+const bash_executor = @import("bash_executor.zig");
+const bash_tool = @import("tools/bash.zig");
+const extensions = @import("extensions/root.zig");
 const model_registry = @import("model_registry.zig");
 const rpc_types = @import("rpc_types.zig");
+const session_events = @import("session_events.zig");
 const session_manager = @import("session_manager.zig");
 const session_stats = @import("session_stats.zig");
 
@@ -14,6 +18,8 @@ pub const RpcModeOptions = struct {
     io: ?std.Io = null,
     model_registry: ?*model_registry.ModelRegistry = null,
     session_manager: ?*session_manager.SessionManager = null,
+    session_replay: ?*session_events.AgentSessionReplay = null,
+    bash_operations: ?bash_executor.BashOperations = null,
     initial_model: ?*const ai.Model = null,
     static_models: []const ai.Model = &.{},
     thinking_level: ai.ThinkingLevel = .medium,
@@ -25,6 +31,8 @@ pub const RpcMode = struct {
     io: std.Io,
     model_registry: ?*model_registry.ModelRegistry,
     session_manager: ?*session_manager.SessionManager,
+    session_replay: ?*session_events.AgentSessionReplay,
+    bash_operations: ?bash_executor.BashOperations,
     static_models: []const ai.Model,
     state: rpc_types.RpcSessionState,
     auto_retry_enabled: bool = true,
@@ -36,6 +44,8 @@ pub const RpcMode = struct {
             .io = options.io orelse std.Io.Threaded.global_single_threaded.io(),
             .model_registry = options.model_registry,
             .session_manager = options.session_manager,
+            .session_replay = options.session_replay,
+            .bash_operations = options.bash_operations,
             .static_models = options.static_models,
             .state = .{
                 .model = options.initial_model,
@@ -195,6 +205,7 @@ pub const RpcMode = struct {
                 defer self.allocator.free(message);
                 return rpc_types.errorLineAlloc(self.allocator, id, "set_steering_mode", message);
             };
+            if (self.session_replay) |replay| replay.setSteeringMode(sessionQueueMode(self.state.steering_mode));
             return rpc_types.successLineAlloc(self.allocator, id, "set_steering_mode", null);
         }
 
@@ -207,6 +218,7 @@ pub const RpcMode = struct {
                 defer self.allocator.free(message);
                 return rpc_types.errorLineAlloc(self.allocator, id, "set_follow_up_mode", message);
             };
+            if (self.session_replay) |replay| replay.setFollowUpMode(sessionQueueMode(self.state.follow_up_mode));
             return rpc_types.successLineAlloc(self.allocator, id, "set_follow_up_mode", null);
         }
 
@@ -224,9 +236,23 @@ pub const RpcMode = struct {
             return rpc_types.successLineAlloc(self.allocator, id, "set_auto_retry", null);
         }
 
+        if (std.mem.eql(u8, command_type, "abort_retry")) {
+            if (self.session_replay) |replay| {
+                var collector = ReplayEventCollector.init(self.allocator);
+                defer collector.deinit();
+                const subscription = try replay.bridge.subscribeWithHandle(collector.listener());
+                defer _ = replay.bridge.unsubscribe(subscription);
+                _ = replay.abortRetry();
+                const response = try rpc_types.successLineAlloc(self.allocator, id, command_type, null);
+                defer self.allocator.free(response);
+                try collector.appendLine(response);
+                return collector.toOwnedSlice();
+            }
+            return rpc_types.successLineAlloc(self.allocator, id, command_type, null);
+        }
+
         if (std.mem.eql(u8, command_type, "abort") or
-            std.mem.eql(u8, command_type, "abort_bash") or
-            std.mem.eql(u8, command_type, "abort_retry"))
+            std.mem.eql(u8, command_type, "abort_bash"))
         {
             return rpc_types.successLineAlloc(self.allocator, id, command_type, null);
         }
@@ -363,11 +389,23 @@ pub const RpcMode = struct {
             return rpc_types.successLineAlloc(self.allocator, id, "clone", data);
         }
 
-        if (std.mem.eql(u8, command_type, "prompt") or
-            std.mem.eql(u8, command_type, "steer") or
-            std.mem.eql(u8, command_type, "follow_up") or
-            std.mem.eql(u8, command_type, "compact") or
-            std.mem.eql(u8, command_type, "bash") or
+        if (std.mem.eql(u8, command_type, "prompt")) {
+            return self.promptWithReplayLineAlloc(id, object);
+        }
+
+        if (std.mem.eql(u8, command_type, "steer")) {
+            return self.queueWithReplayLineAlloc(id, "steer", object, .steer);
+        }
+
+        if (std.mem.eql(u8, command_type, "follow_up")) {
+            return self.queueWithReplayLineAlloc(id, "follow_up", object, .follow_up);
+        }
+
+        if (std.mem.eql(u8, command_type, "bash")) {
+            return self.bashLineAlloc(id, object);
+        }
+
+        if (std.mem.eql(u8, command_type, "compact") or
             std.mem.eql(u8, command_type, "export_html"))
         {
             return self.sessionRuntimeRequiredLineAlloc(id, command_type);
@@ -376,6 +414,125 @@ pub const RpcMode = struct {
         const message = try std.fmt.allocPrint(self.allocator, "Unknown command: {s}", .{command_type});
         defer self.allocator.free(message);
         return rpc_types.errorLineAlloc(self.allocator, null, command_type, message);
+    }
+
+    fn promptWithReplayLineAlloc(
+        self: *RpcMode,
+        id: ?[]const u8,
+        object: std.json.ObjectMap,
+    ) ![]u8 {
+        const replay = self.session_replay orelse
+            return self.sessionRuntimeRequiredLineAlloc(id, "prompt");
+        const message = optionalString(object, "message") orelse {
+            return rpc_types.errorLineAlloc(self.allocator, id, "prompt", "prompt requires message");
+        };
+        if (jsonArrayLen(object, "images") > 0) {
+            return rpc_types.errorLineAlloc(self.allocator, id, "prompt", "prompt images require live AgentSession runtime integration");
+        }
+
+        var collector = ReplayEventCollector.init(self.allocator);
+        defer collector.deinit();
+        const subscription = try replay.bridge.subscribeWithHandle(collector.listener());
+        defer _ = replay.bridge.unsubscribe(subscription);
+
+        const response = try rpc_types.successLineAlloc(self.allocator, id, "prompt", null);
+        defer self.allocator.free(response);
+        try collector.appendLine(response);
+
+        replay.prompt(self.io, message, self.timestampMs()) catch |err| {
+            collector.clear();
+            return self.commandErrorLineAlloc(id, "prompt", err);
+        };
+        try self.refreshSessionState();
+        return collector.toOwnedSlice();
+    }
+
+    fn queueWithReplayLineAlloc(
+        self: *RpcMode,
+        id: ?[]const u8,
+        command: []const u8,
+        object: std.json.ObjectMap,
+        delivery: session_events.CustomMessageDelivery,
+    ) ![]u8 {
+        const replay = self.session_replay orelse
+            return self.sessionRuntimeRequiredLineAlloc(id, command);
+        const message = optionalString(object, "message") orelse {
+            const error_message = try std.fmt.allocPrint(self.allocator, "{s} requires message", .{command});
+            defer self.allocator.free(error_message);
+            return rpc_types.errorLineAlloc(self.allocator, id, command, error_message);
+        };
+        if (jsonArrayLen(object, "images") > 0) {
+            const error_message = try std.fmt.allocPrint(
+                self.allocator,
+                "{s} images require live AgentSession runtime integration",
+                .{command},
+            );
+            defer self.allocator.free(error_message);
+            return rpc_types.errorLineAlloc(self.allocator, id, command, error_message);
+        }
+
+        var collector = ReplayEventCollector.init(self.allocator);
+        defer collector.deinit();
+        const subscription = try replay.bridge.subscribeWithHandle(collector.listener());
+        defer _ = replay.bridge.unsubscribe(subscription);
+
+        switch (delivery) {
+            .steer => replay.steer(message, self.timestampMs()) catch |err| {
+                collector.clear();
+                return self.commandErrorLineAlloc(id, command, err);
+            },
+            .follow_up => replay.followUp(message, self.timestampMs()) catch |err| {
+                collector.clear();
+                return self.commandErrorLineAlloc(id, command, err);
+            },
+            .next_turn => unreachable,
+        }
+        self.state.pending_message_count = replay.pendingMessageCount();
+
+        const response = try rpc_types.successLineAlloc(self.allocator, id, command, null);
+        defer self.allocator.free(response);
+        try collector.appendLine(response);
+        return collector.toOwnedSlice();
+    }
+
+    fn bashLineAlloc(
+        self: *RpcMode,
+        id: ?[]const u8,
+        object: std.json.ObjectMap,
+    ) ![]u8 {
+        const manager = self.session_manager orelse
+            return self.sessionRuntimeRequiredLineAlloc(id, "bash");
+        const command = optionalString(object, "command") orelse {
+            return rpc_types.errorLineAlloc(self.allocator, id, "bash", "bash requires command");
+        };
+        const exclude_from_context = optionalBool(object, "excludeFromContext") orelse false;
+        const operations = self.bash_operations orelse bash_tool.createLocalBashOperations(.{});
+
+        var result = bash_executor.executeBashWithOperationsAlloc(
+            self.allocator,
+            self.io,
+            command,
+            manager.getCwd(),
+            operations,
+            .{},
+        ) catch |err| return self.commandErrorLineAlloc(id, "bash", err);
+        defer result.deinit(self.allocator);
+
+        _ = manager.appendMessage(self.io, .{ .bash_execution = .{
+            .command = command,
+            .output = result.output,
+            .exit_code = if (result.exit_code) |code| @intCast(code) else null,
+            .cancelled = result.cancelled,
+            .truncated = result.truncated,
+            .full_output_path = result.full_output_path,
+            .timestamp_ms = self.timestampMs(),
+            .exclude_from_context = exclude_from_context,
+        } }) catch |err| return self.commandErrorLineAlloc(id, "bash", err);
+        try self.refreshSessionState();
+
+        const data = try rpc_types.bashResultDataJsonAlloc(self.allocator, result);
+        defer self.allocator.free(data);
+        return rpc_types.successLineAlloc(self.allocator, id, "bash", data);
     }
 
     fn availableModelsDataJsonAlloc(self: *RpcMode) ![]u8 {
@@ -454,6 +611,10 @@ pub const RpcMode = struct {
         const manager = self.session_manager orelse return;
         self.state.session_file = manager.getSessionFile();
         self.state.session_id = manager.getSessionId();
+        if (self.session_replay) |replay| {
+            self.state.is_streaming = replay.is_streaming;
+            self.state.pending_message_count = replay.pendingMessageCount();
+        }
 
         var context = try manager.buildSessionContextAlloc(self.allocator);
         defer context.deinit();
@@ -496,6 +657,10 @@ pub const RpcMode = struct {
         err: anyerror,
     ) ![]u8 {
         return rpc_types.errorLineAlloc(self.allocator, id, command, @errorName(err));
+    }
+
+    fn timestampMs(self: *RpcMode) i64 {
+        return std.Io.Clock.real.now(self.io).toMilliseconds();
     }
 
     fn forkMessagesAlloc(
@@ -581,6 +746,43 @@ pub const RpcMode = struct {
     }
 };
 
+const ReplayEventCollector = struct {
+    allocator: std.mem.Allocator,
+    lines: std.ArrayList(u8) = .empty,
+
+    fn init(allocator: std.mem.Allocator) ReplayEventCollector {
+        return .{ .allocator = allocator };
+    }
+
+    fn deinit(self: *ReplayEventCollector) void {
+        self.lines.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    fn listener(self: *ReplayEventCollector) session_events.SessionEventListener {
+        return .{ .ptr = self, .call_fn = onEvent };
+    }
+
+    fn appendLine(self: *ReplayEventCollector, line: []const u8) !void {
+        try self.lines.appendSlice(self.allocator, line);
+    }
+
+    fn clear(self: *ReplayEventCollector) void {
+        self.lines.clearRetainingCapacity();
+    }
+
+    fn toOwnedSlice(self: *ReplayEventCollector) ![]u8 {
+        return self.lines.toOwnedSlice(self.allocator);
+    }
+
+    fn onEvent(ptr: ?*anyopaque, event: session_events.SessionEvent) void {
+        const self: *ReplayEventCollector = @ptrCast(@alignCast(ptr.?));
+        const line = rpc_types.sessionEventLineAlloc(self.allocator, event) catch @panic("failed to serialize RPC session event");
+        defer self.allocator.free(line);
+        self.lines.appendSlice(self.allocator, line) catch @panic("failed to collect RPC session event");
+    }
+};
+
 fn deinitForkMessages(allocator: std.mem.Allocator, messages: []const rpc_types.ForkMessage) void {
     freeForkMessageItems(allocator, messages);
     allocator.free(messages);
@@ -643,6 +845,18 @@ fn sessionHasEntryType(manager: *const session_manager.SessionManager, entry_typ
         if (std.mem.eql(u8, current, entry_type)) return true;
     }
     return false;
+}
+
+fn sessionQueueMode(mode: rpc_types.QueueMode) session_events.QueueMode {
+    return switch (mode) {
+        .all => .all,
+        .one_at_a_time => .one_at_a_time,
+    };
+}
+
+fn jsonArrayLen(object: std.json.ObjectMap, key: []const u8) usize {
+    const value = object.get(key) orelse return 0;
+    return if (value == .array) value.array.items.len else 0;
 }
 
 fn nextModelFromPointers(models: []const *const ai.Model, current: ?*const ai.Model) ?*const ai.Model {
@@ -757,6 +971,172 @@ test "RPC mode returns available models and structured unsupported runtime error
     try std.testing.expectEqual(false, parsed_prompt.value.object.get("success").?.bool);
     try std.testing.expectEqualStrings("prompt", parsed_prompt.value.object.get("command").?.string);
     try std.testing.expect(std.mem.indexOf(u8, parsed_prompt.value.object.get("error").?.string, "AgentSession runtime integration") != null);
+}
+
+test "RPC mode prompt and queued messages emit replay-backed JSONL events" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var session = try session_manager.SessionManager.inMemory(allocator, io, "/tmp");
+    defer session.deinit();
+    var bridge = session_events.SessionEventBridge.init(allocator);
+    defer bridge.deinit();
+    var extension_runtime = extensions.createExtensionRuntime(allocator);
+    defer extension_runtime.deinit();
+    var registry: model_registry.ModelRegistry = undefined;
+    var runner = extensions.ExtensionRunner.init(allocator, &.{}, &extension_runtime, "/tmp", &session, &registry);
+    defer runner.deinit();
+    const retry = session_events.AutoRetryController.init(.{}, null);
+    var replay = session_events.AgentSessionReplay.init(allocator, &bridge, &runner, &session, retry, &.{});
+    defer replay.deinit();
+
+    const assistant_content = [_]ai.AssistantContent{.{ .text = .{ .text = "pong" } }};
+    const responses = [_]ai.AssistantMessage{.{
+        .content = &assistant_content,
+        .api = ai.types.api.openai_completions,
+        .provider = "demo",
+        .model = "demo",
+        .stop_reason = .stop,
+        .timestamp_ms = 2,
+    }};
+    replay.setResponses(&responses);
+
+    var mode = RpcMode.init(allocator, .{
+        .session_manager = &session,
+        .session_replay = &replay,
+    });
+    defer mode.deinit();
+
+    const prompt_response = (try mode.handleLineAlloc("{\"id\":\"p\",\"type\":\"prompt\",\"message\":\"ping\"}")).?;
+    defer allocator.free(prompt_response);
+    var lines = std.mem.splitScalar(u8, prompt_response, '\n');
+    const response_line = lines.next().?;
+    var parsed_response = try std.json.parseFromSlice(std.json.Value, allocator, response_line, .{});
+    defer parsed_response.deinit();
+    try std.testing.expectEqualStrings("response", parsed_response.value.object.get("type").?.string);
+    try std.testing.expectEqualStrings("prompt", parsed_response.value.object.get("command").?.string);
+    try std.testing.expect(parsed_response.value.object.get("success").?.bool);
+
+    var saw_agent_start = false;
+    var saw_text_delta = false;
+    var saw_agent_end = false;
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+        defer parsed.deinit();
+        const event_type = parsed.value.object.get("type").?.string;
+        if (std.mem.eql(u8, event_type, "agent_start")) saw_agent_start = true;
+        if (std.mem.eql(u8, event_type, "message_update")) {
+            const assistant_event = parsed.value.object.get("assistantMessageEvent").?.object;
+            if (std.mem.eql(u8, assistant_event.get("type").?.string, "text_delta")) {
+                saw_text_delta = true;
+                try std.testing.expectEqualStrings("pong", assistant_event.get("delta").?.string);
+                try std.testing.expectEqualStrings("assistant", assistant_event.get("partial").?.object.get("role").?.string);
+            }
+        }
+        if (std.mem.eql(u8, event_type, "agent_end")) {
+            saw_agent_end = true;
+            try std.testing.expectEqual(false, parsed.value.object.get("willRetry").?.bool);
+        }
+    }
+    try std.testing.expect(saw_agent_start);
+    try std.testing.expect(saw_text_delta);
+    try std.testing.expect(saw_agent_end);
+
+    const steer_response = (try mode.handleLineAlloc("{\"id\":\"s\",\"type\":\"steer\",\"message\":\"adjust\"}")).?;
+    defer allocator.free(steer_response);
+    var steer_lines = std.mem.splitScalar(u8, steer_response, '\n');
+    const queue_line = steer_lines.next().?;
+    var parsed_queue = try std.json.parseFromSlice(std.json.Value, allocator, queue_line, .{});
+    defer parsed_queue.deinit();
+    try std.testing.expectEqualStrings("queue_update", parsed_queue.value.object.get("type").?.string);
+    const steering = parsed_queue.value.object.get("steering").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), steering.len);
+    try std.testing.expectEqualStrings("adjust", steering[0].string);
+
+    const steer_success = steer_lines.next().?;
+    var parsed_steer_success = try std.json.parseFromSlice(std.json.Value, allocator, steer_success, .{});
+    defer parsed_steer_success.deinit();
+    try std.testing.expectEqualStrings("steer", parsed_steer_success.value.object.get("command").?.string);
+    try std.testing.expect(parsed_steer_success.value.object.get("success").?.bool);
+
+    const follow_response = (try mode.handleLineAlloc("{\"id\":\"f\",\"type\":\"follow_up\",\"message\":\"next\"}")).?;
+    defer allocator.free(follow_response);
+    var follow_lines = std.mem.splitScalar(u8, follow_response, '\n');
+    const follow_queue_line = follow_lines.next().?;
+    var parsed_follow_queue = try std.json.parseFromSlice(std.json.Value, allocator, follow_queue_line, .{});
+    defer parsed_follow_queue.deinit();
+    try std.testing.expectEqualStrings("queue_update", parsed_follow_queue.value.object.get("type").?.string);
+    const follow_up = parsed_follow_queue.value.object.get("followUp").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), follow_up.len);
+    try std.testing.expectEqualStrings("next", follow_up[0].string);
+
+    const follow_success = follow_lines.next().?;
+    var parsed_follow_success = try std.json.parseFromSlice(std.json.Value, allocator, follow_success, .{});
+    defer parsed_follow_success.deinit();
+    try std.testing.expectEqualStrings("follow_up", parsed_follow_success.value.object.get("command").?.string);
+    try std.testing.expect(parsed_follow_success.value.object.get("success").?.bool);
+
+    const state_response = (try mode.handleLineAlloc("{\"id\":\"state\",\"type\":\"get_state\"}")).?;
+    defer allocator.free(state_response);
+    var parsed_state = try std.json.parseFromSlice(std.json.Value, allocator, state_response[0 .. state_response.len - 1], .{});
+    defer parsed_state.deinit();
+    try std.testing.expectEqual(@as(i64, 2), parsed_state.value.object.get("data").?.object.get("pendingMessageCount").?.integer);
+}
+
+const FakeBashOperations = struct {
+    chunks: []const []const u8,
+    exit_code: ?i32 = 0,
+
+    fn operations(self: *FakeBashOperations) bash_executor.BashOperations {
+        return .{ .ptr = self, .exec_fn = exec };
+    }
+
+    fn exec(
+        ptr: ?*anyopaque,
+        _: std.mem.Allocator,
+        _: std.Io,
+        _: []const u8,
+        _: []const u8,
+        options: bash_executor.BashExecOptions,
+    ) !bash_executor.BashExecResult {
+        const self: *FakeBashOperations = @ptrCast(@alignCast(ptr.?));
+        for (self.chunks) |chunk| try options.on_data.call(chunk);
+        return .{ .exit_code = self.exit_code };
+    }
+};
+
+test "RPC mode executes bash and records bashExecution messages" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var session = try session_manager.SessionManager.inMemory(allocator, io, "/tmp");
+    defer session.deinit();
+    const chunks = [_][]const u8{"hello\n"};
+    var fake = FakeBashOperations{ .chunks = &chunks, .exit_code = 0 };
+    var mode = RpcMode.init(allocator, .{
+        .session_manager = &session,
+        .bash_operations = fake.operations(),
+    });
+    defer mode.deinit();
+
+    const response = (try mode.handleLineAlloc("{\"id\":\"b\",\"type\":\"bash\",\"command\":\"printf hello\"}")).?;
+    defer allocator.free(response);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response[0 .. response.len - 1], .{});
+    defer parsed.deinit();
+    const data = parsed.value.object.get("data").?.object;
+    try std.testing.expectEqualStrings("hello\n", data.get("output").?.string);
+    try std.testing.expectEqual(@as(i64, 0), data.get("exitCode").?.integer);
+    try std.testing.expectEqual(false, data.get("cancelled").?.bool);
+
+    const messages_response = (try mode.handleLineAlloc("{\"id\":\"m\",\"type\":\"get_messages\"}")).?;
+    defer allocator.free(messages_response);
+    var parsed_messages = try std.json.parseFromSlice(std.json.Value, allocator, messages_response[0 .. messages_response.len - 1], .{});
+    defer parsed_messages.deinit();
+    const messages_array = parsed_messages.value.object.get("data").?.object.get("messages").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), messages_array.len);
+    const bash_message = messages_array[0].object;
+    try std.testing.expectEqualStrings("bashExecution", bash_message.get("role").?.string);
+    try std.testing.expectEqualStrings("printf hello", bash_message.get("command").?.string);
+    try std.testing.expectEqualStrings("hello\n", bash_message.get("output").?.string);
 }
 
 test "RPC mode exposes persisted session messages stats fork candidates and state" {
