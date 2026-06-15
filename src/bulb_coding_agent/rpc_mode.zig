@@ -3,6 +3,7 @@ const std = @import("std");
 const ai = @import("bulb_ai");
 const bash_executor = @import("bash_executor.zig");
 const bash_tool = @import("tools/bash.zig");
+const compaction_mod = @import("compaction.zig");
 const extensions = @import("extensions/root.zig");
 const model_registry = @import("model_registry.zig");
 const rpc_types = @import("rpc_types.zig");
@@ -226,6 +227,11 @@ pub const RpcMode = struct {
             self.state.auto_compaction_enabled = optionalBool(object, "enabled") orelse {
                 return rpc_types.errorLineAlloc(self.allocator, id, "set_auto_compaction", "set_auto_compaction requires enabled");
             };
+            if (self.session_replay) |replay| {
+                if (replay.auto_compaction) |*config| {
+                    config.settings.enabled = self.state.auto_compaction_enabled;
+                }
+            }
             return rpc_types.successLineAlloc(self.allocator, id, "set_auto_compaction", null);
         }
 
@@ -405,9 +411,11 @@ pub const RpcMode = struct {
             return self.bashLineAlloc(id, object);
         }
 
-        if (std.mem.eql(u8, command_type, "compact") or
-            std.mem.eql(u8, command_type, "export_html"))
-        {
+        if (std.mem.eql(u8, command_type, "compact")) {
+            return self.compactWithReplayLineAlloc(id, object);
+        }
+
+        if (std.mem.eql(u8, command_type, "export_html")) {
             return self.sessionRuntimeRequiredLineAlloc(id, command_type);
         }
 
@@ -535,6 +543,46 @@ pub const RpcMode = struct {
         return rpc_types.successLineAlloc(self.allocator, id, "bash", data);
     }
 
+    fn compactWithReplayLineAlloc(
+        self: *RpcMode,
+        id: ?[]const u8,
+        object: std.json.ObjectMap,
+    ) ![]u8 {
+        const replay = self.session_replay orelse
+            return self.sessionRuntimeRequiredLineAlloc(id, "compact");
+        if (replay.auto_compaction == null) {
+            return self.sessionRuntimeRequiredLineAlloc(id, "compact");
+        }
+
+        var collector = ReplayEventCollector.init(self.allocator);
+        defer collector.deinit();
+        const subscription = try replay.bridge.subscribeWithHandle(collector.listener());
+        defer _ = replay.bridge.unsubscribe(subscription);
+
+        var signal: ai.AbortSignal = .{};
+        self.state.is_compacting = true;
+        const result = replay.compactManual(
+            self.io,
+            optionalString(object, "customInstructions"),
+            &signal,
+        ) catch |err| {
+            self.state.is_compacting = false;
+            const response = try self.compactErrorLineAlloc(id, err);
+            defer self.allocator.free(response);
+            try collector.appendLine(response);
+            return collector.toOwnedSlice();
+        };
+        self.state.is_compacting = false;
+        try self.refreshSessionState();
+
+        const data = try rpc_types.compactionResultDataJsonAlloc(self.allocator, result);
+        defer self.allocator.free(data);
+        const response = try rpc_types.successLineAlloc(self.allocator, id, "compact", data);
+        defer self.allocator.free(response);
+        try collector.appendLine(response);
+        return collector.toOwnedSlice();
+    }
+
     fn availableModelsDataJsonAlloc(self: *RpcMode) ![]u8 {
         if (self.model_registry) |registry| {
             const available = try registry.getAvailableAlloc(self.allocator);
@@ -614,6 +662,9 @@ pub const RpcMode = struct {
         if (self.session_replay) |replay| {
             self.state.is_streaming = replay.is_streaming;
             self.state.pending_message_count = replay.pendingMessageCount();
+            if (replay.auto_compaction) |config| {
+                self.state.auto_compaction_enabled = config.settings.enabled;
+            }
         }
 
         var context = try manager.buildSessionContextAlloc(self.allocator);
@@ -657,6 +708,17 @@ pub const RpcMode = struct {
         err: anyerror,
     ) ![]u8 {
         return rpc_types.errorLineAlloc(self.allocator, id, command, @errorName(err));
+    }
+
+    fn compactErrorLineAlloc(self: *RpcMode, id: ?[]const u8, err: anyerror) ![]u8 {
+        const message: []const u8 = switch (err) {
+            error.AlreadyCompacted => "Already compacted",
+            error.NothingToCompact => "Nothing to compact (session too small)",
+            error.CompactionCancelled => "Compaction cancelled",
+            error.CompactionAuthUnavailable => "Compaction failed: missing authentication",
+            else => @errorName(err),
+        };
+        return rpc_types.errorLineAlloc(self.allocator, id, "compact", message);
     }
 
     fn timestampMs(self: *RpcMode) i64 {
@@ -1081,6 +1143,148 @@ test "RPC mode prompt and queued messages emit replay-backed JSONL events" {
     var parsed_state = try std.json.parseFromSlice(std.json.Value, allocator, state_response[0 .. state_response.len - 1], .{});
     defer parsed_state.deinit();
     try std.testing.expectEqual(@as(i64, 2), parsed_state.value.object.get("data").?.object.get("pendingMessageCount").?.integer);
+}
+
+const RpcCompactSummaryState = struct {
+    summary: []const u8,
+    calls: usize = 0,
+    content: [1]ai.AssistantContent = undefined,
+
+    fn executor(self: *@This()) compaction_mod.SummaryExecutor {
+        return .{ .ptr = self, .complete_fn = complete };
+    }
+
+    fn complete(
+        ptr: ?*anyopaque,
+        model: ai.Model,
+        context: ai.Context,
+        options: ai.SimpleStreamOptions,
+    ) !ai.AssistantMessage {
+        _ = context;
+        _ = options;
+        const self: *@This() = @ptrCast(@alignCast(ptr.?));
+        self.calls += 1;
+        self.content[0] = .{ .text = .{ .text = self.summary } };
+        return .{
+            .content = self.content[0..],
+            .api = model.api,
+            .provider = model.provider,
+            .model = model.id,
+            .stop_reason = .stop,
+        };
+    }
+};
+
+fn rpcCompactModel() ai.Model {
+    return .{
+        .id = "rpc-compact",
+        .name = "RPC Compact",
+        .api = ai.types.api.openai_responses,
+        .provider = "demo",
+        .base_url = "https://example.invalid",
+        .context_window = 200_000,
+        .max_tokens = 8192,
+    };
+}
+
+test "RPC mode compact emits replay-backed compaction events and result" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var session = try session_manager.SessionManager.inMemory(allocator, io, "/tmp");
+    defer session.deinit();
+    var bridge = session_events.SessionEventBridge.init(allocator);
+    defer bridge.deinit();
+    var extension_runtime = extensions.createExtensionRuntime(allocator);
+    defer extension_runtime.deinit();
+    var registry: model_registry.ModelRegistry = undefined;
+    var runner = extensions.ExtensionRunner.init(allocator, &.{}, &extension_runtime, "/tmp", &session, &registry);
+    defer runner.deinit();
+    const retry = session_events.AutoRetryController.init(.{ .enabled = false }, null);
+    var replay = session_events.AgentSessionReplay.init(allocator, &bridge, &runner, &session, retry, &.{});
+    defer replay.deinit();
+
+    const assistant_content = [_]ai.AssistantContent{.{ .text = .{ .text = "reply before compact" } }};
+    const responses = [_]ai.AssistantMessage{.{
+        .content = &assistant_content,
+        .api = ai.types.api.openai_completions,
+        .provider = "demo",
+        .model = "demo",
+        .stop_reason = .stop,
+        .timestamp_ms = 2,
+    }};
+    replay.setResponses(&responses);
+    try replay.prompt(io, "message to compact", 1);
+
+    var summary_state = RpcCompactSummaryState{ .summary = "rpc compact summary" };
+    replay.setAutoCompaction(.{
+        .model = rpcCompactModel(),
+        .executor = summary_state.executor(),
+        .settings = .{ .reserve_tokens = 1024, .keep_recent_tokens = 1 },
+    });
+
+    var mode = RpcMode.init(allocator, .{
+        .session_manager = &session,
+        .session_replay = &replay,
+    });
+    defer mode.deinit();
+
+    const disabled = (try mode.handleLineAlloc("{\"id\":\"ac0\",\"type\":\"set_auto_compaction\",\"enabled\":false}")).?;
+    defer allocator.free(disabled);
+    try std.testing.expectEqual(false, replay.auto_compaction.?.settings.enabled);
+
+    const state_response = (try mode.handleLineAlloc("{\"id\":\"state\",\"type\":\"get_state\"}")).?;
+    defer allocator.free(state_response);
+    var parsed_state = try std.json.parseFromSlice(std.json.Value, allocator, state_response[0 .. state_response.len - 1], .{});
+    defer parsed_state.deinit();
+    try std.testing.expectEqual(false, parsed_state.value.object.get("data").?.object.get("autoCompactionEnabled").?.bool);
+
+    const enabled = (try mode.handleLineAlloc("{\"id\":\"ac1\",\"type\":\"set_auto_compaction\",\"enabled\":true}")).?;
+    defer allocator.free(enabled);
+    try std.testing.expectEqual(true, replay.auto_compaction.?.settings.enabled);
+
+    const compact_response = (try mode.handleLineAlloc("{\"id\":\"c\",\"type\":\"compact\",\"customInstructions\":\"keep it crisp\"}")).?;
+    defer allocator.free(compact_response);
+    try std.testing.expectEqual(@as(usize, 1), summary_state.calls);
+
+    var saw_start = false;
+    var saw_end = false;
+    var saw_success = false;
+    var saw_first_kept_entry_id = false;
+    var lines = std.mem.splitScalar(u8, compact_response, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+        defer parsed.deinit();
+        const line_type = parsed.value.object.get("type").?.string;
+        if (std.mem.eql(u8, line_type, "compaction_start")) {
+            saw_start = true;
+            try std.testing.expectEqualStrings("manual", parsed.value.object.get("reason").?.string);
+        } else if (std.mem.eql(u8, line_type, "compaction_end")) {
+            saw_end = true;
+            const result = parsed.value.object.get("result").?.object;
+            try std.testing.expectEqualStrings("manual", parsed.value.object.get("reason").?.string);
+            try std.testing.expect(std.mem.indexOf(u8, result.get("summary").?.string, "rpc compact summary") != null);
+            try std.testing.expect(result.get("firstKeptEntryId").?.string.len > 0);
+        } else {
+            saw_success = true;
+            try std.testing.expectEqualStrings("response", line_type);
+            try std.testing.expectEqualStrings("compact", parsed.value.object.get("command").?.string);
+            try std.testing.expect(parsed.value.object.get("success").?.bool);
+            const data = parsed.value.object.get("data").?.object;
+            try std.testing.expect(std.mem.indexOf(u8, data.get("summary").?.string, "rpc compact summary") != null);
+            saw_first_kept_entry_id = data.get("firstKeptEntryId").?.string.len > 0;
+            try std.testing.expect(data.get("tokensBefore").?.integer > 0);
+            try std.testing.expect(data.get("details").?.object.get("readFiles") != null);
+        }
+    }
+    try std.testing.expect(saw_start);
+    try std.testing.expect(saw_end);
+    try std.testing.expect(saw_success);
+    try std.testing.expect(saw_first_kept_entry_id);
+
+    const entries = session.getEntries();
+    try std.testing.expectEqual(@as(usize, 3), entries.len);
+    try std.testing.expectEqualStrings("compaction", entries[2].entry_type.?);
 }
 
 const FakeBashOperations = struct {

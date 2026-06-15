@@ -315,6 +315,16 @@ pub fn bashResultDataJsonAlloc(
     return output.toOwnedSlice(allocator);
 }
 
+pub fn compactionResultDataJsonAlloc(
+    allocator: std.mem.Allocator,
+    result: session_events.CompactionSessionResult,
+) ![]u8 {
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(allocator);
+    try appendCompactionResultJson(allocator, &output, result);
+    return output.toOwnedSlice(allocator);
+}
+
 pub fn sessionEventLineAlloc(
     allocator: std.mem.Allocator,
     event: session_events.SessionEvent,
@@ -622,6 +632,14 @@ fn appendCompactionResultField(
     result: session_events.CompactionSessionResult,
 ) !void {
     try fieldPrefix(allocator, output, first, key);
+    try appendCompactionResultJson(allocator, output, result);
+}
+
+fn appendCompactionResultJson(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(u8),
+    result: session_events.CompactionSessionResult,
+) !void {
     try output.append(allocator, '{');
     var result_first = true;
     try appendStringField(allocator, output, &result_first, "summary", result.summary);

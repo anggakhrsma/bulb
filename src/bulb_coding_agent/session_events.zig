@@ -859,6 +859,76 @@ pub const AgentSessionReplay = struct {
         );
     }
 
+    pub fn compactManual(
+        self: *AgentSessionReplay,
+        io: std.Io,
+        custom_instructions: ?[]const u8,
+        signal: *ai.AbortSignal,
+    ) !CompactionSessionResult {
+        const config = self.auto_compaction orelse {
+            self.bridge.handleCompactionStart(.manual);
+            self.bridge.handleCompactionEnd(.{
+                .reason = .manual,
+                .result = null,
+                .aborted = false,
+                .will_retry = false,
+                .error_message = "Compaction runtime not configured",
+            });
+            return error.CompactionNotConfigured;
+        };
+
+        var resolved_request_options: ?ResolvedCompactionRequestOptions = null;
+        defer {
+            if (resolved_request_options) |*resolved| resolved.deinit(self.allocator);
+        }
+        var request_options = config.request_options;
+        request_options.signal = signal;
+        request_options.custom_instructions = custom_instructions;
+        if (config.auth_resolver) |resolver| {
+            resolved_request_options = try resolver.resolveAlloc(self.allocator, config.model, request_options);
+            if (resolved_request_options) |resolved| {
+                request_options = resolved.options;
+            } else {
+                self.bridge.handleCompactionStart(.manual);
+                self.bridge.handleCompactionEnd(.{
+                    .reason = .manual,
+                    .result = null,
+                    .aborted = false,
+                    .will_retry = false,
+                    .error_message = "Compaction failed: missing authentication",
+                });
+                return error.CompactionAuthUnavailable;
+            }
+        }
+
+        const branch_entries = try self.sessions.getBranchAlloc(self.allocator, null);
+        defer self.allocator.free(branch_entries);
+        var preparation = (try compaction_mod.prepareCompaction(self.allocator, branch_entries, config.settings)) orelse {
+            self.bridge.handleCompactionStart(.manual);
+            const already_compacted = branch_entries.len > 0 and
+                (try fileEntryTypeEqualsAlloc(self.allocator, branch_entries[branch_entries.len - 1], "compaction"));
+            self.bridge.handleCompactionEnd(.{
+                .reason = .manual,
+                .result = null,
+                .aborted = false,
+                .will_retry = false,
+                .error_message = if (already_compacted) "Already compacted" else "Nothing to compact (session too small)",
+            });
+            return if (already_compacted) error.AlreadyCompacted else error.NothingToCompact;
+        };
+        defer preparation.deinit();
+
+        return try self.compactWithGeneratedSummary(
+            io,
+            &preparation,
+            config.model,
+            request_options,
+            config.executor,
+            .manual,
+            false,
+        );
+    }
+
     pub fn checkAutoCompaction(
         self: *AgentSessionReplay,
         io: std.Io,
