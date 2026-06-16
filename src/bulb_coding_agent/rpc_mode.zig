@@ -5,6 +5,7 @@ const agent_session_runtime = @import("agent_session_runtime.zig");
 const bash_executor = @import("bash_executor.zig");
 const bash_tool = @import("tools/bash.zig");
 const compaction_mod = @import("compaction.zig");
+const export_html = @import("export_html.zig");
 const extensions = @import("extensions/root.zig");
 const model_registry = @import("model_registry.zig");
 const rpc_runtime_host = @import("rpc_runtime_host.zig");
@@ -458,7 +459,15 @@ pub const RpcMode = struct {
         }
 
         if (std.mem.eql(u8, command_type, "export_html")) {
-            return self.sessionRuntimeRequiredLineAlloc(id, command_type);
+            const manager = self.session_manager orelse
+                return self.sessionRuntimeRequiredLineAlloc(id, "export_html");
+            const output_path = optionalString(object, "outputPath");
+            const path = export_html.exportSessionToHtmlAlloc(self.allocator, self.io, manager, output_path) catch |err|
+                return self.commandErrorLineAlloc(id, "export_html", err);
+            defer self.allocator.free(path);
+            const data = try rpc_types.exportHtmlDataJsonAlloc(self.allocator, path);
+            defer self.allocator.free(data);
+            return rpc_types.successLineAlloc(self.allocator, id, "export_html", data);
         }
 
         const message = try std.fmt.allocPrint(self.allocator, "Unknown command: {s}", .{command_type});
@@ -1556,6 +1565,68 @@ test "RPC mode exposes persisted session messages stats fork candidates and stat
     try std.testing.expectEqualStrings("high", context.thinking_level);
     try std.testing.expectEqualStrings("demo", context.model.?.provider);
     try std.testing.expectEqualStrings("demo", context.model.?.model_id);
+}
+
+test "RPC mode exports persisted session to escaped HTML" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(cwd);
+    const root = try std.fs.path.join(allocator, &.{ cwd, ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(root);
+    const project_dir = try std.fs.path.join(allocator, &.{ root, "project" });
+    defer allocator.free(project_dir);
+    const session_dir = try std.fs.path.join(allocator, &.{ root, "sessions" });
+    defer allocator.free(session_dir);
+    const output_path = try std.fs.path.join(allocator, &.{ root, "exports", "rpc-session.html" });
+    defer allocator.free(output_path);
+
+    try std.Io.Dir.cwd().createDirPath(io, project_dir);
+    try std.Io.Dir.cwd().createDirPath(io, session_dir);
+
+    var session = try session_manager.SessionManager.create(allocator, io, project_dir, session_dir, .{});
+    defer session.deinit();
+
+    const user_content = [_]ai.UserContent{.{ .text = .{ .text = "<script>alert(1)</script>" } }};
+    _ = try session.appendMessage(io, .{ .user = .{
+        .content = &user_content,
+        .timestamp_ms = 1,
+    } });
+    const assistant_content = [_]ai.AssistantContent{.{ .text = .{ .text = "reply" } }};
+    _ = try session.appendMessage(io, .{ .assistant = .{
+        .content = &assistant_content,
+        .api = ai.types.api.openai_completions,
+        .provider = "demo",
+        .model = "demo",
+        .stop_reason = .stop,
+        .timestamp_ms = 2,
+    } });
+
+    var mode = RpcMode.init(allocator, .{ .session_manager = &session });
+    defer mode.deinit();
+
+    const command = try std.fmt.allocPrint(
+        allocator,
+        "{{\"id\":\"x\",\"type\":\"export_html\",\"outputPath\":\"{s}\"}}",
+        .{output_path},
+    );
+    defer allocator.free(command);
+    const response = (try mode.handleLineAlloc(command)).?;
+    defer allocator.free(response);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response[0 .. response.len - 1], .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("success").?.bool);
+    try std.testing.expectEqualStrings("export_html", parsed.value.object.get("command").?.string);
+    try std.testing.expectEqualStrings(output_path, parsed.value.object.get("data").?.object.get("path").?.string);
+
+    const html = try std.Io.Dir.cwd().readFileAlloc(io, output_path, allocator, .unlimited);
+    defer allocator.free(html);
+    try std.testing.expect(std.mem.indexOf(u8, html, "&lt;script&gt;alert(1)&lt;/script&gt;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "reply") != null);
 }
 
 test "RPC mode performs session fork clone new and switch lifecycle commands" {

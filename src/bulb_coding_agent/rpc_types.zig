@@ -202,6 +202,16 @@ pub fn forkDataJsonAlloc(allocator: std.mem.Allocator, selected_text: []const u8
     return output.toOwnedSlice(allocator);
 }
 
+pub fn exportHtmlDataJsonAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(allocator);
+    try output.append(allocator, '{');
+    var first = true;
+    try appendStringField(allocator, &output, &first, "path", path);
+    try output.append(allocator, '}');
+    return output.toOwnedSlice(allocator);
+}
+
 pub fn emptyCommandsDataJsonAlloc(allocator: std.mem.Allocator) ![]u8 {
     return allocator.dupe(u8, "{\"commands\":[]}");
 }

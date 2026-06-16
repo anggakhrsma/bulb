@@ -25,6 +25,7 @@ pub const assistant_message = @import("assistant_message.zig");
 pub const footer = @import("footer.zig");
 pub const ansi = @import("ansi.zig");
 pub const bash_executor = @import("bash_executor.zig");
+pub const export_html = @import("export_html.zig");
 pub const cli_args = @import("cli_args.zig");
 pub const event_bus = @import("event_bus.zig");
 pub const file_processor = @import("file_processor.zig");
@@ -266,6 +267,7 @@ test {
     _ = @import("footer.zig");
     _ = @import("ansi.zig");
     _ = @import("bash_executor.zig");
+    _ = @import("export_html.zig");
     _ = @import("cli_args.zig");
     _ = @import("event_bus.zig");
     _ = @import("file_processor.zig");
