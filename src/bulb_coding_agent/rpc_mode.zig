@@ -338,7 +338,7 @@ pub const RpcMode = struct {
         }
 
         if (std.mem.eql(u8, command_type, "get_commands")) {
-            const data = try rpc_types.emptyCommandsDataJsonAlloc(self.allocator);
+            const data = try self.commandsDataJsonAlloc();
             defer self.allocator.free(data);
             return rpc_types.successLineAlloc(self.allocator, id, "get_commands", data);
         }
@@ -670,6 +670,63 @@ pub const RpcMode = struct {
     fn static_modelsOrGenerated(self: RpcMode) []const ai.Model {
         if (self.static_models.len > 0) return self.static_models;
         return ai.models.allModels();
+    }
+
+    fn commandsDataJsonAlloc(self: *RpcMode) ![]u8 {
+        const runtime = self.session_runtime orelse return rpc_types.emptyCommandsDataJsonAlloc(self.allocator);
+        var resolved = try runtime.session.getExtensionRunner().getRegisteredCommandsAlloc(self.allocator);
+        defer resolved.deinit();
+
+        const services = runtime.getServices();
+        const prompts = services.resource_loader.getPrompts().prompts;
+        const skills = services.resource_loader.getSkills().skills;
+        var commands = try self.allocator.alloc(
+            rpc_types.RpcSlashCommand,
+            resolved.commands.len + prompts.len + skills.len,
+        );
+        defer self.allocator.free(commands);
+
+        var skill_names: std.ArrayList([]u8) = .empty;
+        defer {
+            for (skill_names.items) |name| self.allocator.free(name);
+            skill_names.deinit(self.allocator);
+        }
+
+        var index: usize = 0;
+        for (resolved.commands) |command| {
+            commands[index] = .{
+                .name = command.invocation_name,
+                .description = command.command.description,
+                .source = .extension,
+                .source_info = command.command.source_info,
+            };
+            index += 1;
+        }
+        for (prompts) |template| {
+            commands[index] = .{
+                .name = template.name,
+                .description = template.description,
+                .source = .prompt,
+                .source_info = template.source_info,
+            };
+            index += 1;
+        }
+        for (skills) |skill| {
+            const command_name = try std.fmt.allocPrint(self.allocator, "skill:{s}", .{skill.name});
+            skill_names.append(self.allocator, command_name) catch |err| {
+                self.allocator.free(command_name);
+                return err;
+            };
+            commands[index] = .{
+                .name = command_name,
+                .description = skill.description,
+                .source = .skill,
+                .source_info = skill.source_info,
+            };
+            index += 1;
+        }
+
+        return rpc_types.commandsDataJsonAlloc(self.allocator, commands);
     }
 
     fn readStdinLineAlloc(self: *RpcMode, reader: *std.Io.File.Reader) ![]u8 {
@@ -1013,6 +1070,15 @@ fn optionalString(object: std.json.ObjectMap, key: []const u8) ?[]const u8 {
 fn optionalBool(object: std.json.ObjectMap, key: []const u8) ?bool {
     const value = object.get(key) orelse return null;
     return if (value == .bool) value.bool else null;
+}
+
+fn writeRpcTestFile(path: []const u8, data: []const u8) !void {
+    if (std.fs.path.dirname(path)) |parent| try std.Io.Dir.cwd().createDirPath(std.testing.io, parent);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = path,
+        .data = data,
+        .flags = .{ .read = true, .truncate = true },
+    });
 }
 
 test "RPC mode handles state thinking queue and session-name commands" {
@@ -1669,4 +1735,89 @@ test "RPC mode uses AgentSessionRuntime for session lifecycle commands" {
     defer parsed_switch.deinit();
     try std.testing.expect(parsed_switch.value.object.get("success").?.bool);
     try std.testing.expectEqualStrings(first_path, mode.session_manager.?.getSessionFile().?);
+}
+
+test "RPC mode get_commands uses AgentSessionRuntime prompt templates and skills" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(cwd);
+    const root = try std.fs.path.join(allocator, &.{ cwd, ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(root);
+    const project_dir = try std.fs.path.join(allocator, &.{ root, "project" });
+    defer allocator.free(project_dir);
+    const agent_dir = try std.fs.path.join(allocator, &.{ root, "agent" });
+    defer allocator.free(agent_dir);
+    const session_dir = try std.fs.path.join(allocator, &.{ root, "sessions" });
+    defer allocator.free(session_dir);
+    const prompt_path = try std.fs.path.join(allocator, &.{ root, "prompts", "review.md" });
+    defer allocator.free(prompt_path);
+    const skill_root = try std.fs.path.join(allocator, &.{ root, "skills" });
+    defer allocator.free(skill_root);
+    const skill_path = try std.fs.path.join(allocator, &.{ skill_root, "debug-tool", "SKILL.md" });
+    defer allocator.free(skill_path);
+
+    try std.Io.Dir.cwd().createDirPath(io, project_dir);
+    try std.Io.Dir.cwd().createDirPath(io, agent_dir);
+    try writeRpcTestFile(prompt_path,
+        \\---
+        \\description: Review code
+        \\---
+        \\Review $ARGUMENTS
+    );
+    try writeRpcTestFile(skill_path,
+        \\---
+        \\name: debug-tool
+        \\description: Debug helper
+        \\---
+        \\Use the debugger.
+    );
+
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put("HOME", root);
+
+    const manager = try allocator.create(session_manager.SessionManager);
+    manager.* = try session_manager.SessionManager.create(allocator, io, project_dir, session_dir, .{});
+
+    var host = rpc_runtime_host.RpcRuntimeHost.init(allocator, io, .{
+        .env = &env,
+        .agent_dir = agent_dir,
+        .resource_loader_options = .{
+            .additional_skill_paths = &.{skill_root},
+            .additional_prompt_template_paths = &.{prompt_path},
+            .no_extensions = true,
+            .no_skills = true,
+            .no_prompt_templates = true,
+            .no_themes = true,
+            .no_context_files = true,
+        },
+    });
+    try host.start(manager);
+    defer host.deinit();
+
+    var mode = RpcMode.init(allocator, .{ .session_runtime = &host.runtime });
+    defer mode.deinit();
+
+    const response = (try mode.handleLineAlloc("{\"id\":\"cmd\",\"type\":\"get_commands\"}")).?;
+    defer allocator.free(response);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response[0 .. response.len - 1], .{});
+    defer parsed.deinit();
+    const commands = parsed.value.object.get("data").?.object.get("commands").?.array.items;
+
+    try std.testing.expectEqual(@as(usize, 2), commands.len);
+    try std.testing.expectEqualStrings("review", commands[0].object.get("name").?.string);
+    try std.testing.expectEqualStrings("Review code", commands[0].object.get("description").?.string);
+    try std.testing.expectEqualStrings("prompt", commands[0].object.get("source").?.string);
+    try std.testing.expectEqualStrings(prompt_path, commands[0].object.get("sourceInfo").?.object.get("path").?.string);
+    try std.testing.expectEqualStrings("temporary", commands[0].object.get("sourceInfo").?.object.get("scope").?.string);
+
+    try std.testing.expectEqualStrings("skill:debug-tool", commands[1].object.get("name").?.string);
+    try std.testing.expectEqualStrings("Debug helper", commands[1].object.get("description").?.string);
+    try std.testing.expectEqualStrings("skill", commands[1].object.get("source").?.string);
+    try std.testing.expectEqualStrings(skill_path, commands[1].object.get("sourceInfo").?.object.get("path").?.string);
+    try std.testing.expectEqualStrings("temporary", commands[1].object.get("sourceInfo").?.object.get("scope").?.string);
 }

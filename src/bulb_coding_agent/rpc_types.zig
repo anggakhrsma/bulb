@@ -2,6 +2,7 @@ const std = @import("std");
 const ai = @import("bulb_ai");
 const bash_executor = @import("bash_executor.zig");
 const messages = @import("messages.zig");
+const source_info = @import("source_info.zig");
 const session_manager = @import("session_manager.zig");
 const session_events = @import("session_events.zig");
 const session_stats = @import("session_stats.zig");
@@ -24,6 +25,19 @@ pub const RpcSessionState = struct {
     auto_compaction_enabled: bool = true,
     message_count: u64 = 0,
     pending_message_count: u64 = 0,
+};
+
+pub const RpcSlashCommandSource = enum {
+    extension,
+    prompt,
+    skill,
+};
+
+pub const RpcSlashCommand = struct {
+    name: []const u8,
+    description: ?[]const u8 = null,
+    source: RpcSlashCommandSource,
+    source_info: source_info.SourceInfo,
 };
 
 pub fn thinkingLevelName(level: ai.ThinkingLevel) []const u8 {
@@ -190,6 +204,21 @@ pub fn forkDataJsonAlloc(allocator: std.mem.Allocator, selected_text: []const u8
 
 pub fn emptyCommandsDataJsonAlloc(allocator: std.mem.Allocator) ![]u8 {
     return allocator.dupe(u8, "{\"commands\":[]}");
+}
+
+pub fn commandsDataJsonAlloc(
+    allocator: std.mem.Allocator,
+    commands: []const RpcSlashCommand,
+) ![]u8 {
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(allocator);
+    try output.appendSlice(allocator, "{\"commands\":[");
+    for (commands, 0..) |command, index| {
+        if (index > 0) try output.append(allocator, ',');
+        try appendRpcSlashCommandJson(allocator, &output, command);
+    }
+    try output.appendSlice(allocator, "]}");
+    return output.toOwnedSlice(allocator);
 }
 
 pub fn emptyMessagesDataJsonAlloc(allocator: std.mem.Allocator) ![]u8 {
@@ -791,6 +820,38 @@ fn appendStringArrayField(
     try output.append(allocator, ']');
 }
 
+fn appendRpcSlashCommandJson(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(u8),
+    command: RpcSlashCommand,
+) !void {
+    try output.append(allocator, '{');
+    var first = true;
+    try appendStringField(allocator, output, &first, "name", command.name);
+    if (command.description) |description| try appendStringField(allocator, output, &first, "description", description);
+    try appendStringField(allocator, output, &first, "source", slashCommandSourceName(command.source));
+    try appendSourceInfoField(allocator, output, &first, "sourceInfo", command.source_info);
+    try output.append(allocator, '}');
+}
+
+fn appendSourceInfoField(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(u8),
+    first: *bool,
+    key: []const u8,
+    info: source_info.SourceInfo,
+) !void {
+    try fieldPrefix(allocator, output, first, key);
+    try output.append(allocator, '{');
+    var info_first = true;
+    try appendStringField(allocator, output, &info_first, "path", info.path);
+    try appendStringField(allocator, output, &info_first, "source", info.source);
+    try appendStringField(allocator, output, &info_first, "scope", sourceScopeName(info.scope));
+    try appendStringField(allocator, output, &info_first, "origin", sourceOriginName(info.origin));
+    if (info.base_dir) |base_dir| try appendStringField(allocator, output, &info_first, "baseDir", base_dir);
+    try output.append(allocator, '}');
+}
+
 fn appendStringField(
     allocator: std.mem.Allocator,
     output: *std.ArrayList(u8),
@@ -937,6 +998,29 @@ fn appendJsonValueAlloc(allocator: std.mem.Allocator, output: *std.ArrayList(u8)
     try output.appendSlice(allocator, json);
 }
 
+fn slashCommandSourceName(source: RpcSlashCommandSource) []const u8 {
+    return switch (source) {
+        .extension => "extension",
+        .prompt => "prompt",
+        .skill => "skill",
+    };
+}
+
+fn sourceScopeName(scope: source_info.SourceScope) []const u8 {
+    return switch (scope) {
+        .user => "user",
+        .project => "project",
+        .temporary => "temporary",
+    };
+}
+
+fn sourceOriginName(origin: source_info.SourceOrigin) []const u8 {
+    return switch (origin) {
+        .package => "package",
+        .top_level => "top-level",
+    };
+}
+
 fn thinkingLevelMapHasValues(map: ai.ThinkingLevelMap) bool {
     return map.off != .unset or
         map.minimal != .unset or
@@ -1008,6 +1092,56 @@ fn thinkingFormatName(value: ai.ThinkingFormat) []const u8 {
         .qwen_chat_template => "qwen-chat-template",
         .string_thinking => "string-thinking",
     };
+}
+
+test "RPC commands JSON serializes slash commands and source info" {
+    const allocator = std.testing.allocator;
+    const commands = [_]RpcSlashCommand{
+        .{
+            .name = "ask:1",
+            .description = "Ask extension",
+            .source = .extension,
+            .source_info = source_info.createSyntheticSourceInfo("/tmp/ext.zig", .{
+                .source = "extension:test",
+                .scope = .project,
+                .origin = .package,
+                .base_dir = "/tmp",
+            }),
+        },
+        .{
+            .name = "daily",
+            .source = .prompt,
+            .source_info = source_info.createSyntheticSourceInfo("/tmp/daily.md", .{
+                .source = "cli",
+            }),
+        },
+        .{
+            .name = "skill:debug",
+            .description = "Debug things",
+            .source = .skill,
+            .source_info = source_info.createSyntheticSourceInfo("/tmp/debug/SKILL.md", .{
+                .source = "local",
+                .scope = .user,
+            }),
+        },
+    };
+
+    const json = try commandsDataJsonAlloc(allocator, &commands);
+    defer allocator.free(json);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+    const array = parsed.value.object.get("commands").?.array.items;
+    try std.testing.expectEqual(@as(usize, 3), array.len);
+    try std.testing.expectEqualStrings("ask:1", array[0].object.get("name").?.string);
+    try std.testing.expectEqualStrings("extension", array[0].object.get("source").?.string);
+    try std.testing.expectEqualStrings("project", array[0].object.get("sourceInfo").?.object.get("scope").?.string);
+    try std.testing.expectEqualStrings("package", array[0].object.get("sourceInfo").?.object.get("origin").?.string);
+    try std.testing.expectEqualStrings("/tmp", array[0].object.get("sourceInfo").?.object.get("baseDir").?.string);
+    try std.testing.expect(array[1].object.get("description") == null);
+    try std.testing.expect(array[1].object.get("sourceInfo").?.object.get("baseDir") == null);
+    try std.testing.expectEqualStrings("skill:debug", array[2].object.get("name").?.string);
+    try std.testing.expectEqualStrings("skill", array[2].object.get("source").?.string);
 }
 
 test "RPC model JSON uses Pi-compatible camelCase fields" {
