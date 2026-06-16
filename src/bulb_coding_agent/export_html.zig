@@ -8,8 +8,30 @@ const session_manager = @import("session_manager.zig");
 
 pub const ExportHtmlError = error{
     CannotExportInMemorySession,
+    ExportInputFileNotFound,
     NothingToExportYet,
 };
+
+pub fn exportFromFileAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    input_path: []const u8,
+    output_path: ?[]const u8,
+) ![]u8 {
+    const process_cwd = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(process_cwd);
+    const resolved_input_path = try paths.resolvePathAlloc(allocator, input_path, process_cwd, .{});
+    defer allocator.free(resolved_input_path);
+
+    if (!pathExists(io, resolved_input_path)) return ExportHtmlError.ExportInputFileNotFound;
+
+    var manager = try session_manager.SessionManager.open(allocator, io, resolved_input_path, .{
+        .session_dir = std.fs.path.dirname(resolved_input_path),
+    });
+    defer manager.deinit();
+
+    return exportSessionToHtmlAlloc(allocator, io, &manager, output_path);
+}
 
 pub fn exportSessionToHtmlAlloc(
     allocator: std.mem.Allocator,
@@ -45,6 +67,27 @@ pub fn exportSessionToHtmlAlloc(
     });
 
     return try allocator.dupe(u8, resolved_output);
+}
+
+pub fn formatExportErrorMessageAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    input_path: ?[]const u8,
+    err: anyerror,
+) ![]u8 {
+    switch (err) {
+        ExportHtmlError.CannotExportInMemorySession => return allocator.dupe(u8, "Cannot export in-memory session to HTML"),
+        ExportHtmlError.ExportInputFileNotFound => {
+            const input = input_path orelse return allocator.dupe(u8, "File not found");
+            const process_cwd = try std.process.currentPathAlloc(io, allocator);
+            defer allocator.free(process_cwd);
+            const resolved = try paths.resolvePathAlloc(allocator, input, process_cwd, .{});
+            defer allocator.free(resolved);
+            return std.fmt.allocPrint(allocator, "File not found: {s}", .{resolved});
+        },
+        ExportHtmlError.NothingToExportYet => return allocator.dupe(u8, "Nothing to export yet - start a conversation first"),
+        else => return allocator.dupe(u8, @errorName(err)),
+    }
 }
 
 fn defaultOutputPathAlloc(allocator: std.mem.Allocator, session_file: []const u8) ![]u8 {
@@ -438,4 +481,83 @@ test "export html writes a readable transcript with escaped content" {
 
     try std.testing.expect(std.mem.indexOf(u8, html, "&lt;script&gt;alert(1)&lt;/script&gt;") != null);
     try std.testing.expect(std.mem.indexOf(u8, html, "Bulb session export") != null);
+}
+
+test "exportFromFile opens an existing session and writes selected output path" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(cwd);
+    const root = try std.fs.path.join(allocator, &.{ cwd, ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(root);
+    const project_dir = try std.fs.path.join(allocator, &.{ root, "project" });
+    defer allocator.free(project_dir);
+    const session_dir = try std.fs.path.join(allocator, &.{ root, "sessions" });
+    defer allocator.free(session_dir);
+    const output_path = try std.fs.path.join(allocator, &.{ root, "exports", "from-file.html" });
+    defer allocator.free(output_path);
+
+    try std.Io.Dir.cwd().createDirPath(io, project_dir);
+    try std.Io.Dir.cwd().createDirPath(io, session_dir);
+
+    var manager = try session_manager.SessionManager.create(allocator, io, project_dir, session_dir, .{});
+    defer manager.deinit();
+
+    const user_content = [_]ai.UserContent{.{ .text = .{ .text = "Export from file" } }};
+    _ = try manager.appendMessage(io, .{
+        .user = .{
+            .content = &user_content,
+            .timestamp_ms = 2234,
+        },
+    });
+    const assistant_content = [_]ai.AssistantContent{.{ .text = .{ .text = "Exported response" } }};
+    _ = try manager.appendMessage(io, .{
+        .assistant = .{
+            .content = &assistant_content,
+            .api = ai.types.api.openai_completions,
+            .provider = "demo",
+            .model = "demo",
+            .timestamp_ms = 2235,
+        },
+    });
+    const session_file = try allocator.dupe(u8, manager.getSessionFile().?);
+    defer allocator.free(session_file);
+
+    const written = try exportFromFileAlloc(allocator, io, session_file, output_path);
+    defer allocator.free(written);
+    try std.testing.expectEqualStrings(output_path, written);
+
+    const html = try std.Io.Dir.cwd().readFileAlloc(io, output_path, allocator, .unlimited);
+    defer allocator.free(html);
+    try std.testing.expect(std.mem.indexOf(u8, html, "Export from file") != null);
+}
+
+test "exportFromFile rejects missing input before opening a new session" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(cwd);
+    const missing_path = try std.fs.path.join(allocator, &.{ cwd, ".zig-cache", "tmp", tmp.sub_path[0..], "missing.jsonl" });
+    defer allocator.free(missing_path);
+
+    try std.testing.expectError(
+        ExportHtmlError.ExportInputFileNotFound,
+        exportFromFileAlloc(allocator, io, missing_path, null),
+    );
+
+    const message = try formatExportErrorMessageAlloc(
+        allocator,
+        io,
+        missing_path,
+        ExportHtmlError.ExportInputFileNotFound,
+    );
+    defer allocator.free(message);
+    try std.testing.expect(std.mem.startsWith(u8, message, "File not found: "));
+    try std.testing.expect(std.mem.endsWith(u8, message, "missing.jsonl"));
 }

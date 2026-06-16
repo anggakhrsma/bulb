@@ -40,6 +40,9 @@ pub fn main(init: std.process.Init) !void {
         try coding_agent.cli_args.writeHelp(stdout);
     } else if (parsed.list_models) |list_models| {
         try writeModelList(allocator, init.io, init.environ_map, stdout, stderr, list_models);
+    } else if (parsed.export_path) |export_path| {
+        const output_path = if (parsed.messages.items.len > 0) parsed.messages.items[0] else null;
+        try writeHtmlExport(allocator, init.io, stdout, stderr, export_path, output_path);
     } else if (parsed.mode == .rpc) {
         try runRpcMode(allocator, init.io, init.environ_map, stdout, &parsed);
     } else {
@@ -261,6 +264,36 @@ fn findInitialRpcModel(
     }
 
     return null;
+}
+
+fn writeHtmlExport(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
+    input_path: []const u8,
+    output_path: ?[]const u8,
+) !void {
+    const exported_path = coding_agent.export_html.exportFromFileAlloc(
+        allocator,
+        io,
+        input_path,
+        output_path,
+    ) catch |err| {
+        const owned_message = coding_agent.export_html.formatExportErrorMessageAlloc(
+            allocator,
+            io,
+            input_path,
+            err,
+        ) catch null;
+        defer if (owned_message) |message| allocator.free(message);
+        const message = owned_message orelse @errorName(err);
+        try stderr.print("Error: {s}\n", .{message});
+        try stderr.flush();
+        std.process.exit(1);
+    };
+    defer allocator.free(exported_path);
+    try stdout.print("Exported to: {s}\n", .{exported_path});
 }
 
 fn writeModelList(
